@@ -31,15 +31,34 @@ class RPCService {
 
     const cacheKey = `${network}-${method}-${JSON.stringify(params)}`;
     const cachedResult = cache.get(cacheKey);
-    
+
     if (cachedResult) {
       return cachedResult;
     }
 
     const result = await this.makeRPCCall(CONFIG.RPC_ENDPOINTS[network], method, params);
     cache.set(cacheKey, result);
-    
+
     return result;
+  }
+
+  async executeCustomRPC(url, method, params) {
+    try {
+      const response = await fetch(url, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ method, params }),
+      });
+
+      if (!response.ok) {
+        throw new Error(`RPC call failed with status ${response.status}`);
+      }
+
+      const data = await response.json();
+      return data;
+    } catch (error) {
+      throw new Error(`Failed to execute custom RPC: ${error.message}`);
+    }
   }
 }
 
