@@ -24,7 +24,7 @@ class RPCService {
     return await response.json();
   }
 
-  async executeRPC(network, method, params) {
+  async executeRPC(network, method, params, customRpcUrl = '') {
     if (!CONFIG.RPC_ENDPOINTS[network]) {
       throw new Error('Invalid network');
     }
@@ -36,29 +36,16 @@ class RPCService {
       return cachedResult;
     }
 
-    const result = await this.makeRPCCall(CONFIG.RPC_ENDPOINTS[network], method, params);
-    cache.set(cacheKey, result);
-
-    return result;
-  }
-
-  async executeCustomRPC(url, method, params) {
-    try {
-      const response = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ method, params }),
-      });
-
-      if (!response.ok) {
-        throw new Error(`RPC call failed with status ${response.status}`);
-      }
-
-      const data = await response.json();
-      return data;
-    } catch (error) {
-      throw new Error(`Failed to execute custom RPC: ${error.message}`);
+    if (network === 'custom' && customRpcUrl !== '') {
+      const result = await this.makeRPCCall(customRpcUrl, method, params);
+      cache.set(cacheKey, result);
+      return result;
+    } else {
+      const result = await this.makeRPCCall(CONFIG.RPC_ENDPOINTS[network], method, params);
+      cache.set(cacheKey, result);
+      return result;
     }
+
   }
 }
 
