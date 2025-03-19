@@ -8,6 +8,7 @@ const app = express();
 // Middleware
 app.use(express.json());
 app.use(corsMiddleware);
+app.set('trust proxy', 1); // Trust the first proxy
 
 // Routes
 app.use(routes);
