@@ -1,6 +1,7 @@
 import express from "express";
 import nodemailer from "nodemailer";
 import rateLimit from 'express-rate-limit';
+import axios from "axios";
 
 const appRouter = express.Router();
 
@@ -68,6 +69,25 @@ appRouter.post("/support", supportRateLimit, (req, res) => {
                 }
             });
         }
+    });
+});
+
+appRouter.post("/tx-history", async (req, res) => {
+    const { address, page = 1, limit = 5 } = req.body;
+    const formattedAddress = 'Z' + address.toLowerCase().substring(1);
+    axios.get(`https://zondscan.com/api/address/${formattedAddress}/transactions`, {
+        params: {
+            page: page,
+            limit: limit
+        }
+    })
+    .then(response => {
+        console.log(response.data);
+        res.status(200).json(response.data);
+    })
+    .catch(error => {
+        console.log(error);
+        res.status(500).json({ message: "Failed to get tx history" });
     });
 });
 
