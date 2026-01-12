@@ -17,4 +17,4 @@ commonLabels:
 
 images:
   - name: ghcr.io/myqrlwallet/backend
-    newTag: latest
+    newTag: dev

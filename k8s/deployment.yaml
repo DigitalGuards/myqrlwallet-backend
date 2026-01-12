@@ -20,7 +20,8 @@ spec:
     spec:
       containers:
         - name: backend
-          image: ghcr.io/myqrlwallet/backend:latest
+          # Image tag is updated by CI/CD pipeline via kustomize
+          image: ghcr.io/myqrlwallet/backend:dev
           imagePullPolicy: Always
           ports:
             - name: http
@@ -59,6 +60,13 @@ spec:
             readOnlyRootFilesystem: true
             runAsNonRoot: true
             runAsUser: 1000
+            runAsGroup: 1000
+          volumeMounts:
+            - name: tmp-data
+              mountPath: /tmp
+      volumes:
+        - name: tmp-data
+          emptyDir: {}
       # Spread pods across nodes for high availability
       topologySpreadConstraints:
         - maxSkew: 1
