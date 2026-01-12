@@ -1,0 +1,32 @@
+# Dependencies
+node_modules
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp
+*.swo
+
+# Environment files (should be passed at runtime)
+.env
+.env.*
+!.env.example
+
+# Test files
+test
+coverage
+*.test.js
+*.spec.js
+
+# Documentation
+*.md
+!README.md
+
+# Misc
+.DS_Store
+*.log
+npm-debug.log*
