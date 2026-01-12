@@ -14,8 +14,8 @@ data:
   NODE_ENV: "production"
   PORT: "3000"
   # Zond RPC endpoints
-  ZOND_RPC_TESTNET: "https://rpc.qrl.tips"
-  ZOND_RPC_MAINNET: "https://mainnet-rpc.qrl.tips"
+  ZOND_RPC_TESTNET: "https://qrlwallet.com/api/zond-rpc/testnet"
+  ZOND_RPC_MAINNET: "https://qrlwallet.com/api/zond-rpc/mainnet"
   # ZondScan API for transaction history
   ZONDSCAN_API_URL: "https://zondscan.com/api"
   # CORS allowed origins (comma-separated)
