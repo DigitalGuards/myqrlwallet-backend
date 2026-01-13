@@ -11,6 +11,12 @@ const supportRateLimit = rateLimit({
     message: { message: "Too many requests, please try again later." }
 });
 
+const txHistoryRateLimit = rateLimit({
+    windowMs: 60 * 1000, // 1 minute
+    max: 30, // 30 requests per minute per IP
+    message: { message: "Too many requests, please try again later." }
+});
+
 appRouter.post("/support", supportRateLimit, (req, res) => {
     const { name, email, message, subject } = req.body;
 
@@ -72,7 +78,7 @@ appRouter.post("/support", supportRateLimit, (req, res) => {
     });
 });
 
-appRouter.post("/tx-history", async (req, res) => {
+appRouter.post("/tx-history", txHistoryRateLimit, async (req, res) => {
     const { address, page = 1, limit = 5 } = req.body;
     const formattedAddress = 'Z' + address.toLowerCase().substring(1);
     axios.get(`https://zondscan.com/api/address/${formattedAddress}/transactions`, {
