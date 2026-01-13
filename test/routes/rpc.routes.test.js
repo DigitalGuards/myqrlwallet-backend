@@ -19,12 +19,12 @@ describe('RPC Routes', () => {
   });
 
   it('should return result for valid RPC call', async () => {
-    const mockResult = { data: 'mockData' };
+    const mockResult = { jsonrpc: '2.0', id: 1, result: '0x1234' };
     rpcServiceStub.resolves(mockResult);
 
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
-      .send({ method: 'getInfo', params: [] });
+      .send({ method: 'zond_blockNumber', params: [] });
 
     expect(res).to.have.status(200);
     expect(res.body).to.deep.equal(mockResult);
@@ -35,9 +35,40 @@ describe('RPC Routes', () => {
 
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
-      .send({ method: 'getInfo', params: [] });
+      .send({ method: 'zond_blockNumber', params: [] });
 
     expect(res).to.have.status(500);
     expect(res.body.error.message).to.equal('RPC Error');
   });
-}); 
+
+  it('should reject disallowed RPC methods', async () => {
+    const res = await request.execute(app)
+      .post('/api/zond-rpc/dev')
+      .send({ method: 'debug_traceTransaction', params: [] });
+
+    expect(res).to.have.status(403);
+    expect(res.body.error.code).to.equal(-32601);
+    expect(res.body.error.message).to.include('Method not allowed');
+  });
+
+  it('should reject batch requests', async () => {
+    const res = await request.execute(app)
+      .post('/api/zond-rpc/dev')
+      .send([
+        { method: 'zond_blockNumber', params: [] },
+        { method: 'zond_gasPrice', params: [] }
+      ]);
+
+    expect(res).to.have.status(400);
+    expect(res.body.error.message).to.include('Batch requests are not supported');
+  });
+
+  it('should validate address format', async () => {
+    const res = await request.execute(app)
+      .post('/api/zond-rpc/dev')
+      .send({ method: 'zond_getBalance', params: ['invalid-address', 'latest'] });
+
+    expect(res).to.have.status(400);
+    expect(res.body.error.code).to.equal(-32602);
+  });
+});
