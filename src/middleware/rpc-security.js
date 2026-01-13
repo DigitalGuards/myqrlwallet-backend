@@ -36,51 +36,42 @@ const WRITE_METHODS = new Set([
 ]);
 
 /**
- * Methods that are read-only and cacheable - more lenient rate limits
+ * Helper function to send JSON-RPC error responses
  */
-const READ_METHODS = new Set([
-  'zond_getBalance',
-  'zond_getTransactionCount',
-  'zond_gasPrice',
-  'zond_getCode',
-  'zond_call',
-  'zond_chainId',
-  'zond_blockNumber',
-  'net_version',
-  'net_listening',
-  'zond_getTransactionReceipt',
-  'zond_estimateGas',
-]);
+const sendRpcError = (res, statusCode, id, errorCode, message) => {
+  return res.status(statusCode).json({
+    jsonrpc: '2.0',
+    id: id || null,
+    error: { code: errorCode, message }
+  });
+};
+
+/**
+ * Middleware to reject batch requests
+ * Must be applied before other validation middleware
+ */
+export const rpcBatchReject = (req, res, next) => {
+  if (Array.isArray(req.body)) {
+    return sendRpcError(res, 400, null, -32600, 'Batch requests are not supported on this endpoint.');
+  }
+  next();
+};
 
 /**
  * Middleware to validate and whitelist RPC methods
  */
 export const rpcMethodWhitelist = (req, res, next) => {
-  const { method } = req.body;
+  const { method, id } = req.body;
 
   // Validate method exists
   if (!method || typeof method !== 'string') {
-    return res.status(400).json({
-      jsonrpc: '2.0',
-      id: req.body?.id || null,
-      error: {
-        code: -32600,
-        message: 'Invalid Request: missing or invalid method'
-      }
-    });
+    return sendRpcError(res, 400, id, -32600, 'Invalid Request: missing or invalid method');
   }
 
   // Check if method is allowed
   if (!ALLOWED_RPC_METHODS.has(method)) {
     console.warn(`Blocked RPC method: ${method} from IP: ${req.ip}`);
-    return res.status(403).json({
-      jsonrpc: '2.0',
-      id: req.body?.id || null,
-      error: {
-        code: -32601,
-        message: `Method not allowed: ${method}`
-      }
-    });
+    return sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
   }
 
   // Tag the request type for rate limiting
@@ -103,13 +94,8 @@ export const rpcRateLimitGeneral = rateLimit({
     return `${req.ip}-${req.params.network || 'unknown'}`;
   },
   skip: (req) => req.rpcMethodType === 'write', // Skip for write methods (they have their own limiter)
-  message: {
-    jsonrpc: '2.0',
-    id: null,
-    error: {
-      code: -32005,
-      message: 'Rate limit exceeded. Please try again later.'
-    }
+  handler: (req, res) => {
+    sendRpcError(res, 429, req.body?.id, -32005, 'Rate limit exceeded. Please try again later.');
   }
 });
 
@@ -126,13 +112,8 @@ export const rpcRateLimitWrite = rateLimit({
     return `${req.ip}-write-${req.params.network || 'unknown'}`;
   },
   skip: (req) => req.rpcMethodType !== 'write', // Only apply to write methods
-  message: {
-    jsonrpc: '2.0',
-    id: null,
-    error: {
-      code: -32005,
-      message: 'Transaction rate limit exceeded. Please wait before sending more transactions.'
-    }
+  handler: (req, res) => {
+    sendRpcError(res, 429, req.body?.id, -32005, 'Transaction rate limit exceeded. Please wait before sending more transactions.');
   }
 });
 
@@ -145,14 +126,7 @@ export const rpcRequestSizeLimit = (req, res, next) => {
   const MAX_SIZE = 50 * 1024; // 50KB
 
   if (contentLength > MAX_SIZE) {
-    return res.status(413).json({
-      jsonrpc: '2.0',
-      id: null,
-      error: {
-        code: -32600,
-        message: 'Request payload too large'
-      }
-    });
+    return sendRpcError(res, 413, req.body?.id, -32600, 'Request payload too large');
   }
 
   next();
@@ -162,18 +136,11 @@ export const rpcRequestSizeLimit = (req, res, next) => {
  * Validate params structure for known methods
  */
 export const rpcParamsValidator = (req, res, next) => {
-  const { method, params } = req.body;
+  const { method, params, id } = req.body;
 
   // Params should be an array or undefined/null
   if (params !== undefined && params !== null && !Array.isArray(params)) {
-    return res.status(400).json({
-      jsonrpc: '2.0',
-      id: req.body?.id || null,
-      error: {
-        code: -32602,
-        message: 'Invalid params: must be an array'
-      }
-    });
+    return sendRpcError(res, 400, id, -32602, 'Invalid params: must be an array');
   }
 
   // Basic validation for specific methods
@@ -183,75 +150,33 @@ export const rpcParamsValidator = (req, res, next) => {
     case 'zond_getCode':
       // These require at least an address
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: address required'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
       }
       // Validate address format (0x + 40 hex chars)
       if (!/^0x[a-fA-F0-9]{40}$/.test(params[0])) {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: invalid address format'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
       }
       break;
 
     case 'zond_sendRawTransaction':
       // Requires a hex-encoded signed transaction
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: signed transaction required'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: signed transaction required');
       }
       // Validate it starts with 0x
       if (!params[0].startsWith('0x')) {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: transaction must be hex-encoded'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
       }
       break;
 
     case 'zond_getTransactionReceipt':
       // Requires a transaction hash
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: transaction hash required'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction hash required');
       }
       // Validate tx hash format (0x + 64 hex chars)
       if (!/^0x[a-fA-F0-9]{64}$/.test(params[0])) {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: invalid transaction hash format'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid transaction hash format');
       }
       break;
 
@@ -259,14 +184,7 @@ export const rpcParamsValidator = (req, res, next) => {
     case 'zond_estimateGas':
       // These require a transaction object
       if (!params || params.length < 1 || typeof params[0] !== 'object') {
-        return res.status(400).json({
-          jsonrpc: '2.0',
-          id: req.body?.id || null,
-          error: {
-            code: -32602,
-            message: 'Invalid params: transaction object required'
-          }
-        });
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
       }
       break;
   }
@@ -278,7 +196,7 @@ export const rpcParamsValidator = (req, res, next) => {
  * Log suspicious activity
  */
 export const rpcSecurityLogger = (req, res, next) => {
-  const { method, params } = req.body;
+  const { method } = req.body;
   const startTime = Date.now();
 
   // Log the request

@@ -1,6 +1,7 @@
 import { Router } from 'express';
 import { rpcService } from '../services/rpc.service.js';
 import {
+  rpcBatchReject,
   rpcMethodWhitelist,
   rpcRateLimitGeneral,
   rpcRateLimitWrite,
@@ -13,12 +14,14 @@ const router = Router();
 
 // Apply security middleware in order:
 // 1. Request size limit (reject oversized payloads early)
-// 2. Security logger (log all requests)
-// 3. Method whitelist (block disallowed methods)
-// 4. Params validator (validate input)
-// 5. Rate limiters (apply appropriate limits)
+// 2. Batch reject (block batch requests)
+// 3. Security logger (log all requests)
+// 4. Method whitelist (block disallowed methods)
+// 5. Params validator (validate input)
+// 6. Rate limiters (apply appropriate limits)
 router.post('/:network',
   rpcRequestSizeLimit,
+  rpcBatchReject,
   rpcSecurityLogger,
   rpcMethodWhitelist,
   rpcParamsValidator,
