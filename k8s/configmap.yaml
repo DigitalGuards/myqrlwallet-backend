@@ -1,0 +1,24 @@
+# Non-sensitive configuration for the backend
+# Update these values for your environment
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: myqrlwallet-backend-config
+  namespace: myqrlwallet
+  labels:
+    app: myqrlwallet-backend
+    app.kubernetes.io/name: myqrlwallet-backend
+    app.kubernetes.io/component: backend
+    app.kubernetes.io/part-of: myqrlwallet
+data:
+  NODE_ENV: "production"
+  PORT: "3000"
+  # Zond RPC endpoints
+  ZOND_RPC_TESTNET: "https://qrlwallet.com/api/zond-rpc/testnet"
+  ZOND_RPC_MAINNET: "https://qrlwallet.com/api/zond-rpc/mainnet"
+  # ZondScan API for transaction history
+  ZONDSCAN_API_URL: "https://zondscan.com/api"
+  # CORS allowed origins (comma-separated)
+  CORS_ORIGINS: "https://qrlwallet.com,https://www.qrlwallet.com"
+  # Cache TTL in seconds
+  CACHE_TTL: "60"
