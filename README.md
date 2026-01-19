@@ -49,8 +49,8 @@ Edit `.env` with your settings:
 PORT=3000
 
 # RPC Endpoints
-RPC_URL_TESTNET=https://your-testnet-node
-RPC_URL_MAINNET=https://your-mainnet-node
+RPC_URL_TESTNET=https://qrlwallet.com/api/zond-rpc/testnet
+RPC_URL_MAINNET=https://qrlwallet.com/api/zond-rpc/mainnet
 
 # SMTP Configuration (for support emails)
 SMTP_HOST=smtp.example.com
@@ -79,7 +79,7 @@ npm test        # Run tests
 | POST | `/api/zond-rpc/:network` | Proxy RPC calls (network: testnet, mainnet, custom) |
 | POST | `/api/support` | Send support email |
 | POST | `/api/tx-history` | Get transaction history for address |
-| GET | `/api/health` | Health check |
+| GET | `/health` | Health check |
 
 ### RPC Proxy Example
 
@@ -97,16 +97,113 @@ curl -X POST https://qrlwallet.com/api/tx-history \
   -d '{"address": "Z1234...", "page": 1, "limit": 10}'
 ```
 
+## Docker Deployment
+
+### Build Image
+
+```bash
+docker build -t myqrlwallet-backend:latest .
+```
+
+### Run Container
+
+```bash
+docker run -d -p 3000:3000 \
+  -e SMTP_HOST=smtp.example.com \
+  -e SMTP_PORT=587 \
+  -e SMTP_USER=your-user \
+  -e SMTP_TOKEN=your-password \
+  -e SMTP_FROM=noreply@example.com \
+  -e SMTP_TO=support@example.com \
+  myqrlwallet-backend:latest
+```
+
+The container:
+- Uses Node.js 20 Alpine with non-root user (UID 1000)
+- Serves on port 3000
+- Includes health check at `/health`
+- Has read-only root filesystem (security hardened)
+
+## Kubernetes Deployment
+
+Kubernetes manifests are provided in the `k8s/` directory.
+
+### Prerequisites
+
+- Kubernetes cluster
+- Frontend deployed first (creates namespace and ingress)
+
+### Deploy
+
+```bash
+# Update secrets first!
+# Edit k8s/secret.yaml or create via kubectl:
+kubectl create secret generic myqrlwallet-backend-secrets \
+  --namespace=myqrlwallet \
+  --from-literal=SMTP_HOST=smtp.example.com \
+  --from-literal=SMTP_PORT=587 \
+  --from-literal=SMTP_USER=your-user \
+  --from-literal=SMTP_PASS=your-password \
+  --from-literal=SMTP_FROM=noreply@example.com \
+  --from-literal=SUPPORT_EMAIL=support@example.com
+
+# Apply all manifests
+kubectl apply -k k8s/
+
+# Or apply individually
+kubectl apply -f k8s/deployment.yaml
+kubectl apply -f k8s/service.yaml
+kubectl apply -f k8s/configmap.yaml
+kubectl apply -f k8s/hpa.yaml
+```
+
+### Manifests
+
+| File | Description |
+|------|-------------|
+| `deployment.yaml` | 2 replicas with health checks, security context |
+| `service.yaml` | ClusterIP service on port 3000 |
+| `configmap.yaml` | Non-sensitive config (RPC URLs, CORS) |
+| `secret.yaml` | Template for SMTP credentials |
+| `hpa.yaml` | Horizontal Pod Autoscaler (2-10 replicas) |
+
+### Security Features
+
+- Runs as non-root user (UID 1000)
+- Read-only root filesystem
+- `/tmp` mounted as emptyDir for temp files
+- No privilege escalation allowed
+
+## CI/CD
+
+The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
+
+1. **On PR/Push**: Runs tests
+2. **On Push to main/dev**: Builds and pushes Docker image to GitHub Container Registry
+3. **On Push to main**: Deploys to Kubernetes cluster
+
+### Image Tags
+
+- `ghcr.io/<owner>/myqrlwallet-backend:latest` - Latest main branch
+- `ghcr.io/<owner>/myqrlwallet-backend:main-<sha>` - Specific commit
+- `ghcr.io/<owner>/myqrlwallet-backend:dev` - Dev branch
+
+### Required GitHub Configuration
+
+**Secrets** (Settings → Secrets and variables → Actions → Secrets):
+- `KUBECONFIG` - Base64-encoded kubeconfig for deployment
+
 ## Technology Stack
 
 | Category | Technology |
 |----------|------------|
-| Runtime | Node.js |
+| Runtime | Node.js 20 |
 | Framework | Express.js |
 | Email | Nodemailer |
 | HTTP Client | Axios |
 | Caching | node-cache |
 | Rate Limiting | express-rate-limit |
+| Container | Node.js Alpine |
 
 ## Project Structure
 
