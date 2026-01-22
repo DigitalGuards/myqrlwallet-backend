@@ -82,11 +82,11 @@ export const rpcMethodWhitelist = (req, res, next) => {
 
 /**
  * Rate limiter for general RPC requests (read operations)
- * More lenient - 100 requests per minute per IP
+ * More lenient - 300 requests per minute per IP
  */
 export const rpcRateLimitGeneral = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 100, // 100 requests per minute per IP
+  max: 300, // 300 requests per minute per IP
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
