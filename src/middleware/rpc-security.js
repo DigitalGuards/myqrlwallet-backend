@@ -20,10 +20,12 @@ const ALLOWED_RPC_METHODS = new Set([
   // Contract Operations
   'zond_getCode',
   'zond_call',           // Used for ERC20 calls (balanceOf, name, symbol, decimals)
+  'zond_getLogs',        // Used for fetching event logs (token transfers, contract events)
 
   // Block info (needed by web3.js internally)
   'zond_chainId',
   'zond_blockNumber',
+  'zond_getBlockByNumber', // Needed for event watching (token transfers, contract events)
   'net_version',
 ]);
 
