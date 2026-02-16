@@ -47,7 +47,7 @@ CREATE INDEX IF NOT EXISTS idx_payments_address ON payment_intents(deposit_addre
 CREATE TABLE IF NOT EXISTS webhook_deliveries (
     id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     payment_intent_id UUID NOT NULL REFERENCES payment_intents(id),
-    merchant_id UUID NOT NULL,
+    merchant_id UUID NOT NULL REFERENCES merchants(id),
     url TEXT NOT NULL,
     payload JSONB NOT NULL,
     hmac_signature TEXT NOT NULL,
