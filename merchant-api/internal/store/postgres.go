@@ -193,6 +193,47 @@ func (s *PostgresStore) AssignAddressAndCreatePayment(ctx context.Context, p *mo
 	return tx.Commit()
 }
 
+func (s *PostgresStore) GetAssignedAddressMap(ctx context.Context) (map[string]string, error) {
+	rows, err := s.db.QueryContext(ctx,
+		`SELECT ap.address, ap.payment_intent_id::text FROM address_pool ap
+		 JOIN payment_intents pi ON ap.payment_intent_id = pi.id
+		 WHERE ap.status = 'assigned'
+		   AND pi.status IN ('pending', 'detected')
+		   AND pi.tx_hash IS NULL`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	m := make(map[string]string)
+	for rows.Next() {
+		var addr, paymentID string
+		if err := rows.Scan(&addr, &paymentID); err != nil {
+			return nil, err
+		}
+		m[addr] = paymentID
+	}
+	return m, rows.Err()
+}
+
+// --- Key-Value State ---
+
+func (s *PostgresStore) GetState(ctx context.Context, key string) (string, error) {
+	var value string
+	err := s.db.QueryRowContext(ctx, `SELECT value FROM kv_state WHERE key = $1`, key).Scan(&value)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return value, err
+}
+
+func (s *PostgresStore) SetState(ctx context.Context, key, value string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO kv_state (key, value) VALUES ($1, $2) ON CONFLICT (key) DO UPDATE SET value = $2`,
+		key, value)
+	return err
+}
+
 // --- Payment Intents ---
 
 func (s *PostgresStore) CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error {

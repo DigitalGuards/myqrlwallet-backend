@@ -11,3 +11,8 @@ CREATE TABLE IF NOT EXISTS address_pool (
 );
 CREATE INDEX IF NOT EXISTS idx_pool_available ON address_pool(merchant_id, status)
     WHERE status = 'available';
+
+CREATE TABLE IF NOT EXISTS kv_state (
+    key TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);

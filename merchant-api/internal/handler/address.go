@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/DigitalGuards/merchant-api/internal/address"
 	"github.com/DigitalGuards/merchant-api/internal/store"
 	"github.com/theQRL/go-qrllib/wallet/common"
 )
@@ -25,14 +26,6 @@ type poolStatusResponse struct {
 	Available int `json:"available"`
 	Assigned  int `json:"assigned"`
 	Total     int `json:"total"`
-}
-
-// normalizeAddress converts Z-prefix to Q-prefix, leaves Q-prefix as-is.
-func normalizeAddress(addr string) string {
-	if strings.HasPrefix(addr, "Z") || strings.HasPrefix(addr, "z") {
-		return "Q" + addr[1:]
-	}
-	return addr
 }
 
 func HandleAddAddresses(s store.Store) http.HandlerFunc {
@@ -61,7 +54,7 @@ func HandleAddAddresses(s store.Store) http.HandlerFunc {
 		normalized := make([]string, 0, len(req.Addresses))
 		var invalid []string
 		for _, addr := range req.Addresses {
-			norm := normalizeAddress(addr)
+			norm := address.Normalize(addr)
 			if !common.IsValidAddress(norm) {
 				invalid = append(invalid, addr)
 				continue

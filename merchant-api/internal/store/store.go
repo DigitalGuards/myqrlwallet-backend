@@ -28,6 +28,11 @@ type Store interface {
 	AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error)
 	GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error)
 	AssignAddressAndCreatePayment(ctx context.Context, p *model.PaymentIntent) error
+	GetAssignedAddressMap(ctx context.Context) (map[string]string, error)
+
+	// Key-Value State
+	GetState(ctx context.Context, key string) (string, error)
+	SetState(ctx context.Context, key, value string) error
 
 	// Payment Intents
 	CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error
