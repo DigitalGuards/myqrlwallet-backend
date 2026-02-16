@@ -124,7 +124,7 @@ func (s *PostgresStore) AddPoolAddresses(ctx context.Context, merchantID string,
 		query += fmt.Sprintf("($1, $%d)", i+2)
 		args = append(args, addr)
 	}
-	query += ` ON CONFLICT (merchant_id, address) DO NOTHING`
+	query += ` ON CONFLICT (address) DO NOTHING`
 
 	res, err := s.db.ExecContext(ctx, query, args...)
 	if err != nil {
