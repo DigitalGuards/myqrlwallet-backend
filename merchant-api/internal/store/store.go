@@ -2,9 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 
 	"github.com/DigitalGuards/merchant-api/internal/model"
 )
+
+// ErrNoAvailableAddresses is returned when the address pool is empty.
+var ErrNoAvailableAddresses = errors.New("no available addresses in pool")
 
 // Store defines the persistence interface for the merchant payment API.
 type Store interface {

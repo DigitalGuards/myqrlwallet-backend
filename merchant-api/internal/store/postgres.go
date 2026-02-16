@@ -108,26 +108,30 @@ func (s *PostgresStore) GetDepositWalletByAddress(ctx context.Context, address s
 // --- Address Pool ---
 
 func (s *PostgresStore) AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, fmt.Errorf("begin tx: %w", err)
+	if len(addresses) == 0 {
+		return 0, nil
 	}
-	defer tx.Rollback()
 
-	added := 0
-	for _, addr := range addresses {
-		res, err := tx.ExecContext(ctx,
-			`INSERT INTO address_pool (merchant_id, address) VALUES ($1, $2) ON CONFLICT (merchant_id, address) DO NOTHING`,
-			merchantID, addr,
-		)
-		if err != nil {
-			return 0, fmt.Errorf("insert address %s: %w", addr, err)
+	// Build bulk INSERT: VALUES ($1, $2), ($1, $3), ($1, $4), ...
+	args := make([]interface{}, 0, 1+len(addresses))
+	args = append(args, merchantID) // $1 = merchantID
+
+	query := `INSERT INTO address_pool (merchant_id, address) VALUES `
+	for i, addr := range addresses {
+		if i > 0 {
+			query += ", "
 		}
-		n, _ := res.RowsAffected()
-		added += int(n)
+		query += fmt.Sprintf("($1, $%d)", i+2)
+		args = append(args, addr)
 	}
+	query += ` ON CONFLICT (merchant_id, address) DO NOTHING`
 
-	return added, tx.Commit()
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, fmt.Errorf("bulk insert addresses: %w", err)
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 func (s *PostgresStore) GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error) {
@@ -158,7 +162,7 @@ func (s *PostgresStore) AssignAddressAndCreatePayment(ctx context.Context, p *mo
 		 FOR UPDATE SKIP LOCKED`, p.MerchantID,
 	).Scan(&poolID, &addr)
 	if err == sql.ErrNoRows {
-		return fmt.Errorf("no available addresses in pool")
+		return ErrNoAvailableAddresses
 	}
 	if err != nil {
 		return fmt.Errorf("select address: %w", err)

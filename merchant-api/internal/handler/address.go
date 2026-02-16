@@ -86,6 +86,8 @@ func HandleAddAddresses(s store.Store) http.HandlerFunc {
 		available, _, err := s.GetPoolStatus(r.Context(), merchant.ID)
 		if err != nil {
 			log.Printf("ERROR: get pool status: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
 		}
 
 		writeJSON(w, http.StatusOK, addAddressesResponse{
