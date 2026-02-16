@@ -36,8 +36,12 @@ func NewRouter(s store.Store, adminKey string, masterKey [32]byte, defaultConfs 
 	mux.Handle("/v1/payments", APIKeyAuth(s)(authMux))
 	mux.Handle("/v1/payments/", APIKeyAuth(s)(authMux))
 
+	// Rate limiter: 10 requests/sec sustained, burst of 30
+	rl := NewRateLimiter(10, 30)
+
 	// Wrap with global middleware
 	var handler http.Handler = mux
+	handler = rl.Limit(handler)
 	handler = RequestLogger(handler)
 	handler = Recovery(handler)
 
