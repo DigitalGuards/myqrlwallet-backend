@@ -27,12 +27,16 @@ func NewPostgresStore(db *sql.DB) (*PostgresStore, error) {
 }
 
 func (s *PostgresStore) migrate() error {
-	data, err := migrations.ReadFile("migrations/001_initial.sql")
-	if err != nil {
-		return fmt.Errorf("read migration: %w", err)
+	for _, file := range []string{"migrations/001_initial.sql", "migrations/002_address_pool.sql"} {
+		data, err := migrations.ReadFile(file)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", file, err)
+		}
+		if _, err = s.db.ExecContext(context.Background(), string(data)); err != nil {
+			return fmt.Errorf("exec %s: %w", file, err)
+		}
 	}
-	_, err = s.db.ExecContext(context.Background(), string(data))
-	return err
+	return nil
 }
 
 func (s *PostgresStore) Ping(ctx context.Context) error {
@@ -99,6 +103,90 @@ func (s *PostgresStore) GetDepositWalletByAddress(ctx context.Context, address s
 		w.PaymentIntentID = paymentID.String
 	}
 	return w, err
+}
+
+// --- Address Pool ---
+
+func (s *PostgresStore) AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	added := 0
+	for _, addr := range addresses {
+		res, err := tx.ExecContext(ctx,
+			`INSERT INTO address_pool (merchant_id, address) VALUES ($1, $2) ON CONFLICT (merchant_id, address) DO NOTHING`,
+			merchantID, addr,
+		)
+		if err != nil {
+			return 0, fmt.Errorf("insert address %s: %w", addr, err)
+		}
+		n, _ := res.RowsAffected()
+		added += int(n)
+	}
+
+	return added, tx.Commit()
+}
+
+func (s *PostgresStore) GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error) {
+	err = s.db.QueryRowContext(ctx,
+		`SELECT
+			COALESCE(SUM(CASE WHEN status = 'available' THEN 1 ELSE 0 END), 0),
+			COALESCE(SUM(CASE WHEN status = 'assigned' THEN 1 ELSE 0 END), 0)
+		 FROM address_pool WHERE merchant_id = $1`, merchantID,
+	).Scan(&available, &assigned)
+	return
+}
+
+func (s *PostgresStore) AssignAddressAndCreatePayment(ctx context.Context, p *model.PaymentIntent) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("begin tx: %w", err)
+	}
+	defer tx.Rollback()
+
+	// Pick an available address and lock it
+	var addr string
+	var poolID string
+	err = tx.QueryRowContext(ctx,
+		`SELECT id, address FROM address_pool
+		 WHERE merchant_id = $1 AND status = 'available'
+		 ORDER BY created_at ASC
+		 LIMIT 1
+		 FOR UPDATE SKIP LOCKED`, p.MerchantID,
+	).Scan(&poolID, &addr)
+	if err == sql.ErrNoRows {
+		return fmt.Errorf("no available addresses in pool")
+	}
+	if err != nil {
+		return fmt.Errorf("select address: %w", err)
+	}
+
+	// Assign the address to this payment
+	p.DepositAddress = addr
+
+	// Create the payment intent
+	_, err = tx.ExecContext(ctx,
+		`INSERT INTO payment_intents (id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, required_confs, expires_at, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
+		p.ID, p.MerchantID, p.ExternalID, p.DepositAddress, p.ExpectedAmountWei, p.ReceivedAmountWei, p.Status, p.RequiredConfs, p.ExpiresAt, p.CreatedAt, p.UpdatedAt,
+	)
+	if err != nil {
+		return fmt.Errorf("insert payment: %w", err)
+	}
+
+	// Mark address as assigned
+	_, err = tx.ExecContext(ctx,
+		`UPDATE address_pool SET status = 'assigned', payment_intent_id = $2 WHERE id = $1`,
+		poolID, p.ID,
+	)
+	if err != nil {
+		return fmt.Errorf("assign address: %w", err)
+	}
+
+	return tx.Commit()
 }
 
 // --- Payment Intents ---
