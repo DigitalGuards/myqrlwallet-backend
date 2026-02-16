@@ -12,6 +12,8 @@ import (
 	"github.com/theQRL/go-qrllib/wallet/common"
 )
 
+const maxAddressesPerRequest = 1000
+
 type addAddressesRequest struct {
 	Addresses []string `json:"addresses"`
 }
@@ -36,6 +38,8 @@ func HandleAddAddresses(s store.Store) http.HandlerFunc {
 			return
 		}
 
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
+
 		var req addAddressesRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
@@ -45,8 +49,8 @@ func HandleAddAddresses(s store.Store) http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "addresses array is required and must not be empty"})
 			return
 		}
-		if len(req.Addresses) > 1000 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "maximum 1000 addresses per request"})
+		if len(req.Addresses) > maxAddressesPerRequest {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": fmt.Sprintf("maximum %d addresses per request", maxAddressesPerRequest)})
 			return
 		}
 

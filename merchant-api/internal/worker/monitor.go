@@ -16,7 +16,10 @@ import (
 	"github.com/DigitalGuards/merchant-api/internal/zondscan"
 )
 
-const lastScannedBlockKey = "last_scanned_block"
+const (
+	lastScannedBlockKey = "last_scanned_block"
+	maxBlocksPerTick    = 10
+)
 
 // Monitor polls the Zond blockchain for deposits to pending payment addresses.
 type Monitor struct {
@@ -137,8 +140,8 @@ func (m *Monitor) scanBlocks(ctx context.Context) {
 
 	// Scan up to 10 blocks per tick
 	endBlock := latestBlock
-	if endBlock-lastScanned > 10 {
-		endBlock = lastScanned + 10
+	if endBlock-lastScanned > maxBlocksPerTick {
+		endBlock = lastScanned + maxBlocksPerTick
 	}
 
 	for blockNum := lastScanned + 1; blockNum <= endBlock; blockNum++ {

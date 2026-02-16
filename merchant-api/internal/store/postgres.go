@@ -130,7 +130,10 @@ func (s *PostgresStore) AddPoolAddresses(ctx context.Context, merchantID string,
 	if err != nil {
 		return 0, fmt.Errorf("bulk insert addresses: %w", err)
 	}
-	n, _ := res.RowsAffected()
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("rows affected: %w", err)
+	}
 	return int(n), nil
 }
 
