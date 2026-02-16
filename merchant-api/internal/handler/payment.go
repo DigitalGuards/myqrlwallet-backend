@@ -2,11 +2,11 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"math/big"
 	"net/http"
 	"regexp"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -86,7 +86,7 @@ func HandleCreatePayment(s store.Store, defaultConfs int, defaultTTL time.Durati
 			UpdatedAt:         now,
 		}
 		if err := s.AssignAddressAndCreatePayment(r.Context(), payment); err != nil {
-			if strings.Contains(err.Error(), "no available addresses") {
+			if errors.Is(err, store.ErrNoAvailableAddresses) {
 				writeJSON(w, http.StatusConflict, map[string]string{"error": "no deposit addresses available, upload more via POST /v1/addresses"})
 				return
 			}
