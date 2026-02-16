@@ -77,7 +77,7 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			ttl = time.Duration(req.TTLMinutes) * time.Minute
 		}
 
-		// Store wallet
+		// Store wallet and payment atomically
 		wallet := &model.DepositWallet{
 			ID:              uuid.New().String(),
 			MerchantID:      merchant.ID,
@@ -87,13 +87,7 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			PaymentIntentID: paymentID,
 			CreatedAt:       now,
 		}
-		if err := s.CreateDepositWallet(r.Context(), wallet); err != nil {
-			log.Printf("ERROR: store wallet: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to store wallet"})
-			return
-		}
 
-		// Store payment intent
 		payment := &model.PaymentIntent{
 			ID:                paymentID,
 			MerchantID:        merchant.ID,
@@ -107,7 +101,7 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
-		if err := s.CreatePaymentIntent(r.Context(), payment); err != nil {
+		if err := s.CreatePaymentWithWallet(r.Context(), wallet, payment); err != nil {
 			log.Printf("ERROR: store payment: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create payment"})
 			return

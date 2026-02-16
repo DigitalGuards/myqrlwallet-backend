@@ -21,6 +21,7 @@ type Store interface {
 	GetDepositWalletByAddress(ctx context.Context, address string) (*model.DepositWallet, error)
 
 	// Payment Intents
+	CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error
 	CreatePaymentIntent(ctx context.Context, p *model.PaymentIntent) error
 	GetPaymentIntent(ctx context.Context, id string) (*model.PaymentIntent, error)
 	GetPaymentIntentByExternalID(ctx context.Context, merchantID, externalID string) (*model.PaymentIntent, error)
