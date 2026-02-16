@@ -33,7 +33,7 @@ func NewClient(endpoint string, timeout time.Duration) *Client {
 // The address should be in Q-format ("Q..." 41 chars) — it will be
 // converted to 0x-format for the RPC call.
 func (c *Client) GetBalance(ctx context.Context, qAddress string) (*big.Int, error) {
-	hexAddr := qAddressToHex(qAddress)
+	hexAddr := qAddressToZond(qAddress)
 	result, err := c.call(ctx, "zond_getBalance", hexAddr, "latest")
 	if err != nil {
 		return nil, err
@@ -135,13 +135,13 @@ func (c *Client) call(ctx context.Context, method string, params ...interface{})
 	return rpcResp.Result, nil
 }
 
-// qAddressToHex converts a Q-format address ("Q" + 40 hex) to 0x-format.
-func qAddressToHex(addr string) string {
+// qAddressToZond converts a Q-format address ("Q" + 40 hex) to Z-format for Zond RPC.
+func qAddressToZond(addr string) string {
 	if strings.HasPrefix(addr, "Q") {
-		return "0x" + addr[1:]
+		return "Z" + addr[1:]
 	}
-	if strings.HasPrefix(addr, "0x") || strings.HasPrefix(addr, "0X") {
+	if strings.HasPrefix(addr, "Z") || strings.HasPrefix(addr, "0x") || strings.HasPrefix(addr, "0X") {
 		return addr
 	}
-	return "0x" + addr
+	return "Z" + addr
 }
