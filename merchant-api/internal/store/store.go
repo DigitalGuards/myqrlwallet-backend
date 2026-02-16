@@ -20,6 +20,11 @@ type Store interface {
 	CreateDepositWallet(ctx context.Context, w *model.DepositWallet) error
 	GetDepositWalletByAddress(ctx context.Context, address string) (*model.DepositWallet, error)
 
+	// Address Pool
+	AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error)
+	GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error)
+	AssignAddressAndCreatePayment(ctx context.Context, p *model.PaymentIntent) error
+
 	// Payment Intents
 	CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error
 	CreatePaymentIntent(ctx context.Context, p *model.PaymentIntent) error
