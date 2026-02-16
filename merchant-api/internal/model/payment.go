@@ -23,7 +23,7 @@ type PaymentIntent struct {
 	Confirmations    int           `json:"confirmations"`
 	RequiredConfs    int           `json:"required_confirmations"`
 	ExpiresAt        time.Time     `json:"expires_at"`
-	WebhookDelivered bool          `json:"-"`
+	WebhookEnqueued  bool          `json:"-"`
 	CreatedAt        time.Time     `json:"created_at"`
 	UpdatedAt        time.Time     `json:"updated_at"`
 }

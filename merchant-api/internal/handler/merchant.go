@@ -6,7 +6,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
+	"net/url"
 	"time"
 
 	"github.com/google/uuid"
@@ -37,6 +39,10 @@ func HandleCreateMerchant(s store.Store, masterKey [32]byte) http.HandlerFunc {
 		}
 		if req.Name == "" || req.WebhookURL == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name and webhook_url are required"})
+			return
+		}
+		if err := validateWebhookURL(req.WebhookURL); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
 		}
 
@@ -90,6 +96,26 @@ func HandleCreateMerchant(s store.Store, masterKey [32]byte) http.HandlerFunc {
 			CreatedAt:     now.Format(time.RFC3339),
 		})
 	}
+}
+
+// validateWebhookURL ensures the URL is HTTPS and not pointing at internal/private addresses.
+func validateWebhookURL(rawURL string) error {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("webhook_url is not a valid URL")
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("webhook_url must use HTTPS")
+	}
+	host := u.Hostname()
+	if host == "localhost" || host == "" {
+		return fmt.Errorf("webhook_url must not target localhost")
+	}
+	ip := net.ParseIP(host)
+	if ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
+		return fmt.Errorf("webhook_url must not target private/internal addresses")
+	}
+	return nil
 }
 
 func generateSecureToken(prefix string) (string, error) {

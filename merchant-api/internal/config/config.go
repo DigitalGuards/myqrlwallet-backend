@@ -18,6 +18,7 @@ type Config struct {
 	MonitorInterval         time.Duration
 	DefaultRequiredConfs    int
 	DefaultPaymentTTL       time.Duration
+	WebhookInterval         time.Duration
 	WebhookMaxRetries       int
 	WebhookTimeout          time.Duration
 }
@@ -49,6 +50,11 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("MONITOR_INTERVAL_SECONDS must be >= 1, got %d", monitorSecs)
 	}
 
+	webhookInterval := getEnvInt("WEBHOOK_INTERVAL_SECONDS", 15)
+	if webhookInterval < 1 {
+		return nil, fmt.Errorf("WEBHOOK_INTERVAL_SECONDS must be >= 1, got %d", webhookInterval)
+	}
+
 	webhookTimeout := getEnvInt("WEBHOOK_TIMEOUT_SECONDS", 10)
 	if webhookTimeout < 1 {
 		return nil, fmt.Errorf("WEBHOOK_TIMEOUT_SECONDS must be >= 1, got %d", webhookTimeout)
@@ -68,6 +74,7 @@ func Load() (*Config, error) {
 		MonitorInterval:         time.Duration(monitorSecs) * time.Second,
 		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 10),
 		DefaultPaymentTTL:       time.Duration(paymentTTL) * time.Minute,
+		WebhookInterval:         time.Duration(webhookInterval) * time.Second,
 		WebhookMaxRetries:       getEnvInt("WEBHOOK_MAX_RETRIES", 5),
 		WebhookTimeout:          time.Duration(webhookTimeout) * time.Second,
 	}, nil

@@ -26,10 +26,11 @@ type Store interface {
 	GetPaymentIntent(ctx context.Context, id string) (*model.PaymentIntent, error)
 	GetPaymentIntentByExternalID(ctx context.Context, merchantID, externalID string) (*model.PaymentIntent, error)
 	ListPendingPayments(ctx context.Context) ([]model.PaymentIntent, error)
+	SetPaymentTxHash(ctx context.Context, id string, txHash string) error
 	UpdatePaymentStatus(ctx context.Context, id string, status model.PaymentStatus, txHash string, received string, confirmations int) error
 	ExpireStalePayments(ctx context.Context) (int64, error)
 	ListUndeliveredConfirmed(ctx context.Context) ([]model.PaymentIntent, error)
-	MarkWebhookDelivered(ctx context.Context, paymentID string) error
+	MarkWebhookEnqueued(ctx context.Context, paymentID string) error
 
 	// Webhook Deliveries
 	CreateWebhookDelivery(ctx context.Context, d *model.WebhookDelivery) error

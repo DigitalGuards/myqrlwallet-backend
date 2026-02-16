@@ -35,7 +35,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
     confirmations INT NOT NULL DEFAULT 0,
     required_confs INT NOT NULL DEFAULT 10,
     expires_at TIMESTAMPTZ NOT NULL,
-    webhook_delivered BOOLEAN NOT NULL DEFAULT FALSE,
+    webhook_enqueued BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     UNIQUE(merchant_id, external_id)
@@ -59,3 +59,17 @@ CREATE TABLE IF NOT EXISTS webhook_deliveries (
 );
 CREATE INDEX IF NOT EXISTS idx_webhook_pending ON webhook_deliveries(next_retry_at)
     WHERE delivered_at IS NULL;
+
+-- Add deferred FK from deposit_wallets to payment_intents (created after both tables exist)
+DO $$ BEGIN
+    IF NOT EXISTS (
+        SELECT 1 FROM information_schema.table_constraints
+        WHERE constraint_name = 'fk_wallets_payment_intent'
+    ) THEN
+        ALTER TABLE deposit_wallets
+            ADD CONSTRAINT fk_wallets_payment_intent
+            FOREIGN KEY (payment_intent_id) REFERENCES payment_intents(id)
+            ON DELETE SET NULL
+            DEFERRABLE INITIALLY DEFERRED;
+    END IF;
+END $$;
