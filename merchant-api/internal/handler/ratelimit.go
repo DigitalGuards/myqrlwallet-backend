@@ -1,6 +1,9 @@
 package handler
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -13,24 +16,40 @@ type bucket struct {
 }
 
 // RateLimiter implements an in-memory token bucket rate limiter.
-// Each unique key (API key or IP) gets its own bucket.
+// Each unique key (API key hash or IP) gets its own bucket.
 type RateLimiter struct {
-	mu       sync.Mutex
-	buckets  map[string]*bucket
-	rate     float64 // tokens added per second
-	burst    int     // max tokens (bucket capacity)
-	lastClean time.Time
+	mu      sync.Mutex
+	buckets map[string]*bucket
+	rate    float64 // tokens added per second
+	burst   int     // max tokens (bucket capacity)
 }
 
-// NewRateLimiter creates a rate limiter.
+// NewRateLimiter creates a rate limiter and starts a background cleanup goroutine.
 //   - rate: requests allowed per second (sustained)
 //   - burst: max requests allowed in a burst (bucket size)
 func NewRateLimiter(rate float64, burst int) *RateLimiter {
-	return &RateLimiter{
-		buckets:  make(map[string]*bucket),
-		rate:     rate,
-		burst:    burst,
-		lastClean: time.Now(),
+	rl := &RateLimiter{
+		buckets: make(map[string]*bucket),
+		rate:    rate,
+		burst:   burst,
+	}
+	go rl.cleanup()
+	return rl
+}
+
+// cleanup removes stale buckets every 5 minutes in a background goroutine.
+func (rl *RateLimiter) cleanup() {
+	ticker := time.NewTicker(5 * time.Minute)
+	defer ticker.Stop()
+	for range ticker.C {
+		rl.mu.Lock()
+		now := time.Now()
+		for k, b := range rl.buckets {
+			if now.Sub(b.lastTime) > 10*time.Minute {
+				delete(rl.buckets, k)
+			}
+		}
+		rl.mu.Unlock()
 	}
 }
 
@@ -40,16 +59,6 @@ func (rl *RateLimiter) allow(key string) bool {
 	defer rl.mu.Unlock()
 
 	now := time.Now()
-
-	// Clean stale buckets every 5 minutes to prevent memory growth
-	if now.Sub(rl.lastClean) > 5*time.Minute {
-		for k, b := range rl.buckets {
-			if now.Sub(b.lastTime) > 10*time.Minute {
-				delete(rl.buckets, k)
-			}
-		}
-		rl.lastClean = now
-	}
 
 	b, exists := rl.buckets[key]
 	if !exists {
@@ -76,15 +85,24 @@ func (rl *RateLimiter) allow(key string) bool {
 	return true
 }
 
-// Limit returns HTTP middleware that rate-limits by API key (falls back to IP).
+// clientKey extracts a stable key from the request: hashed API key or IP without port.
+func clientKey(r *http.Request) string {
+	if apiKey := r.Header.Get("X-API-Key"); apiKey != "" {
+		h := sha256.Sum256([]byte(apiKey))
+		return "key:" + hex.EncodeToString(h[:8]) // 8 bytes is enough for bucketing
+	}
+	// Strip port from RemoteAddr
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	return "ip:" + host
+}
+
+// Limit returns HTTP middleware that rate-limits by API key hash (falls back to IP).
 func (rl *RateLimiter) Limit(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		key := r.Header.Get("X-API-Key")
-		if key == "" {
-			key = r.RemoteAddr
-		}
-
-		if !rl.allow(key) {
+		if !rl.allow(clientKey(r)) {
 			w.Header().Set("Retry-After", "1")
 			writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "rate limit exceeded"})
 			return
