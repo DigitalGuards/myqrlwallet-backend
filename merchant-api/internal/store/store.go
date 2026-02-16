@@ -2,9 +2,13 @@ package store
 
 import (
 	"context"
+	"errors"
 
 	"github.com/DigitalGuards/merchant-api/internal/model"
 )
+
+// ErrNoAvailableAddresses is returned when the address pool is empty.
+var ErrNoAvailableAddresses = errors.New("no available addresses in pool")
 
 // Store defines the persistence interface for the merchant payment API.
 type Store interface {
@@ -19,6 +23,16 @@ type Store interface {
 	// Deposit Wallets
 	CreateDepositWallet(ctx context.Context, w *model.DepositWallet) error
 	GetDepositWalletByAddress(ctx context.Context, address string) (*model.DepositWallet, error)
+
+	// Address Pool
+	AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error)
+	GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error)
+	AssignAddressAndCreatePayment(ctx context.Context, p *model.PaymentIntent) error
+	GetAssignedAddressMap(ctx context.Context) (map[string]string, error)
+
+	// Key-Value State
+	GetState(ctx context.Context, key string) (string, error)
+	SetState(ctx context.Context, key, value string) error
 
 	// Payment Intents
 	CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error
