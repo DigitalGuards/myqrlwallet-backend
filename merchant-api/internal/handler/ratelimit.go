@@ -1,6 +1,7 @@
 package handler
 
 import (
+	"context"
 	"crypto/sha256"
 	"encoding/hex"
 	"net"
@@ -8,6 +9,8 @@ import (
 	"sync"
 	"time"
 )
+
+const maxBuckets = 100_000 // cap on bucket map to prevent memory exhaustion
 
 // bucket holds the token state for a single key.
 type bucket struct {
@@ -22,34 +25,48 @@ type RateLimiter struct {
 	buckets map[string]*bucket
 	rate    float64 // tokens added per second
 	burst   int     // max tokens (bucket capacity)
+	cancel  context.CancelFunc
 }
 
 // NewRateLimiter creates a rate limiter and starts a background cleanup goroutine.
+// Call Stop() to release the cleanup goroutine on shutdown.
 //   - rate: requests allowed per second (sustained)
 //   - burst: max requests allowed in a burst (bucket size)
 func NewRateLimiter(rate float64, burst int) *RateLimiter {
+	ctx, cancel := context.WithCancel(context.Background())
 	rl := &RateLimiter{
 		buckets: make(map[string]*bucket),
 		rate:    rate,
 		burst:   burst,
+		cancel:  cancel,
 	}
-	go rl.cleanup()
+	go rl.cleanup(ctx)
 	return rl
 }
 
+// Stop shuts down the background cleanup goroutine.
+func (rl *RateLimiter) Stop() {
+	rl.cancel()
+}
+
 // cleanup removes stale buckets every 5 minutes in a background goroutine.
-func (rl *RateLimiter) cleanup() {
+func (rl *RateLimiter) cleanup(ctx context.Context) {
 	ticker := time.NewTicker(5 * time.Minute)
 	defer ticker.Stop()
-	for range ticker.C {
-		rl.mu.Lock()
-		now := time.Now()
-		for k, b := range rl.buckets {
-			if now.Sub(b.lastTime) > 10*time.Minute {
-				delete(rl.buckets, k)
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			rl.mu.Lock()
+			now := time.Now()
+			for k, b := range rl.buckets {
+				if now.Sub(b.lastTime) > 10*time.Minute {
+					delete(rl.buckets, k)
+				}
 			}
+			rl.mu.Unlock()
 		}
-		rl.mu.Unlock()
 	}
 }
 
@@ -62,6 +79,10 @@ func (rl *RateLimiter) allow(key string) bool {
 
 	b, exists := rl.buckets[key]
 	if !exists {
+		// Enforce max bucket count to prevent memory exhaustion
+		if len(rl.buckets) >= maxBuckets {
+			return false
+		}
 		rl.buckets[key] = &bucket{
 			tokens:   float64(rl.burst) - 1, // consume one token
 			lastTime: now,

@@ -53,7 +53,7 @@ func main() {
 	rpcClient := rpc.NewClient(cfg.ZondRPCEndpoint, 10*time.Second)
 
 	// Build HTTP router
-	router := handler.NewRouter(s, cfg.AdminAPIKey, cfg.MasterEncryptionKey, cfg.DefaultRequiredConfs, cfg.DefaultPaymentTTL)
+	router := handler.NewRouter(s, cfg.AdminAPIKey, cfg.MasterEncryptionKey, cfg.DefaultRequiredConfs, cfg.DefaultPaymentTTL, cfg.RateLimitRate, cfg.RateLimitBurst)
 
 	// Create server
 	addr := fmt.Sprintf(":%d", cfg.Port)
@@ -70,7 +70,7 @@ func main() {
 	defer cancel()
 
 	// Initialize zondscan client for block scanning
-	zondscanClient := zondscan.NewClient(cfg.ZondscanURL)
+	zondscanClient := zondscan.NewClient(cfg.ZondscanURL, cfg.ZondscanTimeout)
 
 	// Start on-chain monitor
 	monitor := worker.NewMonitor(s, rpcClient, zondscanClient, cfg.MonitorInterval)

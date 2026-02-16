@@ -17,11 +17,11 @@ type Client struct {
 }
 
 // NewClient creates a new zondscan API client.
-func NewClient(baseURL string) *Client {
+func NewClient(baseURL string, timeout time.Duration) *Client {
 	return &Client{
 		baseURL: strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{
-			Timeout: 10 * time.Second,
+			Timeout: timeout,
 		},
 	}
 }
