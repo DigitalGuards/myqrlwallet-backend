@@ -20,10 +20,6 @@ type Store interface {
 	GetMerchantByAPIKeyHash(ctx context.Context, hash string) (*model.Merchant, error)
 	GetMerchantByID(ctx context.Context, id string) (*model.Merchant, error)
 
-	// Deposit Wallets
-	CreateDepositWallet(ctx context.Context, w *model.DepositWallet) error
-	GetDepositWalletByAddress(ctx context.Context, address string) (*model.DepositWallet, error)
-
 	// Address Pool
 	AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error)
 	GetPoolStatus(ctx context.Context, merchantID string) (available int, assigned int, err error)
@@ -35,7 +31,6 @@ type Store interface {
 	SetState(ctx context.Context, key, value string) error
 
 	// Payment Intents
-	CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error
 	CreatePaymentIntent(ctx context.Context, p *model.PaymentIntent) error
 	GetPaymentIntent(ctx context.Context, id string) (*model.PaymentIntent, error)
 	GetPaymentIntentByExternalID(ctx context.Context, merchantID, externalID string) (*model.PaymentIntent, error)

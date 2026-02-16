@@ -284,7 +284,6 @@ go build -o merchant-api ./cmd/merchant-api
 |--------|----------|------|-------------|
 | GET | `/health` | None | Health check |
 | POST | `/v1/merchants` | Admin | Create a new merchant |
-| POST | `/v1/wallets` | Merchant | Generate a QRL address (utility) |
 | POST | `/v1/addresses` | Merchant | Upload deposit addresses to pool |
 | GET | `/v1/addresses` | Merchant | Get address pool status |
 | POST | `/v1/payments` | Merchant | Create a payment intent |
@@ -292,22 +291,60 @@ go build -o merchant-api ./cmd/merchant-api
 | GET | `/v1/payments?external_id=X` | Merchant | Look up payment by external ID |
 | PATCH | `/v1/payments/{id}/tx` | Merchant | Submit tx hash (optional fast-path) |
 
+### Merchant Keygen Tool
+
+A CLI tool for merchants to generate QRL wallets locally and upload addresses to the API.
+Private keys never leave the merchant's machine — this is what makes the system non-custodial.
+
+```bash
+cd merchant-api
+go build -o merchant-keygen ./cmd/merchant-keygen
+```
+
+**Usage:**
+
+```bash
+# Generate 50 wallets, save keys locally
+./merchant-keygen -count 50 -out ./my-wallets
+
+# Generate and upload addresses to API in one step
+./merchant-keygen -count 100 -out ./my-wallets \
+  -api https://api.example.com \
+  -key qrl_live_your_api_key_here
+```
+
+**Output files:**
+- `wallets-SECRET-<timestamp>.csv` — Private keys (store offline, never share)
+- `addresses-<timestamp>.json` — Public addresses (safe to upload)
+
+**Flags:**
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-count` | 10 | Number of wallets to generate (1-1000) |
+| `-out` | `.` | Output directory for generated files |
+| `-api` | - | Merchant API base URL (enables auto-upload) |
+| `-key` | - | Merchant API key (required with `-api`) |
+
 ### Payment Flow
 
 ```
-1. Merchant uploads QRL addresses     POST /v1/addresses
-2. Customer checks out                POST /v1/payments (assigns address from pool)
-3. Customer sends QRL to address      (on-chain transaction)
-4. Block scanner detects deposit      (automatic — scans zondscan every ~15s)
-5. Monitor tracks confirmations       (automatic — checks tx receipt)
-6. Payment confirmed                  (webhook fires to merchant URL)
+1. Merchant generates wallets locally  merchant-keygen -count 100
+2. Merchant uploads public addresses   POST /v1/addresses (or via -api flag)
+3. Customer checks out                 POST /v1/payments (assigns address from pool)
+4. Customer sends QRL to address       (on-chain transaction)
+5. Block scanner detects deposit       (automatic — scans zondscan every ~15s)
+6. Monitor tracks confirmations        (automatic — checks tx receipt)
+7. Payment confirmed                   (webhook fires to merchant URL)
 ```
 
 ### Project Structure
 
 ```
 merchant-api/
-├── cmd/merchant-api/       # Entry point
+├── cmd/
+│   ├── merchant-api/       # Server entry point
+│   └── merchant-keygen/    # Client-side wallet generator
 ├── internal/
 │   ├── address/            # Address normalization (Z→Q prefix)
 │   ├── config/             # Environment configuration
