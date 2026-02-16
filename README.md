@@ -270,7 +270,7 @@ go build -o merchant-api ./cmd/merchant-api
 | `ZONDSCAN_URL` | No | https://zondscan.com/api | Zondscan REST API URL |
 | `ZONDSCAN_TIMEOUT_SECONDS` | No | 10 | Zondscan HTTP client timeout |
 | `MONITOR_INTERVAL_SECONDS` | No | 15 | Block monitor polling interval |
-| `DEFAULT_REQUIRED_CONFIRMATIONS` | No | 10 | Confirmations before payment is confirmed |
+| `DEFAULT_REQUIRED_CONFIRMATIONS` | No | 1 | Confirmations before payment is confirmed |
 | `DEFAULT_PAYMENT_TTL_MINUTES` | No | 60 | Payment expiration time |
 | `WEBHOOK_INTERVAL_SECONDS` | No | 15 | Webhook delivery polling interval |
 | `WEBHOOK_MAX_RETRIES` | No | 5 | Max webhook delivery attempts |
