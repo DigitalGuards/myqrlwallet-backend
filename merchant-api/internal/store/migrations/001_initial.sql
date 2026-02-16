@@ -33,7 +33,7 @@ CREATE TABLE IF NOT EXISTS payment_intents (
         CHECK (status IN ('pending','detected','confirmed','expired')),
     tx_hash TEXT,
     confirmations INT NOT NULL DEFAULT 0,
-    required_confs INT NOT NULL DEFAULT 10,
+    required_confs INT NOT NULL DEFAULT 1,
     expires_at TIMESTAMPTZ NOT NULL,
     webhook_enqueued BOOLEAN NOT NULL DEFAULT FALSE,
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
