@@ -225,6 +225,102 @@ src/
     └── cache.js        # Cache configuration
 ```
 
+## Merchant Payment API
+
+A standalone Go microservice for accepting QRL payments. Located in the `merchant-api/` directory.
+
+### Features
+
+- **Non-custodial**: Merchants upload their own QRL addresses — the service never holds private keys
+- **Automatic deposit detection**: Scans new blocks via zondscan.com to discover transactions without merchant intervention
+- **Confirmation tracking**: Monitors tx confirmations and promotes payments through `pending → detected → confirmed`
+- **Webhook notifications**: Delivers HMAC-signed webhook callbacks when payments are confirmed
+- **Rate limiting**: Configurable token bucket rate limiter per API key
+- **Encryption at rest**: Webhook secrets encrypted with AES-256-GCM using a master key
+
+### Prerequisites
+
+- Go 1.24+
+- PostgreSQL 16+
+
+### Quick Start
+
+```bash
+cd merchant-api
+
+# Set required environment variables
+export DATABASE_URL="postgres://user:pass@localhost:5432/merchant_api?sslmode=disable"
+export ADMIN_API_KEY="your-admin-key"
+export MASTER_ENCRYPTION_KEY=$(openssl rand -hex 32)
+
+# Build and run
+go build -o merchant-api ./cmd/merchant-api
+./merchant-api
+```
+
+### Environment Variables
+
+| Variable | Required | Default | Description |
+|----------|----------|---------|-------------|
+| `DATABASE_URL` | Yes | - | PostgreSQL connection string |
+| `ADMIN_API_KEY` | Yes | - | Admin API key for merchant management |
+| `MASTER_ENCRYPTION_KEY` | Yes | - | 64 hex chars (32 bytes) for AES-256-GCM |
+| `PORT` | No | 8080 | HTTP server port |
+| `ZOND_RPC_ENDPOINT` | No | http://localhost:8545 | Zond node JSON-RPC URL |
+| `ZONDSCAN_URL` | No | https://zondscan.com/api | Zondscan REST API URL |
+| `ZONDSCAN_TIMEOUT_SECONDS` | No | 10 | Zondscan HTTP client timeout |
+| `MONITOR_INTERVAL_SECONDS` | No | 15 | Block monitor polling interval |
+| `DEFAULT_REQUIRED_CONFIRMATIONS` | No | 10 | Confirmations before payment is confirmed |
+| `DEFAULT_PAYMENT_TTL_MINUTES` | No | 60 | Payment expiration time |
+| `WEBHOOK_INTERVAL_SECONDS` | No | 15 | Webhook delivery polling interval |
+| `WEBHOOK_MAX_RETRIES` | No | 5 | Max webhook delivery attempts |
+| `WEBHOOK_TIMEOUT_SECONDS` | No | 10 | Webhook HTTP request timeout |
+| `RATE_LIMIT_RPS` | No | 10 | Rate limit: requests per second |
+| `RATE_LIMIT_BURST` | No | 30 | Rate limit: max burst size |
+
+### API Endpoints
+
+| Method | Endpoint | Auth | Description |
+|--------|----------|------|-------------|
+| GET | `/health` | None | Health check |
+| POST | `/v1/merchants` | Admin | Create a new merchant |
+| POST | `/v1/wallets` | Merchant | Generate a QRL address (utility) |
+| POST | `/v1/addresses` | Merchant | Upload deposit addresses to pool |
+| GET | `/v1/addresses` | Merchant | Get address pool status |
+| POST | `/v1/payments` | Merchant | Create a payment intent |
+| GET | `/v1/payments/{id}` | Merchant | Get payment status |
+| GET | `/v1/payments?external_id=X` | Merchant | Look up payment by external ID |
+| PATCH | `/v1/payments/{id}/tx` | Merchant | Submit tx hash (optional fast-path) |
+
+### Payment Flow
+
+```
+1. Merchant uploads QRL addresses     POST /v1/addresses
+2. Customer checks out                POST /v1/payments (assigns address from pool)
+3. Customer sends QRL to address      (on-chain transaction)
+4. Block scanner detects deposit      (automatic — scans zondscan every ~15s)
+5. Monitor tracks confirmations       (automatic — checks tx receipt)
+6. Payment confirmed                  (webhook fires to merchant URL)
+```
+
+### Project Structure
+
+```
+merchant-api/
+├── cmd/merchant-api/       # Entry point
+├── internal/
+│   ├── address/            # Address normalization (Z→Q prefix)
+│   ├── config/             # Environment configuration
+│   ├── crypto/             # AES-256-GCM encryption
+│   ├── handler/            # HTTP handlers + middleware
+│   ├── model/              # Domain types
+│   ├── rpc/                # Zond JSON-RPC client
+│   ├── store/              # PostgreSQL store + migrations
+│   ├── worker/             # Monitor + webhook workers
+│   └── zondscan/           # Zondscan REST API client
+└── go.mod
+```
+
 ## Related Projects
 
 - [myqrlwallet-frontend](https://github.com/DigitalGuards/myqrlwallet-frontend) - React web wallet

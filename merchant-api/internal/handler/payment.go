@@ -2,6 +2,7 @@ package handler
 
 import (
 	"encoding/json"
+	"errors"
 	"log"
 	"math/big"
 	"net/http"
@@ -10,7 +11,6 @@ import (
 
 	"github.com/google/uuid"
 
-	"github.com/DigitalGuards/merchant-api/internal/crypto"
 	"github.com/DigitalGuards/merchant-api/internal/model"
 	"github.com/DigitalGuards/merchant-api/internal/store"
 )
@@ -24,7 +24,7 @@ type createPaymentRequest struct {
 	TTLMinutes    int    `json:"ttl_minutes,omitempty"`
 }
 
-func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, defaultTTL time.Duration) http.HandlerFunc {
+func HandleCreatePayment(s store.Store, defaultConfs int, defaultTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		merchant := MerchantFromContext(r.Context())
 		if merchant == nil {
@@ -61,23 +61,7 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			return
 		}
 
-		// Generate a new deposit wallet for this payment
-		walletResult, err := crypto.GenerateWallet()
-		if err != nil {
-			log.Printf("ERROR: generate wallet for payment: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to generate deposit address"})
-			return
-		}
-
-		seedEnc, seedNonce, err := crypto.Encrypt(masterKey, walletResult.ExtendedSeed[:])
-		if err != nil {
-			log.Printf("ERROR: encrypt seed: %v", err)
-			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
-			return
-		}
-
 		now := time.Now().UTC()
-		paymentID := uuid.New().String()
 
 		confs := defaultConfs
 		if req.RequiredConfs > 0 {
@@ -88,22 +72,11 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			ttl = time.Duration(req.TTLMinutes) * time.Minute
 		}
 
-		// Store wallet and payment atomically
-		wallet := &model.DepositWallet{
-			ID:              uuid.New().String(),
-			MerchantID:      merchant.ID,
-			Address:         walletResult.Address,
-			EncryptedSeed:   seedEnc,
-			SeedNonce:       seedNonce,
-			PaymentIntentID: paymentID,
-			CreatedAt:       now,
-		}
-
+		// Assign address from pool and create payment atomically
 		payment := &model.PaymentIntent{
-			ID:                paymentID,
+			ID:                uuid.New().String(),
 			MerchantID:        merchant.ID,
 			ExternalID:        req.ExternalID,
-			DepositAddress:    walletResult.Address,
 			ExpectedAmountWei: req.AmountWei,
 			ReceivedAmountWei: "0",
 			Status:            model.StatusPending,
@@ -112,8 +85,12 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 			CreatedAt:         now,
 			UpdatedAt:         now,
 		}
-		if err := s.CreatePaymentWithWallet(r.Context(), wallet, payment); err != nil {
-			log.Printf("ERROR: store payment: %v", err)
+		if err := s.AssignAddressAndCreatePayment(r.Context(), payment); err != nil {
+			if errors.Is(err, store.ErrNoAvailableAddresses) {
+				writeJSON(w, http.StatusConflict, map[string]string{"error": "no deposit addresses available, upload more via POST /v1/addresses"})
+				return
+			}
+			log.Printf("ERROR: create payment: %v", err)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create payment"})
 			return
 		}

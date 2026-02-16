@@ -18,6 +18,7 @@ import (
 	"github.com/DigitalGuards/merchant-api/internal/rpc"
 	"github.com/DigitalGuards/merchant-api/internal/store"
 	"github.com/DigitalGuards/merchant-api/internal/worker"
+	"github.com/DigitalGuards/merchant-api/internal/zondscan"
 )
 
 func main() {
@@ -52,7 +53,7 @@ func main() {
 	rpcClient := rpc.NewClient(cfg.ZondRPCEndpoint, 10*time.Second)
 
 	// Build HTTP router
-	router := handler.NewRouter(s, cfg.AdminAPIKey, cfg.MasterEncryptionKey, cfg.DefaultRequiredConfs, cfg.DefaultPaymentTTL)
+	router := handler.NewRouter(s, cfg.AdminAPIKey, cfg.MasterEncryptionKey, cfg.DefaultRequiredConfs, cfg.DefaultPaymentTTL, cfg.RateLimitRate, cfg.RateLimitBurst)
 
 	// Create server
 	addr := fmt.Sprintf(":%d", cfg.Port)
@@ -68,8 +69,11 @@ func main() {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// Initialize zondscan client for block scanning
+	zondscanClient := zondscan.NewClient(cfg.ZondscanURL, cfg.ZondscanTimeout)
+
 	// Start on-chain monitor
-	monitor := worker.NewMonitor(s, rpcClient, cfg.MonitorInterval)
+	monitor := worker.NewMonitor(s, rpcClient, zondscanClient, cfg.MonitorInterval)
 	go monitor.Run(ctx)
 
 	// Start webhook worker

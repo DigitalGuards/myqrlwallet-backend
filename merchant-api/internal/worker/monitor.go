@@ -2,29 +2,39 @@ package worker
 
 import (
 	"context"
+	"fmt"
 	"log"
 	"math/big"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/DigitalGuards/merchant-api/internal/address"
 	"github.com/DigitalGuards/merchant-api/internal/model"
 	"github.com/DigitalGuards/merchant-api/internal/rpc"
 	"github.com/DigitalGuards/merchant-api/internal/store"
+	"github.com/DigitalGuards/merchant-api/internal/zondscan"
+)
+
+const (
+	lastScannedBlockKey = "last_scanned_block"
+	maxBlocksPerTick    = 10
 )
 
 // Monitor polls the Zond blockchain for deposits to pending payment addresses.
 type Monitor struct {
 	store    store.Store
 	rpc      *rpc.Client
+	zondscan *zondscan.Client
 	interval time.Duration
 }
 
 // NewMonitor creates a new on-chain monitor.
-func NewMonitor(s store.Store, rpc *rpc.Client, interval time.Duration) *Monitor {
+func NewMonitor(s store.Store, rpc *rpc.Client, zs *zondscan.Client, interval time.Duration) *Monitor {
 	return &Monitor{
 		store:    s,
 		rpc:      rpc,
+		zondscan: zs,
 		interval: interval,
 	}
 }
@@ -47,6 +57,9 @@ func (m *Monitor) Run(ctx context.Context) {
 }
 
 func (m *Monitor) tick(ctx context.Context) {
+	// Scan new blocks for deposits (auto-detect tx hashes)
+	m.scanBlocks(ctx)
+
 	// Expire stale payments first
 	expired, err := m.store.ExpireStalePayments(ctx)
 	if err != nil {
@@ -71,6 +84,100 @@ func (m *Monitor) tick(ctx context.Context) {
 
 	for _, p := range payments {
 		m.checkPayment(ctx, p, currentBlock)
+	}
+}
+
+// scanBlocks scans new blocks via zondscan for transactions to assigned pool addresses.
+func (m *Monitor) scanBlocks(ctx context.Context) {
+	// Get latest block from zondscan
+	latestBlock, err := m.zondscan.GetLatestBlock(ctx)
+	if err != nil {
+		log.Printf("monitor: zondscan get latest block: %v", err)
+		return
+	}
+
+	// Get last scanned block from DB
+	lastScannedStr, err := m.store.GetState(ctx, lastScannedBlockKey)
+	if err != nil {
+		log.Printf("monitor: get last scanned block: %v", err)
+		return
+	}
+
+	var lastScanned uint64
+	if lastScannedStr == "" {
+		// First run: start from current block (don't scan history)
+		lastScanned = latestBlock
+		if err := m.store.SetState(ctx, lastScannedBlockKey, fmt.Sprintf("%d", latestBlock)); err != nil {
+			log.Printf("monitor: set initial scanned block: %v", err)
+		}
+		return
+	}
+
+	lastScanned, err = strconv.ParseUint(lastScannedStr, 10, 64)
+	if err != nil {
+		log.Printf("monitor: parse last scanned block %q: %v", lastScannedStr, err)
+		return
+	}
+
+	if lastScanned >= latestBlock {
+		return // No new blocks
+	}
+
+	// Load addresses waiting for tx hash discovery
+	addrMap, err := m.store.GetAssignedAddressMap(ctx)
+	if err != nil {
+		log.Printf("monitor: get assigned address map: %v", err)
+		return
+	}
+
+	if len(addrMap) == 0 {
+		// No addresses to watch — just update cursor
+		if err := m.store.SetState(ctx, lastScannedBlockKey, fmt.Sprintf("%d", latestBlock)); err != nil {
+			log.Printf("monitor: set scanned block: %v", err)
+		}
+		return
+	}
+
+	// Scan up to 10 blocks per tick
+	endBlock := latestBlock
+	if endBlock-lastScanned > maxBlocksPerTick {
+		endBlock = lastScanned + maxBlocksPerTick
+	}
+
+	for blockNum := lastScanned + 1; blockNum <= endBlock; blockNum++ {
+		block, err := m.zondscan.GetBlock(ctx, blockNum)
+		if err != nil {
+			log.Printf("monitor: zondscan get block %d: %v", blockNum, err)
+			break // Don't skip blocks — retry next tick
+		}
+
+		for _, tx := range block.Transactions {
+			if tx.To == "" || tx.Status != "0x1" {
+				continue // Skip contract creations and failed txs
+			}
+
+			// Normalize address to Q-prefix for lookup
+			normalizedTo := address.Normalize(tx.To)
+			paymentID, found := addrMap[normalizedTo]
+			if !found {
+				continue
+			}
+
+			log.Printf("monitor: auto-detected tx %s for payment %s (address=%s, block=%d)",
+				tx.Hash, paymentID, normalizedTo, blockNum)
+
+			if err := m.store.SetPaymentTxHash(ctx, paymentID, tx.Hash); err != nil {
+				log.Printf("monitor: set tx hash for payment %s: %v", paymentID, err)
+			}
+
+			// Remove from map so we don't process duplicates within this scan
+			delete(addrMap, normalizedTo)
+		}
+
+		// Update cursor after each successfully scanned block
+		if err := m.store.SetState(ctx, lastScannedBlockKey, fmt.Sprintf("%d", blockNum)); err != nil {
+			log.Printf("monitor: set scanned block: %v", err)
+		}
 	}
 }
 
@@ -170,7 +277,7 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 
 	// No tx hash — re-check balance to track received amount.
 	// Without a tx hash we cannot count real confirmations, so we only
-	// update the received amount and wait for a tx hash to appear.
+	// update the received amount and wait for the block scanner to find the tx.
 	balance, err := m.rpc.GetBalance(ctx, p.DepositAddress)
 	if err != nil {
 		log.Printf("monitor: get balance for %s: %v", p.DepositAddress, err)

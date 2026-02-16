@@ -15,12 +15,16 @@ type Config struct {
 	MasterEncryptionKey     [32]byte
 	DatabaseURL             string
 	ZondRPCEndpoint         string
+	ZondscanURL             string
 	MonitorInterval         time.Duration
 	DefaultRequiredConfs    int
 	DefaultPaymentTTL       time.Duration
 	WebhookInterval         time.Duration
 	WebhookMaxRetries       int
 	WebhookTimeout          time.Duration
+	RateLimitRate           float64
+	RateLimitBurst          int
+	ZondscanTimeout         time.Duration
 }
 
 func Load() (*Config, error) {
@@ -71,12 +75,16 @@ func Load() (*Config, error) {
 		MasterEncryptionKey:     masterKey,
 		DatabaseURL:             dbURL,
 		ZondRPCEndpoint:         getEnvStr("ZOND_RPC_ENDPOINT", "http://localhost:8545"),
+		ZondscanURL:             getEnvStr("ZONDSCAN_URL", "https://zondscan.com/api"),
 		MonitorInterval:         time.Duration(monitorSecs) * time.Second,
 		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 10),
 		DefaultPaymentTTL:       time.Duration(paymentTTL) * time.Minute,
 		WebhookInterval:         time.Duration(webhookInterval) * time.Second,
 		WebhookMaxRetries:       getEnvInt("WEBHOOK_MAX_RETRIES", 5),
 		WebhookTimeout:          time.Duration(webhookTimeout) * time.Second,
+		RateLimitRate:           float64(getEnvInt("RATE_LIMIT_RPS", 10)),
+		RateLimitBurst:          getEnvInt("RATE_LIMIT_BURST", 30),
+		ZondscanTimeout:         time.Duration(getEnvInt("ZONDSCAN_TIMEOUT_SECONDS", 10)) * time.Second,
 	}, nil
 }
 

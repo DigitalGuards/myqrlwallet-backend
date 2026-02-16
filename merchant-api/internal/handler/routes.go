@@ -10,30 +10,37 @@ import (
 )
 
 // NewRouter creates the HTTP router with all routes and middleware.
-func NewRouter(s store.Store, adminKey string, masterKey [32]byte, defaultConfs int, defaultTTL time.Duration) http.Handler {
+func NewRouter(s store.Store, adminKey string, masterKey [32]byte, defaultConfs int, defaultTTL time.Duration, rateLimit float64, rateBurst int) http.Handler {
 	mux := http.NewServeMux()
+	rl := NewRateLimiter(rateLimit, rateBurst)
 
-	// Public
+	// Public (exempt from rate limiting)
 	mux.HandleFunc("GET /health", HandleHealth(s))
 
-	// Admin-only
+	// Admin-only (rate-limited)
 	adminMux := http.NewServeMux()
 	adminMux.HandleFunc("POST /v1/merchants", HandleCreateMerchant(s, masterKey))
-	mux.Handle("/v1/merchants", AdminAuth(adminKey)(adminMux))
+	mux.Handle("/v1/merchants", rl.Limit(AdminAuth(adminKey)(adminMux)))
 
-	// Merchant-authenticated
+	// Merchant-authenticated (rate-limited)
 	authMux := http.NewServeMux()
 	authMux.HandleFunc("POST /v1/wallets", HandleCreateWallet(s, masterKey))
-	authMux.HandleFunc("POST /v1/payments", HandleCreatePayment(s, masterKey, defaultConfs, defaultTTL))
+	authMux.HandleFunc("POST /v1/addresses", HandleAddAddresses(s))
+	authMux.HandleFunc("GET /v1/addresses", HandleGetPoolStatus(s))
+	authMux.HandleFunc("POST /v1/payments", HandleCreatePayment(s, defaultConfs, defaultTTL))
 	authMux.HandleFunc("GET /v1/payments/{id}", HandleGetPayment(s))
 	authMux.HandleFunc("PATCH /v1/payments/{id}/tx", HandleSubmitTxHash(s))
 	authMux.HandleFunc("GET /v1/payments", HandleGetPayment(s))
 
-	mux.Handle("/v1/wallets", APIKeyAuth(s)(authMux))
-	mux.Handle("/v1/payments", APIKeyAuth(s)(authMux))
-	mux.Handle("/v1/payments/", APIKeyAuth(s)(authMux))
+	var authHandler http.Handler = authMux
+	authHandler = rl.Limit(APIKeyAuth(s)(authHandler))
 
-	// Wrap with global middleware
+	mux.Handle("/v1/wallets", authHandler)
+	mux.Handle("/v1/addresses", authHandler)
+	mux.Handle("/v1/payments", authHandler)
+	mux.Handle("/v1/payments/", authHandler)
+
+	// Global middleware (logging + recovery only — rate limiting is per-route above)
 	var handler http.Handler = mux
 	handler = RequestLogger(handler)
 	handler = Recovery(handler)
