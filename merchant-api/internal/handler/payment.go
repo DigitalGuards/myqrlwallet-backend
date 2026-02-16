@@ -3,7 +3,9 @@ package handler
 import (
 	"encoding/json"
 	"log"
+	"math/big"
 	"net/http"
+	"regexp"
 	"time"
 
 	"github.com/google/uuid"
@@ -12,6 +14,8 @@ import (
 	"github.com/DigitalGuards/merchant-api/internal/model"
 	"github.com/DigitalGuards/merchant-api/internal/store"
 )
+
+var hexHashRegex = regexp.MustCompile(`^0x[0-9a-fA-F]{64}$`)
 
 type createPaymentRequest struct {
 	ExternalID    string `json:"external_id"`
@@ -35,6 +39,13 @@ func HandleCreatePayment(s store.Store, masterKey [32]byte, defaultConfs int, de
 		}
 		if req.ExternalID == "" || req.AmountWei == "" {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "external_id and amount_wei are required"})
+			return
+		}
+
+		// Validate amount_wei is a positive integer
+		amount := new(big.Int)
+		if _, ok := amount.SetString(req.AmountWei, 10); !ok || amount.Sign() <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "amount_wei must be a positive integer string"})
 			return
 		}
 
@@ -159,6 +170,63 @@ func HandleGetPayment(s store.Store) http.HandlerFunc {
 			return
 		}
 
+		writeJSON(w, http.StatusOK, payment)
+	}
+}
+
+type submitTxHashRequest struct {
+	TxHash string `json:"tx_hash"`
+}
+
+// HandleSubmitTxHash allows merchants to associate a transaction hash with a payment.
+// This is required for the monitor to track confirmations on-chain.
+func HandleSubmitTxHash(s store.Store) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		merchant := MerchantFromContext(r.Context())
+		if merchant == nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
+			return
+		}
+
+		id := r.PathValue("id")
+		if id == "" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "payment id is required"})
+			return
+		}
+
+		var req submitTxHashRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid JSON"})
+			return
+		}
+		if !hexHashRegex.MatchString(req.TxHash) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tx_hash must be a 0x-prefixed 64-character hex string"})
+			return
+		}
+
+		payment, err := s.GetPaymentIntent(r.Context(), id)
+		if err != nil {
+			log.Printf("ERROR: get payment for tx submit: %v", err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+		if payment == nil || payment.MerchantID != merchant.ID {
+			writeJSON(w, http.StatusNotFound, map[string]string{"error": "payment not found"})
+			return
+		}
+
+		if payment.Status != model.StatusDetected {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "tx_hash can only be submitted for payments in 'detected' status"})
+			return
+		}
+
+		if err := s.SetPaymentTxHash(r.Context(), id, req.TxHash); err != nil {
+			log.Printf("ERROR: set tx hash for payment %s: %v", id, err)
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+			return
+		}
+
+		payment.TxHash = req.TxHash
 		writeJSON(w, http.StatusOK, payment)
 	}
 }

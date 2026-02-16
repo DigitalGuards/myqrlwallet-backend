@@ -26,6 +26,7 @@ func NewRouter(s store.Store, adminKey string, masterKey [32]byte, defaultConfs 
 	authMux.HandleFunc("POST /v1/wallets", HandleCreateWallet(s, masterKey))
 	authMux.HandleFunc("POST /v1/payments", HandleCreatePayment(s, masterKey, defaultConfs, defaultTTL))
 	authMux.HandleFunc("GET /v1/payments/{id}", HandleGetPayment(s))
+	authMux.HandleFunc("PATCH /v1/payments/{id}/tx", HandleSubmitTxHash(s))
 	authMux.HandleFunc("GET /v1/payments", HandleGetPayment(s))
 
 	mux.Handle("/v1/wallets", APIKeyAuth(s)(authMux))

@@ -97,7 +97,10 @@ func (m *Monitor) checkPendingPayment(ctx context.Context, p model.PaymentIntent
 
 	// Validate received amount meets expected amount
 	expected := new(big.Int)
-	expected.SetString(p.ExpectedAmountWei, 10)
+	if _, ok := expected.SetString(p.ExpectedAmountWei, 10); !ok {
+		log.Printf("monitor: invalid expected amount %q for payment %s", p.ExpectedAmountWei, p.ID)
+		return
+	}
 	if balance.Cmp(expected) < 0 {
 		log.Printf("monitor: partial deposit for payment %s (expected=%s, received=%s wei)",
 			p.ID, p.ExpectedAmountWei, balance.String())
@@ -138,9 +141,15 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 
 		// Validate amount before confirming
 		expected := new(big.Int)
-		expected.SetString(p.ExpectedAmountWei, 10)
+		if _, ok := expected.SetString(p.ExpectedAmountWei, 10); !ok {
+			log.Printf("monitor: invalid expected amount %q for payment %s", p.ExpectedAmountWei, p.ID)
+			return
+		}
 		received := new(big.Int)
-		received.SetString(p.ReceivedAmountWei, 10)
+		if _, ok := received.SetString(p.ReceivedAmountWei, 10); !ok {
+			log.Printf("monitor: invalid received amount %q for payment %s", p.ReceivedAmountWei, p.ID)
+			return
+		}
 
 		if confirmations >= p.RequiredConfs {
 			if received.Cmp(expected) < 0 {

@@ -73,7 +73,7 @@ func main() {
 	go monitor.Run(ctx)
 
 	// Start webhook worker
-	webhookWorker := worker.NewWebhookWorker(s, cfg.MasterEncryptionKey, cfg.MonitorInterval, cfg.WebhookMaxRetries, cfg.WebhookTimeout)
+	webhookWorker := worker.NewWebhookWorker(s, cfg.MasterEncryptionKey, cfg.WebhookInterval, cfg.WebhookMaxRetries, cfg.WebhookTimeout)
 	go webhookWorker.Run(ctx)
 
 	// Graceful shutdown on SIGINT/SIGTERM

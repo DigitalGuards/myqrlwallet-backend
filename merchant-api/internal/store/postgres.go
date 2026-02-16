@@ -144,9 +144,9 @@ func (s *PostgresStore) GetPaymentIntent(ctx context.Context, id string) (*model
 	p := &model.PaymentIntent{}
 	var txHash sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
+		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_enqueued, created_at, updated_at
 		 FROM payment_intents WHERE id = $1`, id,
-	).Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookDelivered, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookEnqueued, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -160,9 +160,9 @@ func (s *PostgresStore) GetPaymentIntentByExternalID(ctx context.Context, mercha
 	p := &model.PaymentIntent{}
 	var txHash sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
+		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_enqueued, created_at, updated_at
 		 FROM payment_intents WHERE merchant_id = $1 AND external_id = $2`, merchantID, externalID,
-	).Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookDelivered, &p.CreatedAt, &p.UpdatedAt)
+	).Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookEnqueued, &p.CreatedAt, &p.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -174,13 +174,21 @@ func (s *PostgresStore) GetPaymentIntentByExternalID(ctx context.Context, mercha
 
 func (s *PostgresStore) ListPendingPayments(ctx context.Context) ([]model.PaymentIntent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
+		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_enqueued, created_at, updated_at
 		 FROM payment_intents WHERE status IN ('pending', 'detected') LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	return scanPayments(rows)
+}
+
+func (s *PostgresStore) SetPaymentTxHash(ctx context.Context, id string, txHash string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE payment_intents SET tx_hash = $2, updated_at = NOW() WHERE id = $1`,
+		id, txHash,
+	)
+	return err
 }
 
 func (s *PostgresStore) UpdatePaymentStatus(ctx context.Context, id string, status model.PaymentStatus, txHash string, received string, confirmations int) error {
@@ -203,8 +211,8 @@ func (s *PostgresStore) ExpireStalePayments(ctx context.Context) (int64, error) 
 
 func (s *PostgresStore) ListUndeliveredConfirmed(ctx context.Context) ([]model.PaymentIntent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
-		 FROM payment_intents WHERE status = 'confirmed' AND webhook_delivered = FALSE LIMIT 1000`)
+		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_enqueued, created_at, updated_at
+		 FROM payment_intents WHERE status = 'confirmed' AND webhook_enqueued = FALSE LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}
@@ -212,9 +220,9 @@ func (s *PostgresStore) ListUndeliveredConfirmed(ctx context.Context) ([]model.P
 	return scanPayments(rows)
 }
 
-func (s *PostgresStore) MarkWebhookDelivered(ctx context.Context, paymentID string) error {
+func (s *PostgresStore) MarkWebhookEnqueued(ctx context.Context, paymentID string) error {
 	_, err := s.db.ExecContext(ctx,
-		`UPDATE payment_intents SET webhook_delivered = TRUE, updated_at = NOW() WHERE id = $1`, paymentID)
+		`UPDATE payment_intents SET webhook_enqueued = TRUE, updated_at = NOW() WHERE id = $1`, paymentID)
 	return err
 }
 
@@ -268,7 +276,7 @@ func scanPayments(rows *sql.Rows) ([]model.PaymentIntent, error) {
 	for rows.Next() {
 		var p model.PaymentIntent
 		var txHash sql.NullString
-		if err := rows.Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookDelivered, &p.CreatedAt, &p.UpdatedAt); err != nil {
+		if err := rows.Scan(&p.ID, &p.MerchantID, &p.ExternalID, &p.DepositAddress, &p.ExpectedAmountWei, &p.ReceivedAmountWei, &p.Status, &txHash, &p.Confirmations, &p.RequiredConfs, &p.ExpiresAt, &p.WebhookEnqueued, &p.CreatedAt, &p.UpdatedAt); err != nil {
 			return nil, err
 		}
 		if txHash.Valid {

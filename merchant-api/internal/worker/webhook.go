@@ -154,7 +154,7 @@ func (w *WebhookWorker) enqueueNewWebhooks(ctx context.Context) {
 		}
 
 		// Mark payment as webhook enqueued so we don't re-enqueue
-		if err := w.store.MarkWebhookDelivered(ctx, p.ID); err != nil {
+		if err := w.store.MarkWebhookEnqueued(ctx, p.ID); err != nil {
 			log.Printf("webhook: mark delivered for payment %s: %v", p.ID, err)
 		}
 	}
@@ -204,8 +204,8 @@ func (w *WebhookWorker) deliver(ctx context.Context, d model.WebhookDelivery) {
 func (w *WebhookWorker) handleFailure(ctx context.Context, d model.WebhookDelivery, statusCode int) {
 	if d.Attempt >= w.maxRetries {
 		log.Printf("webhook: delivery %s exhausted retries (%d attempts)", d.ID, d.Attempt)
-		// Mark as failed by setting a far-future retry (effectively abandoned)
-		if err := w.store.UpdateWebhookDelivery(ctx, d.ID, statusCode, false, nil); err != nil {
+		abandonTime := time.Now().UTC().AddDate(100, 0, 0).Format(time.RFC3339)
+		if err := w.store.UpdateWebhookDelivery(ctx, d.ID, statusCode, false, &abandonTime); err != nil {
 			log.Printf("webhook: update delivery %s: %v", d.ID, err)
 		}
 		return
