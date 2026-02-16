@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/subtle"
 	"encoding/hex"
 	"log"
 	"net/http"
@@ -55,7 +56,7 @@ func AdminAuth(adminKey string) func(http.Handler) http.Handler {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			apiKey := r.Header.Get("X-API-Key")
-			if apiKey == "" || apiKey != adminKey {
+			if apiKey == "" || subtle.ConstantTimeCompare([]byte(apiKey), []byte(adminKey)) != 1 {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
 				return
 			}

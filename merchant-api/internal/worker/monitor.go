@@ -95,6 +95,14 @@ func (m *Monitor) checkPendingPayment(ctx context.Context, p model.PaymentIntent
 		return // No deposit yet
 	}
 
+	// Validate received amount meets expected amount
+	expected := new(big.Int)
+	expected.SetString(p.ExpectedAmountWei, 10)
+	if balance.Cmp(expected) < 0 {
+		log.Printf("monitor: partial deposit for payment %s (expected=%s, received=%s wei)",
+			p.ID, p.ExpectedAmountWei, balance.String())
+	}
+
 	log.Printf("monitor: deposit detected for payment %s (address=%s, balance=%s wei)",
 		p.ID, p.DepositAddress, balance.String())
 
@@ -118,13 +126,27 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 			return // Not yet mined
 		}
 
-		txBlock := hexToUint64(receipt.BlockNumber)
+		txBlock, err := hexToUint64(receipt.BlockNumber)
+		if err != nil {
+			log.Printf("monitor: parse block number %q for %s: %v", receipt.BlockNumber, p.TxHash, err)
+			return
+		}
 		confirmations := int(currentBlock - txBlock)
 		if confirmations < 0 {
 			confirmations = 0
 		}
 
+		// Validate amount before confirming
+		expected := new(big.Int)
+		expected.SetString(p.ExpectedAmountWei, 10)
+		received := new(big.Int)
+		received.SetString(p.ReceivedAmountWei, 10)
+
 		if confirmations >= p.RequiredConfs {
+			if received.Cmp(expected) < 0 {
+				log.Printf("monitor: payment %s has %d confirmations but underpaid (expected=%s, received=%s)",
+					p.ID, confirmations, p.ExpectedAmountWei, p.ReceivedAmountWei)
+			}
 			log.Printf("monitor: payment %s confirmed (%d/%d confirmations)",
 				p.ID, confirmations, p.RequiredConfs)
 			err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, p.TxHash, p.ReceivedAmountWei, confirmations)
@@ -137,9 +159,9 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 		return
 	}
 
-	// No tx hash yet — re-check balance and try to find confirmations
-	// For now, use a simple heuristic: if balance is still there after
-	// some blocks, consider it confirmed based on time elapsed
+	// No tx hash — re-check balance to track received amount.
+	// Without a tx hash we cannot count real confirmations, so we only
+	// update the received amount and wait for a tx hash to appear.
 	balance, err := m.rpc.GetBalance(ctx, p.DepositAddress)
 	if err != nil {
 		log.Printf("monitor: get balance for %s: %v", p.DepositAddress, err)
@@ -150,25 +172,14 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 		return // Balance gone (shouldn't happen for deposit addresses)
 	}
 
-	// Estimate confirmations based on time since detection
-	// Zond block time is ~16 seconds
-	timeSinceUpdate := time.Since(p.UpdatedAt)
-	estimatedConfs := int(timeSinceUpdate.Seconds() / 16)
-
-	if estimatedConfs >= p.RequiredConfs {
-		log.Printf("monitor: payment %s confirmed (estimated %d/%d confirmations, no tx hash)",
-			p.ID, estimatedConfs, p.RequiredConfs)
-		err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, "", balance.String(), estimatedConfs)
-	} else {
-		err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, "", balance.String(), estimatedConfs)
-	}
+	// Update balance but do NOT confirm without a real tx hash
+	err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, "", balance.String(), 0)
 	if err != nil {
 		log.Printf("monitor: update payment %s: %v", p.ID, err)
 	}
 }
 
-func hexToUint64(hex string) uint64 {
+func hexToUint64(hex string) (uint64, error) {
 	hex = strings.TrimPrefix(hex, "0x")
-	n, _ := strconv.ParseUint(hex, 16, 64)
-	return n
+	return strconv.ParseUint(hex, 16, 64)
 }
