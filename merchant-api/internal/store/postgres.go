@@ -31,7 +31,7 @@ func (s *PostgresStore) migrate() error {
 	if err != nil {
 		return fmt.Errorf("read migration: %w", err)
 	}
-	_, err = s.db.Exec(string(data))
+	_, err = s.db.ExecContext(context.Background(), string(data))
 	return err
 }
 
@@ -147,7 +147,7 @@ func (s *PostgresStore) GetPaymentIntentByExternalID(ctx context.Context, mercha
 func (s *PostgresStore) ListPendingPayments(ctx context.Context) ([]model.PaymentIntent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
-		 FROM payment_intents WHERE status IN ('pending', 'detected')`)
+		 FROM payment_intents WHERE status IN ('pending', 'detected') LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}
@@ -176,7 +176,7 @@ func (s *PostgresStore) ExpireStalePayments(ctx context.Context) (int64, error) 
 func (s *PostgresStore) ListUndeliveredConfirmed(ctx context.Context) ([]model.PaymentIntent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_delivered, created_at, updated_at
-		 FROM payment_intents WHERE status = 'confirmed' AND webhook_delivered = FALSE`)
+		 FROM payment_intents WHERE status = 'confirmed' AND webhook_delivered = FALSE LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}
@@ -205,7 +205,7 @@ func (s *PostgresStore) ListPendingWebhooks(ctx context.Context) ([]model.Webhoo
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, payment_intent_id, merchant_id, url, payload, hmac_signature, status_code, attempt, next_retry_at, delivered_at, created_at
 		 FROM webhook_deliveries WHERE delivered_at IS NULL AND (next_retry_at IS NULL OR next_retry_at <= NOW())
-		 ORDER BY created_at ASC`)
+		 ORDER BY created_at ASC LIMIT 500`)
 	if err != nil {
 		return nil, err
 	}

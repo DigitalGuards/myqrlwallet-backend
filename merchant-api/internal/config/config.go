@@ -3,6 +3,7 @@ package config
 import (
 	"encoding/hex"
 	"fmt"
+	"log"
 	"os"
 	"strconv"
 	"time"
@@ -43,17 +44,32 @@ func Load() (*Config, error) {
 		return nil, fmt.Errorf("DATABASE_URL is required")
 	}
 
+	monitorSecs := getEnvInt("MONITOR_INTERVAL_SECONDS", 15)
+	if monitorSecs < 1 {
+		return nil, fmt.Errorf("MONITOR_INTERVAL_SECONDS must be >= 1, got %d", monitorSecs)
+	}
+
+	webhookTimeout := getEnvInt("WEBHOOK_TIMEOUT_SECONDS", 10)
+	if webhookTimeout < 1 {
+		return nil, fmt.Errorf("WEBHOOK_TIMEOUT_SECONDS must be >= 1, got %d", webhookTimeout)
+	}
+
+	paymentTTL := getEnvInt("DEFAULT_PAYMENT_TTL_MINUTES", 60)
+	if paymentTTL < 1 {
+		return nil, fmt.Errorf("DEFAULT_PAYMENT_TTL_MINUTES must be >= 1, got %d", paymentTTL)
+	}
+
 	return &Config{
 		Port:                    getEnvInt("PORT", 8080),
 		AdminAPIKey:             adminKey,
 		MasterEncryptionKey:     masterKey,
 		DatabaseURL:             dbURL,
 		ZondRPCEndpoint:         getEnvStr("ZOND_RPC_ENDPOINT", "http://localhost:8545"),
-		MonitorInterval:         time.Duration(getEnvInt("MONITOR_INTERVAL_SECONDS", 15)) * time.Second,
+		MonitorInterval:         time.Duration(monitorSecs) * time.Second,
 		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 10),
-		DefaultPaymentTTL:       time.Duration(getEnvInt("DEFAULT_PAYMENT_TTL_MINUTES", 60)) * time.Minute,
+		DefaultPaymentTTL:       time.Duration(paymentTTL) * time.Minute,
 		WebhookMaxRetries:       getEnvInt("WEBHOOK_MAX_RETRIES", 5),
-		WebhookTimeout:          time.Duration(getEnvInt("WEBHOOK_TIMEOUT_SECONDS", 10)) * time.Second,
+		WebhookTimeout:          time.Duration(webhookTimeout) * time.Second,
 	}, nil
 }
 
@@ -66,9 +82,12 @@ func getEnvStr(key, fallback string) string {
 
 func getEnvInt(key string, fallback int) int {
 	if v := os.Getenv(key); v != "" {
-		if i, err := strconv.Atoi(v); err == nil {
-			return i
+		i, err := strconv.Atoi(v)
+		if err != nil {
+			log.Printf("WARNING: %s=%q is not a valid integer, using default %d", key, v, fallback)
+			return fallback
 		}
+		return i
 	}
 	return fallback
 }
