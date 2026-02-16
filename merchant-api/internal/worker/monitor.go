@@ -1,0 +1,194 @@
+package worker
+
+import (
+	"context"
+	"log"
+	"math/big"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/DigitalGuards/merchant-api/internal/model"
+	"github.com/DigitalGuards/merchant-api/internal/rpc"
+	"github.com/DigitalGuards/merchant-api/internal/store"
+)
+
+// Monitor polls the Zond blockchain for deposits to pending payment addresses.
+type Monitor struct {
+	store    store.Store
+	rpc      *rpc.Client
+	interval time.Duration
+}
+
+// NewMonitor creates a new on-chain monitor.
+func NewMonitor(s store.Store, rpc *rpc.Client, interval time.Duration) *Monitor {
+	return &Monitor{
+		store:    s,
+		rpc:      rpc,
+		interval: interval,
+	}
+}
+
+// Run starts the monitor loop. Blocks until ctx is cancelled.
+func (m *Monitor) Run(ctx context.Context) {
+	log.Printf("monitor: starting (interval=%s)", m.interval)
+	ticker := time.NewTicker(m.interval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Println("monitor: shutting down")
+			return
+		case <-ticker.C:
+			m.tick(ctx)
+		}
+	}
+}
+
+func (m *Monitor) tick(ctx context.Context) {
+	// Expire stale payments first
+	expired, err := m.store.ExpireStalePayments(ctx)
+	if err != nil {
+		log.Printf("monitor: expire stale payments: %v", err)
+	} else if expired > 0 {
+		log.Printf("monitor: expired %d stale payments", expired)
+	}
+
+	// Get current block number for confirmation counting
+	currentBlock, err := m.rpc.GetBlockNumber(ctx)
+	if err != nil {
+		log.Printf("monitor: get block number: %v", err)
+		return
+	}
+
+	// Check all pending/detected payments
+	payments, err := m.store.ListPendingPayments(ctx)
+	if err != nil {
+		log.Printf("monitor: list pending payments: %v", err)
+		return
+	}
+
+	for _, p := range payments {
+		m.checkPayment(ctx, p, currentBlock)
+	}
+}
+
+func (m *Monitor) checkPayment(ctx context.Context, p model.PaymentIntent, currentBlock uint64) {
+	switch p.Status {
+	case model.StatusPending:
+		m.checkPendingPayment(ctx, p)
+	case model.StatusDetected:
+		m.checkDetectedPayment(ctx, p, currentBlock)
+	}
+}
+
+// checkPendingPayment checks if a deposit has been received.
+func (m *Monitor) checkPendingPayment(ctx context.Context, p model.PaymentIntent) {
+	balance, err := m.rpc.GetBalance(ctx, p.DepositAddress)
+	if err != nil {
+		log.Printf("monitor: get balance for %s: %v", p.DepositAddress, err)
+		return
+	}
+
+	if balance.Cmp(big.NewInt(0)) <= 0 {
+		return // No deposit yet
+	}
+
+	// Validate received amount meets expected amount
+	expected := new(big.Int)
+	if _, ok := expected.SetString(p.ExpectedAmountWei, 10); !ok {
+		log.Printf("monitor: invalid expected amount %q for payment %s", p.ExpectedAmountWei, p.ID)
+		return
+	}
+	if balance.Cmp(expected) < 0 {
+		log.Printf("monitor: partial deposit for payment %s (expected=%s, received=%s wei)",
+			p.ID, p.ExpectedAmountWei, balance.String())
+	}
+
+	log.Printf("monitor: deposit detected for payment %s (address=%s, balance=%s wei)",
+		p.ID, p.DepositAddress, balance.String())
+
+	// Move to detected status
+	err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, "", balance.String(), 0)
+	if err != nil {
+		log.Printf("monitor: update payment %s to detected: %v", p.ID, err)
+	}
+}
+
+// checkDetectedPayment counts confirmations and promotes to confirmed when ready.
+func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentIntent, currentBlock uint64) {
+	// If we have a tx hash, check its receipt for block number
+	if p.TxHash != "" {
+		receipt, err := m.rpc.GetTransactionReceipt(ctx, p.TxHash)
+		if err != nil {
+			log.Printf("monitor: get receipt for %s: %v", p.TxHash, err)
+			return
+		}
+		if receipt == nil {
+			return // Not yet mined
+		}
+
+		txBlock, err := hexToUint64(receipt.BlockNumber)
+		if err != nil {
+			log.Printf("monitor: parse block number %q for %s: %v", receipt.BlockNumber, p.TxHash, err)
+			return
+		}
+		confirmations := int(currentBlock - txBlock)
+		if confirmations < 0 {
+			confirmations = 0
+		}
+
+		// Validate amount before confirming
+		expected := new(big.Int)
+		if _, ok := expected.SetString(p.ExpectedAmountWei, 10); !ok {
+			log.Printf("monitor: invalid expected amount %q for payment %s", p.ExpectedAmountWei, p.ID)
+			return
+		}
+		received := new(big.Int)
+		if _, ok := received.SetString(p.ReceivedAmountWei, 10); !ok {
+			log.Printf("monitor: invalid received amount %q for payment %s", p.ReceivedAmountWei, p.ID)
+			return
+		}
+
+		if confirmations >= p.RequiredConfs {
+			if received.Cmp(expected) < 0 {
+				log.Printf("monitor: payment %s has %d confirmations but underpaid (expected=%s, received=%s)",
+					p.ID, confirmations, p.ExpectedAmountWei, p.ReceivedAmountWei)
+			}
+			log.Printf("monitor: payment %s confirmed (%d/%d confirmations)",
+				p.ID, confirmations, p.RequiredConfs)
+			err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, p.TxHash, p.ReceivedAmountWei, confirmations)
+		} else {
+			err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, p.TxHash, p.ReceivedAmountWei, confirmations)
+		}
+		if err != nil {
+			log.Printf("monitor: update payment %s: %v", p.ID, err)
+		}
+		return
+	}
+
+	// No tx hash — re-check balance to track received amount.
+	// Without a tx hash we cannot count real confirmations, so we only
+	// update the received amount and wait for a tx hash to appear.
+	balance, err := m.rpc.GetBalance(ctx, p.DepositAddress)
+	if err != nil {
+		log.Printf("monitor: get balance for %s: %v", p.DepositAddress, err)
+		return
+	}
+
+	if balance.Cmp(big.NewInt(0)) <= 0 {
+		return // Balance gone (shouldn't happen for deposit addresses)
+	}
+
+	// Update balance but do NOT confirm without a real tx hash
+	err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, "", balance.String(), 0)
+	if err != nil {
+		log.Printf("monitor: update payment %s: %v", p.ID, err)
+	}
+}
+
+func hexToUint64(hex string) (uint64, error) {
+	hex = strings.TrimPrefix(hex, "0x")
+	return strconv.ParseUint(hex, 16, 64)
+}
