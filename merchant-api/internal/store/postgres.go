@@ -78,33 +78,6 @@ func (s *PostgresStore) GetMerchantByID(ctx context.Context, id string) (*model.
 	return m, err
 }
 
-// --- Deposit Wallets ---
-
-func (s *PostgresStore) CreateDepositWallet(ctx context.Context, w *model.DepositWallet) error {
-	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO deposit_wallets (id, merchant_id, address, encrypted_seed, seed_nonce, payment_intent_id, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		w.ID, w.MerchantID, w.Address, w.EncryptedSeed, w.SeedNonce, nilIfEmpty(w.PaymentIntentID), w.CreatedAt,
-	)
-	return err
-}
-
-func (s *PostgresStore) GetDepositWalletByAddress(ctx context.Context, address string) (*model.DepositWallet, error) {
-	w := &model.DepositWallet{}
-	var paymentID sql.NullString
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id, merchant_id, address, encrypted_seed, seed_nonce, payment_intent_id, created_at
-		 FROM deposit_wallets WHERE address = $1`, address,
-	).Scan(&w.ID, &w.MerchantID, &w.Address, &w.EncryptedSeed, &w.SeedNonce, &paymentID, &w.CreatedAt)
-	if err == sql.ErrNoRows {
-		return nil, nil
-	}
-	if paymentID.Valid {
-		w.PaymentIntentID = paymentID.String
-	}
-	return w, err
-}
-
 // --- Address Pool ---
 
 func (s *PostgresStore) AddPoolAddresses(ctx context.Context, merchantID string, addresses []string) (int, error) {
@@ -238,34 +211,6 @@ func (s *PostgresStore) SetState(ctx context.Context, key, value string) error {
 }
 
 // --- Payment Intents ---
-
-func (s *PostgresStore) CreatePaymentWithWallet(ctx context.Context, w *model.DepositWallet, p *model.PaymentIntent) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return fmt.Errorf("begin tx: %w", err)
-	}
-	defer tx.Rollback()
-
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO deposit_wallets (id, merchant_id, address, encrypted_seed, seed_nonce, payment_intent_id, created_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-		w.ID, w.MerchantID, w.Address, w.EncryptedSeed, w.SeedNonce, nilIfEmpty(w.PaymentIntentID), w.CreatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("insert wallet: %w", err)
-	}
-
-	_, err = tx.ExecContext(ctx,
-		`INSERT INTO payment_intents (id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, required_confs, expires_at, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)`,
-		p.ID, p.MerchantID, p.ExternalID, p.DepositAddress, p.ExpectedAmountWei, p.ReceivedAmountWei, p.Status, p.RequiredConfs, p.ExpiresAt, p.CreatedAt, p.UpdatedAt,
-	)
-	if err != nil {
-		return fmt.Errorf("insert payment: %w", err)
-	}
-
-	return tx.Commit()
-}
 
 func (s *PostgresStore) CreatePaymentIntent(ctx context.Context, p *model.PaymentIntent) error {
 	_, err := s.db.ExecContext(ctx,

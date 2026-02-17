@@ -26,6 +26,7 @@ type createPaymentRequest struct {
 
 func HandleCreatePayment(s store.Store, defaultConfs int, defaultTTL time.Duration) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
 		merchant := MerchantFromContext(r.Context())
 		if merchant == nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -159,6 +160,7 @@ type submitTxHashRequest struct {
 // This is required for the monitor to track confirmations on-chain.
 func HandleSubmitTxHash(s store.Store) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
+		r.Body = http.MaxBytesReader(w, r.Body, 1<<20) // 1 MB limit
 		merchant := MerchantFromContext(r.Context())
 		if merchant == nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "unauthorized"})
@@ -192,8 +194,8 @@ func HandleSubmitTxHash(s store.Store) http.HandlerFunc {
 			return
 		}
 
-		if payment.Status != model.StatusDetected {
-			writeJSON(w, http.StatusConflict, map[string]string{"error": "tx_hash can only be submitted for payments in 'detected' status"})
+		if payment.Status != model.StatusPending && payment.Status != model.StatusDetected {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "tx_hash can only be submitted for payments in 'pending' or 'detected' status"})
 			return
 		}
 
