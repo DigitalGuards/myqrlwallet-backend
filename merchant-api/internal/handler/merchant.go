@@ -19,8 +19,9 @@ import (
 )
 
 type createMerchantRequest struct {
-	Name       string `json:"name"`
-	WebhookURL string `json:"webhook_url"`
+	Name                     string `json:"name"`
+	WebhookURL               string `json:"webhook_url"`
+	UnderpaymentThresholdBPS *int   `json:"underpayment_threshold_bps,omitempty"`
 }
 
 type createMerchantResponse struct {
@@ -45,6 +46,16 @@ func HandleCreateMerchant(s store.Store, masterKey [32]byte) http.HandlerFunc {
 		if err := validateWebhookURL(req.WebhookURL); err != nil {
 			writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 			return
+		}
+
+		// Validate underpayment threshold if provided
+		var thresholdBPS int
+		if req.UnderpaymentThresholdBPS != nil {
+			thresholdBPS = *req.UnderpaymentThresholdBPS
+			if thresholdBPS < 0 || thresholdBPS > 1000 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "underpayment_threshold_bps must be between 0 and 1000 (0-10%)"})
+				return
+			}
 		}
 
 		// Generate API key
@@ -73,15 +84,16 @@ func HandleCreateMerchant(s store.Store, masterKey [32]byte) http.HandlerFunc {
 
 		now := time.Now().UTC()
 		merchant := &model.Merchant{
-			ID:                 uuid.New().String(),
-			Name:               req.Name,
-			APIKeyHash:         hashAPIKey(apiKey),
-			WebhookURL:         req.WebhookURL,
-			WebhookSecretEnc:   secretEnc,
-			WebhookSecretNonce: secretNonce,
-			IsActive:           true,
-			CreatedAt:          now,
-			UpdatedAt:          now,
+			ID:                       uuid.New().String(),
+			Name:                     req.Name,
+			APIKeyHash:               hashAPIKey(apiKey),
+			WebhookURL:               req.WebhookURL,
+			WebhookSecretEnc:         secretEnc,
+			WebhookSecretNonce:       secretNonce,
+			IsActive:                 true,
+			UnderpaymentThresholdBPS: thresholdBPS,
+			CreatedAt:                now,
+			UpdatedAt:                now,
 		}
 
 		if err := s.CreateMerchant(r.Context(), merchant); err != nil {
@@ -100,6 +112,7 @@ func HandleCreateMerchant(s store.Store, masterKey [32]byte) http.HandlerFunc {
 }
 
 // validateWebhookURL ensures the URL is HTTPS and not pointing at internal/private addresses.
+// Performs DNS resolution to block rebinding attacks (e.g. domains that resolve to 127.0.0.1).
 func validateWebhookURL(rawURL string) error {
 	u, err := url.Parse(rawURL)
 	if err != nil {
@@ -112,11 +125,32 @@ func validateWebhookURL(rawURL string) error {
 	if host == "localhost" || host == "" {
 		return fmt.Errorf("webhook_url must not target localhost")
 	}
-	ip := net.ParseIP(host)
-	if ip != nil && (ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast()) {
-		return fmt.Errorf("webhook_url must not target private/internal addresses")
+
+	// Check literal IP addresses first
+	if ip := net.ParseIP(host); ip != nil {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("webhook_url must not target private/internal addresses")
+		}
+		return nil
+	}
+
+	// Resolve hostname and check all resulting IPs
+	ips, err := net.LookupIP(host)
+	if err != nil {
+		return fmt.Errorf("webhook_url hostname could not be resolved")
+	}
+	for _, ip := range ips {
+		if isBlockedIP(ip) {
+			return fmt.Errorf("webhook_url must not target private/internal addresses")
+		}
 	}
 	return nil
+}
+
+// isBlockedIP returns true for loopback, private, link-local, and unspecified addresses.
+func isBlockedIP(ip net.IP) bool {
+	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() ||
+		ip.IsLinkLocalMulticast() || ip.IsUnspecified()
 }
 
 func generateSecureToken(prefix string) (string, error) {

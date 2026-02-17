@@ -29,17 +29,18 @@ var retryDelays = []time.Duration{
 	4 * time.Hour,
 }
 
-// WebhookPayload is the JSON body sent to merchants on payment confirmation.
+// WebhookPayload is the JSON body sent to merchants on payment status changes
+// (confirmed or underpaid).
 type WebhookPayload struct {
-	PaymentID        string    `json:"payment_id"`
-	ExternalID       string    `json:"external_id"`
-	Status           string    `json:"status"`
-	DepositAddress   string    `json:"deposit_address"`
-	ExpectedAmountWei string  `json:"expected_amount_wei"`
-	ReceivedAmountWei string  `json:"received_amount_wei"`
-	TxHash           string    `json:"tx_hash,omitempty"`
-	Confirmations    int       `json:"confirmations"`
-	ConfirmedAt      time.Time `json:"confirmed_at"`
+	PaymentID         string    `json:"payment_id"`
+	ExternalID        string    `json:"external_id"`
+	Status            string    `json:"status"`
+	DepositAddress    string    `json:"deposit_address"`
+	ExpectedAmountWei string    `json:"expected_amount_wei"`
+	ReceivedAmountWei string    `json:"received_amount_wei"`
+	TxHash            string    `json:"tx_hash,omitempty"`
+	Confirmations     int       `json:"confirmations"`
+	ConfirmedAt       time.Time `json:"confirmed_at"`
 }
 
 // WebhookWorker delivers webhook notifications for confirmed payments.
