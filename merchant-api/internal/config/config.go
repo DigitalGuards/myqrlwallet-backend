@@ -77,7 +77,7 @@ func Load() (*Config, error) {
 		ZondRPCEndpoint:         getEnvStr("ZOND_RPC_ENDPOINT", "http://localhost:8545"),
 		ZondscanURL:             getEnvStr("ZONDSCAN_URL", "https://zondscan.com/api"),
 		MonitorInterval:         time.Duration(monitorSecs) * time.Second,
-		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 10),
+		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 1),
 		DefaultPaymentTTL:       time.Duration(paymentTTL) * time.Minute,
 		WebhookInterval:         time.Duration(webhookInterval) * time.Second,
 		WebhookMaxRetries:       getEnvInt("WEBHOOK_MAX_RETRIES", 5),

@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"time"
 
@@ -52,14 +53,35 @@ type WebhookWorker struct {
 }
 
 // NewWebhookWorker creates a new webhook delivery worker.
+// The HTTP client uses a custom transport that blocks connections to private/loopback
+// IP addresses after DNS resolution, preventing SSRF via DNS rebinding.
 func NewWebhookWorker(s store.Store, masterKey [32]byte, interval time.Duration, maxRetries int, timeout time.Duration) *WebhookWorker {
+	dialer := &net.Dialer{Timeout: 10 * time.Second}
+	transport := &http.Transport{
+		DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			host, port, err := net.SplitHostPort(addr)
+			if err != nil {
+				return nil, fmt.Errorf("invalid address %q: %w", addr, err)
+			}
+			ips, err := net.DefaultResolver.LookupIPAddr(ctx, host)
+			if err != nil {
+				return nil, fmt.Errorf("resolve %q: %w", host, err)
+			}
+			for _, ip := range ips {
+				if ip.IP.IsLoopback() || ip.IP.IsPrivate() || ip.IP.IsLinkLocalUnicast() || ip.IP.IsLinkLocalMulticast() || ip.IP.IsUnspecified() {
+					return nil, fmt.Errorf("webhook target %q resolves to blocked address %s", host, ip.IP)
+				}
+			}
+			return dialer.DialContext(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+		},
+	}
 	return &WebhookWorker{
 		store:      s,
 		masterKey:  masterKey,
 		interval:   interval,
 		maxRetries: maxRetries,
 		timeout:    timeout,
-		httpClient: &http.Client{Timeout: timeout},
+		httpClient: &http.Client{Timeout: timeout, Transport: transport},
 	}
 }
 
