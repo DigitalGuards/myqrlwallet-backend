@@ -9,6 +9,7 @@ const (
 	StatusDetected  PaymentStatus = "detected"
 	StatusConfirmed PaymentStatus = "confirmed"
 	StatusExpired   PaymentStatus = "expired"
+	StatusUnderpaid PaymentStatus = "underpaid"
 )
 
 type PaymentIntent struct {

@@ -260,10 +260,16 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 
 		if confirmations >= p.RequiredConfs {
 			if received.Cmp(expected) < 0 {
-				log.Printf("monitor: payment %s has %d confirmations but is underpaid (expected=%s, received=%s), not confirming",
-					p.ID, confirmations, p.ExpectedAmountWei, p.ReceivedAmountWei)
-				// Keep status as 'detected' but update confirmations
-				err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, p.TxHash, p.ReceivedAmountWei, confirmations)
+				// Underpaid — check if within merchant's auto-accept threshold
+				if m.isWithinUnderpaymentThreshold(ctx, p.MerchantID, expected, received) {
+					log.Printf("monitor: payment %s underpaid but within threshold, auto-confirming (expected=%s, received=%s)",
+						p.ID, p.ExpectedAmountWei, p.ReceivedAmountWei)
+					err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, p.TxHash, p.ReceivedAmountWei, confirmations)
+				} else {
+					log.Printf("monitor: payment %s underpaid beyond threshold (expected=%s, received=%s), marking underpaid",
+						p.ID, p.ExpectedAmountWei, p.ReceivedAmountWei)
+					err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusUnderpaid, p.TxHash, p.ReceivedAmountWei, confirmations)
+				}
 			} else {
 				log.Printf("monitor: payment %s confirmed (%d/%d confirmations)",
 					p.ID, confirmations, p.RequiredConfs)
@@ -296,6 +302,28 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 	if err != nil {
 		log.Printf("monitor: update payment %s: %v", p.ID, err)
 	}
+}
+
+// isWithinUnderpaymentThreshold checks if the shortfall is within the merchant's
+// configured tolerance (in basis points). Returns false if the merchant can't be
+// loaded or has no threshold configured.
+func (m *Monitor) isWithinUnderpaymentThreshold(ctx context.Context, merchantID string, expected, received *big.Int) bool {
+	merchant, err := m.store.GetMerchantByID(ctx, merchantID)
+	if err != nil || merchant == nil {
+		return false
+	}
+	if merchant.UnderpaymentThresholdBPS <= 0 {
+		return false
+	}
+
+	// shortfall = expected - received
+	// thresholdAmount = expected * thresholdBPS / 10000
+	// auto-accept if shortfall <= thresholdAmount
+	shortfall := new(big.Int).Sub(expected, received)
+	thresholdAmount := new(big.Int).Mul(expected, big.NewInt(int64(merchant.UnderpaymentThresholdBPS)))
+	thresholdAmount.Div(thresholdAmount, big.NewInt(10000))
+
+	return shortfall.Cmp(thresholdAmount) <= 0
 }
 
 func hexToUint64(hex string) (uint64, error) {

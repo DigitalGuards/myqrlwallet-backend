@@ -27,7 +27,7 @@ func NewPostgresStore(db *sql.DB) (*PostgresStore, error) {
 }
 
 func (s *PostgresStore) migrate() error {
-	for _, file := range []string{"migrations/001_initial.sql", "migrations/002_address_pool.sql"} {
+	for _, file := range []string{"migrations/001_initial.sql", "migrations/002_address_pool.sql", "migrations/003_underpaid_status.sql"} {
 		data, err := migrations.ReadFile(file)
 		if err != nil {
 			return fmt.Errorf("read %s: %w", file, err)
@@ -47,9 +47,9 @@ func (s *PostgresStore) Ping(ctx context.Context) error {
 
 func (s *PostgresStore) CreateMerchant(ctx context.Context, m *model.Merchant) error {
 	_, err := s.db.ExecContext(ctx,
-		`INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, created_at, updated_at)
-		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
-		m.ID, m.Name, m.APIKeyHash, m.WebhookURL, m.WebhookSecretEnc, m.WebhookSecretNonce, m.IsActive, m.CreatedAt, m.UpdatedAt,
+		`INSERT INTO merchants (id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, underpayment_threshold_bps, created_at, updated_at)
+		 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+		m.ID, m.Name, m.APIKeyHash, m.WebhookURL, m.WebhookSecretEnc, m.WebhookSecretNonce, m.IsActive, m.UnderpaymentThresholdBPS, m.CreatedAt, m.UpdatedAt,
 	)
 	return err
 }
@@ -57,9 +57,9 @@ func (s *PostgresStore) CreateMerchant(ctx context.Context, m *model.Merchant) e
 func (s *PostgresStore) GetMerchantByAPIKeyHash(ctx context.Context, hash string) (*model.Merchant, error) {
 	m := &model.Merchant{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, created_at, updated_at
+		`SELECT id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, underpayment_threshold_bps, created_at, updated_at
 		 FROM merchants WHERE api_key_hash = $1 AND is_active = TRUE`, hash,
-	).Scan(&m.ID, &m.Name, &m.APIKeyHash, &m.WebhookURL, &m.WebhookSecretEnc, &m.WebhookSecretNonce, &m.IsActive, &m.CreatedAt, &m.UpdatedAt)
+	).Scan(&m.ID, &m.Name, &m.APIKeyHash, &m.WebhookURL, &m.WebhookSecretEnc, &m.WebhookSecretNonce, &m.IsActive, &m.UnderpaymentThresholdBPS, &m.CreatedAt, &m.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -69,9 +69,9 @@ func (s *PostgresStore) GetMerchantByAPIKeyHash(ctx context.Context, hash string
 func (s *PostgresStore) GetMerchantByID(ctx context.Context, id string) (*model.Merchant, error) {
 	m := &model.Merchant{}
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, created_at, updated_at
+		`SELECT id, name, api_key_hash, webhook_url, webhook_secret_enc, webhook_secret_nonce, is_active, underpayment_threshold_bps, created_at, updated_at
 		 FROM merchants WHERE id = $1`, id,
-	).Scan(&m.ID, &m.Name, &m.APIKeyHash, &m.WebhookURL, &m.WebhookSecretEnc, &m.WebhookSecretNonce, &m.IsActive, &m.CreatedAt, &m.UpdatedAt)
+	).Scan(&m.ID, &m.Name, &m.APIKeyHash, &m.WebhookURL, &m.WebhookSecretEnc, &m.WebhookSecretNonce, &m.IsActive, &m.UnderpaymentThresholdBPS, &m.CreatedAt, &m.UpdatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -293,7 +293,7 @@ func (s *PostgresStore) ExpireStalePayments(ctx context.Context) (int64, error) 
 func (s *PostgresStore) ListUndeliveredConfirmed(ctx context.Context) ([]model.PaymentIntent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, merchant_id, external_id, deposit_address, expected_amount_wei, received_amount_wei, status, tx_hash, confirmations, required_confs, expires_at, webhook_enqueued, created_at, updated_at
-		 FROM payment_intents WHERE status = 'confirmed' AND webhook_enqueued = FALSE LIMIT 1000`)
+		 FROM payment_intents WHERE status IN ('confirmed', 'underpaid') AND webhook_enqueued = FALSE LIMIT 1000`)
 	if err != nil {
 		return nil, err
 	}

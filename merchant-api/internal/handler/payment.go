@@ -66,10 +66,18 @@ func HandleCreatePayment(s store.Store, defaultConfs int, defaultTTL time.Durati
 
 		confs := defaultConfs
 		if req.RequiredConfs > 0 {
+			if req.RequiredConfs > 1000 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "required_confirmations must be <= 1000"})
+				return
+			}
 			confs = req.RequiredConfs
 		}
 		ttl := defaultTTL
 		if req.TTLMinutes > 0 {
+			if req.TTLMinutes > 10080 {
+				writeJSON(w, http.StatusBadRequest, map[string]string{"error": "ttl_minutes must be <= 10080 (7 days)"})
+				return
+			}
 			ttl = time.Duration(req.TTLMinutes) * time.Minute
 		}
 
