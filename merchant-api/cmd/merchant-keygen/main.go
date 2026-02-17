@@ -120,7 +120,10 @@ func uploadAddresses(baseURL, apiKey string, addresses []string) error {
 	}
 	defer resp.Body.Close()
 
-	respBody, _ := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return fmt.Errorf("read response body: %w", err)
+	}
 
 	if resp.StatusCode != http.StatusOK {
 		return fmt.Errorf("API returned %d: %s", resp.StatusCode, string(respBody))

@@ -260,12 +260,15 @@ func (m *Monitor) checkDetectedPayment(ctx context.Context, p model.PaymentInten
 
 		if confirmations >= p.RequiredConfs {
 			if received.Cmp(expected) < 0 {
-				log.Printf("monitor: payment %s has %d confirmations but underpaid (expected=%s, received=%s)",
+				log.Printf("monitor: payment %s has %d confirmations but is underpaid (expected=%s, received=%s), not confirming",
 					p.ID, confirmations, p.ExpectedAmountWei, p.ReceivedAmountWei)
+				// Keep status as 'detected' but update confirmations
+				err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, p.TxHash, p.ReceivedAmountWei, confirmations)
+			} else {
+				log.Printf("monitor: payment %s confirmed (%d/%d confirmations)",
+					p.ID, confirmations, p.RequiredConfs)
+				err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, p.TxHash, p.ReceivedAmountWei, confirmations)
 			}
-			log.Printf("monitor: payment %s confirmed (%d/%d confirmations)",
-				p.ID, confirmations, p.RequiredConfs)
-			err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusConfirmed, p.TxHash, p.ReceivedAmountWei, confirmations)
 		} else {
 			err = m.store.UpdatePaymentStatus(ctx, p.ID, model.StatusDetected, p.TxHash, p.ReceivedAmountWei, confirmations)
 		}
