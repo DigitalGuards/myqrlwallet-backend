@@ -192,11 +192,7 @@ func TestWebhook_DeliversSuccessfully(t *testing.T) {
 
 	// Assert delivery is marked as delivered (DeliveredAt != nil)
 	// We need to check all webhooks since we don't know the ID
-	found := false
-	for i := 0; i < ms.WebhookCount(); i++ {
-		// Iterate via ListPendingWebhooks won't find delivered ones, so check directly
-	}
-	// Use ListPendingWebhooks: delivered webhooks should NOT appear
+	// Delivered webhooks should NOT appear in pending list
 	pending, err := ms.ListPendingWebhooks(context.Background())
 	if err != nil {
 		t.Fatal(err)
@@ -204,7 +200,6 @@ func TestWebhook_DeliversSuccessfully(t *testing.T) {
 	if len(pending) != 0 {
 		t.Fatalf("expected 0 pending webhooks after successful delivery, got %d", len(pending))
 	}
-	_ = found
 }
 
 func TestWebhook_RetriesOn500(t *testing.T) {

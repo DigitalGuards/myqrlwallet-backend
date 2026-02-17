@@ -2,6 +2,7 @@ package testutil
 
 import (
 	"context"
+	"fmt"
 	"sync"
 	"time"
 
@@ -382,9 +383,10 @@ func (m *MockStore) UpdateWebhookDelivery(_ context.Context, id string, statusCo
 		d.Attempt++
 		if nextRetry != nil {
 			t, err := time.Parse(time.RFC3339, *nextRetry)
-			if err == nil {
-				d.NextRetryAt = &t
+			if err != nil {
+				panic(fmt.Sprintf("mock store: invalid time format for nextRetry: %v", err))
 			}
+			d.NextRetryAt = &t
 		}
 	}
 	return nil

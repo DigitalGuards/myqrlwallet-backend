@@ -5,6 +5,6 @@ ALTER TABLE payment_intents DROP CONSTRAINT IF EXISTS payment_intents_status_che
 ALTER TABLE payment_intents ADD CONSTRAINT payment_intents_status_check
     CHECK (status IN ('pending','detected','confirmed','expired','underpaid'));
 
--- 2. Add underpayment tolerance (basis points, 0-10000) to merchants.
---    0 = no tolerance (default), 100 = 1%, 500 = 5%, etc.
+-- 2. Add underpayment tolerance (basis points, 0-1000) to merchants.
+--    0 = no tolerance (default), 100 = 1%, 500 = 5%, 1000 = 10% max.
 ALTER TABLE merchants ADD COLUMN IF NOT EXISTS underpayment_threshold_bps INT NOT NULL DEFAULT 0;
