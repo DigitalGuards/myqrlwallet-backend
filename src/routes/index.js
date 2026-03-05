@@ -9,4 +9,4 @@ router.use('/health', healthRoutes);
 router.use('/api/zond-rpc', rpcRoutes);
 router.use('/api', appRouter);
 
-export const routes = router; 
+export const routes = router;

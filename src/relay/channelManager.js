@@ -32,6 +32,8 @@ class ChannelManager {
         participants: new Map(),
         lastActivity: Date.now(),
         messageBuffer: [],
+        /** @type {Map<string, number>} Monotonic sequence numbers per sender socketId */
+        seqNumbers: new Map(),
       };
       this.channels.set(channelId, channel);
     }
@@ -118,14 +120,22 @@ class ChannelManager {
       return { buffered: false, error: 'Sender not in channel' };
     }
 
+    // Replay protection: enforce monotonic sequence numbers per sender.
+    // If the message includes a seq number, reject duplicates and out-of-order.
+    if (typeof data?.seq === 'number') {
+      const lastSeq = channel.seqNumbers.get(senderSocketId) ?? -1;
+      if (data.seq <= lastSeq) {
+        return { buffered: false, error: 'Duplicate or out-of-order message (replay rejected)' };
+      }
+      channel.seqNumbers.set(senderSocketId, data.seq);
+    }
+
     // Find counterparty (the other participant)
     let targetSocketId = null;
-    let targetClientType = null;
 
-    for (const [sid, participant] of channel.participants) {
+    for (const [sid] of channel.participants) {
       if (sid !== senderSocketId) {
         targetSocketId = sid;
-        targetClientType = participant.clientType;
         break;
       }
     }
@@ -194,10 +204,7 @@ class ChannelManager {
       );
 
       // Remove channels inactive beyond TTL with no participants
-      if (
-        channel.participants.size === 0 &&
-        now - channel.lastActivity > CHANNEL_TTL_MS
-      ) {
+      if (channel.participants.size === 0 && now - channel.lastActivity > CHANNEL_TTL_MS) {
         this.channels.delete(channelId);
       }
     }
@@ -220,6 +227,14 @@ class ChannelManager {
       totalParticipants,
       totalBufferedMessages: totalBuffered,
     };
+  }
+
+  /**
+   * Get current number of tracked channels in O(1).
+   * Useful for admission control before creating new channels.
+   */
+  getActiveChannelCount() {
+    return this.channels.size;
   }
 
   /**

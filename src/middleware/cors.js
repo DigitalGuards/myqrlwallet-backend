@@ -8,5 +8,5 @@ export const corsMiddleware = cors({
     } else {
       callback(new Error('Not allowed by CORS'));
     }
-  }
-}); 
+  },
+});
