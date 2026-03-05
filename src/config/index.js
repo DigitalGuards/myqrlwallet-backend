@@ -7,6 +7,7 @@ export const CONFIG = {
   PORT: process.env.PORT || 3000,
   NODE_ENV: process.env.NODE_ENV || 'development',
   CACHE_TTL: parseInt(process.env.CACHE_TTL || '10', 10),
+  RELAY_STATS_TOKEN: process.env.RELAY_STATS_TOKEN || '',
   
   ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '')
     .split(',')
