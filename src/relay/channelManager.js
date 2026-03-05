@@ -10,9 +10,10 @@ const BUFFER_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Run cleanup every minute
 
 class ChannelManager {
-  constructor() {
+  constructor(options = {}) {
     /** @type {Map<string, Channel>} */
     this.channels = new Map();
+    this.isSocketActive = options.isSocketActive || (() => false);
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
   }
 
@@ -35,10 +36,16 @@ class ChannelManager {
       this.channels.set(channelId, channel);
     }
 
-    // Check if this client type already has a different socket connected
+    // Prevent active participant hijacking by requiring stale socket replacement only.
     for (const [existingSocketId, participant] of channel.participants) {
       if (participant.clientType === clientType && existingSocketId !== socketId) {
-        // Same client type reconnecting with new socket - remove old entry
+        if (this.isSocketActive(existingSocketId)) {
+          return {
+            success: false,
+            error: `A ${clientType} participant is already connected`,
+          };
+        }
+        // Allow replacing stale/disconnected participant socket.
         channel.participants.delete(existingSocketId);
         break;
       }
@@ -52,13 +59,16 @@ class ChannelManager {
     channel.lastActivity = Date.now();
 
     // Deliver buffered messages for this client type
-    const buffered = channel.messageBuffer.filter(
-      (msg) => msg.targetClientType === clientType
-    );
-    // Remove delivered messages from buffer
-    channel.messageBuffer = channel.messageBuffer.filter(
-      (msg) => msg.targetClientType !== clientType
-    );
+    const buffered = [];
+    const newBuffer = [];
+    for (const msg of channel.messageBuffer) {
+      if (msg.targetClientType === clientType) {
+        buffered.push(msg);
+      } else {
+        newBuffer.push(msg);
+      }
+    }
+    channel.messageBuffer = newBuffer;
 
     return {
       success: true,
@@ -70,16 +80,21 @@ class ChannelManager {
    * Remove a participant from their channel.
    * @param {string} socketId
    * @param {string} channelId
+   * @returns {{ clientType: string, joinedAt: number }|null}
    */
   leave(socketId, channelId) {
     const channel = this.channels.get(channelId);
-    if (!channel) return;
+    if (!channel) return null;
+
+    const participant = channel.participants.get(socketId);
+    if (!participant) return null;
 
     channel.participants.delete(socketId);
     channel.lastActivity = Date.now();
 
-    // Don't delete channel immediately - allow reconnection
-    // Cleanup timer will handle stale channels
+    // Don't delete channel immediately - allow reconnection.
+    // Cleanup timer will handle stale channels.
+    return participant;
   }
 
   /**

@@ -8,11 +8,14 @@
 
 import { Server } from 'socket.io';
 import { ChannelManager } from './channelManager.js';
+import { CONFIG } from '../config/index.js';
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX_MESSAGES = 100; // per window per IP
+const RATE_LIMIT_MAX_JOINS = 30; // per window per IP
 const MAX_CHANNEL_ID_LENGTH = 128;
 const CHANNEL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
+const MAX_MESSAGE_BYTES = 256 * 1024;
 
 /**
  * Validate channel identifiers to avoid unbounded relay state growth.
@@ -34,42 +37,77 @@ function isValidChannelId(channelId) {
  * @returns {Server} Socket.IO server instance
  */
 export function createRelayServer(httpServer) {
-  const channelManager = new ChannelManager();
+  /** @type {Server|undefined} */
+  let io;
+  const channelManager = new ChannelManager({
+    isSocketActive: (socketId) => io?.sockets?.sockets?.has(socketId) ?? false,
+  });
 
-  /** @type {Map<string, { count: number, resetAt: number }>} */
+  /** @type {Map<string, { counts: Record<string, number>, resetAt: number }>} */
   const rateLimits = new Map();
 
-  const io = new Server(httpServer, {
+  const allowedOrigins = new Set(CONFIG.ALLOWED_ORIGINS);
+  const allowAllOrigins = CONFIG.NODE_ENV !== 'production' && allowedOrigins.size === 0;
+
+  io = new Server(httpServer, {
     cors: {
-      origin: '*', // Messages are E2E encrypted
+      origin: (origin, callback) => {
+        if (!origin || allowAllOrigins || allowedOrigins.has(origin)) {
+          callback(null, true);
+          return;
+        }
+        callback(new Error('Origin not allowed by relay CORS policy'));
+      },
       methods: ['GET', 'POST'],
     },
     path: '/relay',
     transports: ['websocket', 'polling'],
     pingInterval: 25000,
     pingTimeout: 20000,
+    maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
   /**
-   * Check rate limit for an IP address.
+   * Check a named rate limit bucket for an IP address.
    * @param {string} ip
+   * @param {'message'|'join'} bucket
+   * @param {number} limit
    * @returns {boolean} true if allowed
    */
-  function checkRateLimit(ip) {
+  function checkRateLimit(ip, bucket, limit) {
     const now = Date.now();
     let entry = rateLimits.get(ip);
 
     if (!entry || now > entry.resetAt) {
-      entry = { count: 0, resetAt: now + RATE_LIMIT_WINDOW_MS };
+      entry = { counts: { message: 0, join: 0 }, resetAt: now + RATE_LIMIT_WINDOW_MS };
       rateLimits.set(ip, entry);
     }
 
-    entry.count++;
-    return entry.count <= RATE_LIMIT_MAX_MESSAGES;
+    entry.counts[bucket] = (entry.counts[bucket] || 0) + 1;
+    return entry.counts[bucket] <= limit;
+  }
+
+  /**
+   * Approximate message payload size for memory-DoS protection.
+   * @param {unknown} message
+   * @returns {number}
+   */
+  function getMessageSizeBytes(message) {
+    try {
+      if (typeof message === 'string') {
+        return Buffer.byteLength(message, 'utf8');
+      }
+      if (typeof message === 'object' && message !== null) {
+        return Buffer.byteLength(JSON.stringify(message), 'utf8');
+      }
+      return 0;
+    } catch {
+      return MAX_MESSAGE_BYTES + 1;
+    }
   }
 
   // Cleanup rate limit entries periodically
-  setInterval(() => {
+  const rateLimitCleanupTimer = setInterval(() => {
     const now = Date.now();
     for (const [ip, entry] of rateLimits) {
       if (now > entry.resetAt) {
@@ -79,9 +117,7 @@ export function createRelayServer(httpServer) {
   }, RATE_LIMIT_WINDOW_MS);
 
   io.on('connection', (socket) => {
-    const ip =
-      socket.handshake.headers['x-forwarded-for']?.split(',')[0]?.trim() ||
-      socket.handshake.address;
+    const ip = socket.handshake.address;
 
     let currentChannelId = null;
 
@@ -90,6 +126,10 @@ export function createRelayServer(httpServer) {
      * Payload: { channelId: string, clientType: 'dapp' | 'wallet' }
      */
     socket.on('join_channel', (payload, callback) => {
+      if (!checkRateLimit(ip, 'join', RATE_LIMIT_MAX_JOINS)) {
+        return callback?.({ success: false, error: 'Join rate limit exceeded' });
+      }
+
       const { channelId, clientType } = payload || {};
 
       if (!isValidChannelId(channelId)) {
@@ -135,14 +175,17 @@ export function createRelayServer(httpServer) {
      * Payload: { id: channelId, message: encryptedData, clientType: string }
      */
     socket.on('message', (payload, callback) => {
-      if (!checkRateLimit(ip)) {
+      if (!checkRateLimit(ip, 'message', RATE_LIMIT_MAX_MESSAGES)) {
         return callback?.({ success: false, error: 'Rate limit exceeded' });
       }
 
-      const { id: channelId, message, clientType } = payload || {};
+      const { id: channelId, message } = payload || {};
 
       if (!isValidChannelId(channelId) || !message) {
         return callback?.({ success: false, error: 'Invalid channelId or missing message' });
+      }
+      if (getMessageSizeBytes(message) > MAX_MESSAGE_BYTES) {
+        return callback?.({ success: false, error: 'Message payload too large' });
       }
 
       const result = channelManager.routeMessage(channelId, socket.id, payload);
@@ -167,12 +210,12 @@ export function createRelayServer(httpServer) {
 
       if (channelId) {
         socket.leave(channelId);
-        channelManager.leave(socket.id, channelId);
+        const participant = channelManager.leave(socket.id, channelId);
 
         // Notify other participant
         socket.to(channelId).emit('participants_changed', {
           event: 'leave',
-          clientType: null,
+          clientType: participant?.clientType || null,
         });
 
         if (currentChannelId === channelId) {
@@ -195,11 +238,12 @@ export function createRelayServer(httpServer) {
      */
     socket.on('disconnect', () => {
       if (currentChannelId) {
-        channelManager.leave(socket.id, currentChannelId);
+        const participant = channelManager.leave(socket.id, currentChannelId);
 
         // Notify remaining participant
         socket.to(currentChannelId).emit('participants_changed', {
           event: 'disconnect',
+          clientType: participant?.clientType || null,
         });
       }
     });
@@ -207,6 +251,13 @@ export function createRelayServer(httpServer) {
 
   // Expose stats endpoint for health checks
   io.channelManager = channelManager;
+  io.destroy = () => {
+    if (rateLimitCleanupTimer) {
+      clearInterval(rateLimitCleanupTimer);
+    }
+    channelManager.destroy();
+    io.removeAllListeners();
+  };
 
   return io;
 }
