@@ -46,18 +46,11 @@ export function createRelayServer(httpServer) {
   /** @type {Map<string, { counts: Record<string, number>, resetAt: number }>} */
   const rateLimits = new Map();
 
-  const allowedOrigins = new Set(CONFIG.ALLOWED_ORIGINS);
-  const allowAllOrigins = CONFIG.NODE_ENV !== 'production' && allowedOrigins.size === 0;
-
   io = new Server(httpServer, {
     cors: {
-      origin: (origin, callback) => {
-        if (!origin || allowAllOrigins || allowedOrigins.has(origin)) {
-          callback(null, true);
-          return;
-        }
-        callback(new Error('Origin not allowed by relay CORS policy'));
-      },
+      // Relay allows all origins — it only routes E2E encrypted ciphertext
+      // and any dApp in the world should be able to connect.
+      origin: true,
       methods: ['GET', 'POST'],
     },
     path: '/relay',
