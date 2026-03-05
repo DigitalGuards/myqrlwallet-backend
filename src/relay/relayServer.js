@@ -9,10 +9,12 @@
 import { Server } from 'socket.io';
 import { ChannelManager } from './channelManager.js';
 import { CONFIG } from '../config/index.js';
+import * as metrics from './metrics.js';
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX_MESSAGES = 100; // per window per IP
 const RATE_LIMIT_MAX_JOINS = 30; // per window per IP
+const RATE_LIMIT_MAX_CONNECTIONS = 60; // new connections per window per IP
 const MAX_CHANNEL_ID_LENGTH = 128;
 const CHANNEL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_MESSAGE_BYTES = 256 * 1024;
@@ -45,6 +47,8 @@ export function createRelayServer(httpServer) {
 
   /** @type {Map<string, { counts: Record<string, number>, resetAt: number }>} */
   const rateLimits = new Map();
+  /** @type {Map<string, number>} */
+  const activeSocketsByIp = new Map();
 
   io = new Server(httpServer, {
     cors: {
@@ -63,7 +67,7 @@ export function createRelayServer(httpServer) {
   /**
    * Check a named rate limit bucket for an IP address.
    * @param {string} ip
-   * @param {'message'|'join'} bucket
+   * @param {'connect'|'message'|'join'} bucket
    * @param {number} limit
    * @returns {boolean} true if allowed
    */
@@ -72,7 +76,7 @@ export function createRelayServer(httpServer) {
     let entry = rateLimits.get(ip);
 
     if (!entry || now > entry.resetAt) {
-      entry = { counts: { message: 0, join: 0 }, resetAt: now + RATE_LIMIT_WINDOW_MS };
+      entry = { counts: { connect: 0, message: 0, join: 0 }, resetAt: now + RATE_LIMIT_WINDOW_MS };
       rateLimits.set(ip, entry);
     }
 
@@ -110,9 +114,54 @@ export function createRelayServer(httpServer) {
   }, RATE_LIMIT_WINDOW_MS);
 
   io.on('connection', (socket) => {
-    const ip = socket.handshake.address;
+    const ip = socket.handshake.address || 'unknown';
 
+    if (!checkRateLimit(ip, 'connect', RATE_LIMIT_MAX_CONNECTIONS)) {
+      metrics.rateLimitHits.inc({ bucket: 'connect' });
+      socket.disconnect(true);
+      return;
+    }
+
+    const activeForIp = (activeSocketsByIp.get(ip) || 0) + 1;
+    activeSocketsByIp.set(ip, activeForIp);
+    if (activeForIp > CONFIG.RELAY_MAX_SOCKETS_PER_IP) {
+      activeSocketsByIp.set(ip, activeForIp - 1);
+      if (activeForIp - 1 <= 0) {
+        activeSocketsByIp.delete(ip);
+      }
+      metrics.rateLimitHits.inc({ bucket: 'per_ip_cap' });
+      socket.disconnect(true);
+      return;
+    }
+    if (io.engine.clientsCount > CONFIG.RELAY_MAX_ACTIVE_SOCKETS) {
+      const updatedCount = (activeSocketsByIp.get(ip) || 1) - 1;
+      if (updatedCount > 0) {
+        activeSocketsByIp.set(ip, updatedCount);
+      } else {
+        activeSocketsByIp.delete(ip);
+      }
+      metrics.rateLimitHits.inc({ bucket: 'global_cap' });
+      socket.disconnect(true);
+      return;
+    }
+
+    metrics.connectionsTotal.inc();
+    metrics.activeSockets.inc();
     let currentChannelId = null;
+    let releasedSocketCounter = false;
+
+    const releaseSocketCounter = () => {
+      if (releasedSocketCounter) {
+        return;
+      }
+      releasedSocketCounter = true;
+      const count = activeSocketsByIp.get(ip) || 0;
+      if (count <= 1) {
+        activeSocketsByIp.delete(ip);
+      } else {
+        activeSocketsByIp.set(ip, count - 1);
+      }
+    };
 
     /**
      * join_channel - Join or create a channel room.
@@ -120,6 +169,7 @@ export function createRelayServer(httpServer) {
      */
     socket.on('join_channel', (payload, callback) => {
       if (!checkRateLimit(ip, 'join', RATE_LIMIT_MAX_JOINS)) {
+        metrics.rateLimitHits.inc({ bucket: 'join' });
         return callback?.({ success: false, error: 'Join rate limit exceeded' });
       }
 
@@ -127,6 +177,12 @@ export function createRelayServer(httpServer) {
 
       if (!isValidChannelId(channelId)) {
         return callback?.({ success: false, error: 'Invalid channelId' });
+      }
+      if (
+        !channelManager.getChannelInfo(channelId) &&
+        channelManager.getActiveChannelCount() >= CONFIG.RELAY_MAX_ACTIVE_CHANNELS
+      ) {
+        return callback?.({ success: false, error: 'Relay channel capacity reached' });
       }
 
       if (clientType !== 'dapp' && clientType !== 'wallet') {
@@ -149,6 +205,8 @@ export function createRelayServer(httpServer) {
       }
 
       socket.join(channelId);
+      metrics.channelJoins.inc({ status: 'success' });
+      metrics.activeChannels.set(channelManager.getActiveChannelCount());
       currentChannelId = channelId;
 
       // Notify other participant that counterparty joined
@@ -169,6 +227,7 @@ export function createRelayServer(httpServer) {
      */
     socket.on('message', (payload, callback) => {
       if (!checkRateLimit(ip, 'message', RATE_LIMIT_MAX_MESSAGES)) {
+        metrics.rateLimitHits.inc({ bucket: 'message' });
         return callback?.({ success: false, error: 'Rate limit exceeded' });
       }
 
@@ -190,9 +249,14 @@ export function createRelayServer(httpServer) {
       if (result.targetSocketId) {
         // Deliver directly to counterparty
         io.to(result.targetSocketId).emit('message', payload);
+        metrics.messagesRouted.inc({ status: 'delivered' });
+        metrics.messageSize.observe(getMessageSizeBytes(message));
       }
 
       callback?.({ success: true, buffered: result.buffered });
+      if (result.buffered) {
+        metrics.messagesRouted.inc({ status: 'buffered' });
+      }
     });
 
     /**
@@ -230,6 +294,8 @@ export function createRelayServer(httpServer) {
      * Handle disconnection - clean up channel membership.
      */
     socket.on('disconnect', () => {
+      metrics.activeSockets.dec();
+      releaseSocketCounter();
       if (currentChannelId) {
         const participant = channelManager.leave(socket.id, currentChannelId);
 
@@ -248,6 +314,8 @@ export function createRelayServer(httpServer) {
     if (rateLimitCleanupTimer) {
       clearInterval(rateLimitCleanupTimer);
     }
+    activeSocketsByIp.clear();
+    rateLimits.clear();
     channelManager.destroy();
     io.removeAllListeners();
   };

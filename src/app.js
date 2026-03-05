@@ -16,4 +16,4 @@ app.use(routes);
 // Error handling
 app.use(errorHandler);
 
-export { app }; 
+export { app };
