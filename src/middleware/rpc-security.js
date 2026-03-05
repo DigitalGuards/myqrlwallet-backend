@@ -1,4 +1,7 @@
 import rateLimit from 'express-rate-limit';
+import { logger } from '../utils/logger.js';
+
+const log = logger.child({ module: 'rpc-security' });
 
 /**
  * Whitelist of allowed RPC methods.
@@ -75,7 +78,7 @@ export const rpcMethodWhitelist = (req, res, next) => {
 
   // Check if method is allowed
   if (!ALLOWED_RPC_METHODS.has(method)) {
-    console.warn(`Blocked RPC method: ${method} from IP: ${req.ip}`);
+    log.warn({ method, ip: req.ip }, 'Blocked RPC method');
     return sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
   }
 
@@ -236,7 +239,7 @@ export const rpcSecurityLogger = (req, res, next) => {
 
     // Log errors or slow requests
     if (res.statusCode >= 400 || duration > 5000) {
-      console.warn('RPC Security Log:', JSON.stringify(logEntry));
+      log.warn(logEntry, 'RPC security event');
     }
   });
 
