@@ -7,7 +7,7 @@ import {
   rpcRateLimitWrite,
   rpcRequestSizeLimit,
   rpcParamsValidator,
-  rpcSecurityLogger
+  rpcSecurityLogger,
 } from '../middleware/rpc-security.js';
 
 const router = Router();
@@ -19,7 +19,8 @@ const router = Router();
 // 4. Method whitelist (block disallowed methods)
 // 5. Params validator (validate input)
 // 6. Rate limiters (apply appropriate limits)
-router.post('/:network',
+router.post(
+  '/:network',
   rpcRequestSizeLimit,
   rpcBatchReject,
   rpcSecurityLogger,
@@ -41,6 +42,5 @@ router.post('/:network',
     }
   }
 );
-
 
 export const rpcRoutes = router;
