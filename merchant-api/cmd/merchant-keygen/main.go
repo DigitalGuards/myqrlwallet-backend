@@ -66,17 +66,31 @@ func main() {
 		os.Exit(1)
 	}
 	w := csv.NewWriter(f)
-	w.Write([]string{"address", "extended_seed_hex"})
+	if err := w.Write([]string{"address", "extended_seed_hex"}); err != nil {
+		fmt.Fprintf(os.Stderr, "error: write CSV header: %v\n", err)
+		os.Exit(1)
+	}
 	for _, wl := range wallets {
-		w.Write([]string{wl.Address, wl.Seed})
+		if err := w.Write([]string{wl.Address, wl.Seed}); err != nil {
+			fmt.Fprintf(os.Stderr, "error: write CSV row: %v\n", err)
+			os.Exit(1)
+		}
 	}
 	w.Flush()
+	if err := w.Error(); err != nil {
+		fmt.Fprintf(os.Stderr, "error: flush CSV writer: %v\n", err)
+		os.Exit(1)
+	}
 	f.Close()
 	fmt.Printf("  Secrets saved to: %s\n", secretsFile)
 	fmt.Println("  WARNING: Store this file securely offline. It contains your private keys.")
 
 	// Write addresses-only file (JSON, for upload or reference)
-	addrJSON, _ := json.MarshalIndent(map[string]interface{}{"addresses": addresses}, "", "  ")
+	addrJSON, err := json.MarshalIndent(map[string]interface{}{"addresses": addresses}, "", "  ")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: marshal addresses to JSON: %v\n", err)
+		os.Exit(1)
+	}
 	if err := os.WriteFile(addressesFile, addrJSON, 0644); err != nil {
 		fmt.Fprintf(os.Stderr, "error: write addresses file: %v\n", err)
 		os.Exit(1)
@@ -104,7 +118,10 @@ func main() {
 }
 
 func uploadAddresses(baseURL, apiKey string, addresses []string) error {
-	body, _ := json.Marshal(map[string]interface{}{"addresses": addresses})
+	body, err := json.Marshal(map[string]interface{}{"addresses": addresses})
+	if err != nil {
+		return fmt.Errorf("marshal addresses for upload: %w", err)
+	}
 
 	req, err := http.NewRequest("POST", baseURL+"/v1/addresses", bytes.NewReader(body))
 	if err != nil {

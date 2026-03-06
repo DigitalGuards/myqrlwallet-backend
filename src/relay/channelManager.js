@@ -49,6 +49,7 @@ class ChannelManager {
         }
         // Allow replacing stale/disconnected participant socket.
         channel.participants.delete(existingSocketId);
+        channel.seqNumbers.delete(existingSocketId);
         break;
       }
     }
@@ -92,6 +93,7 @@ class ChannelManager {
     if (!participant) return null;
 
     channel.participants.delete(socketId);
+    channel.seqNumbers.delete(socketId);
     channel.lastActivity = Date.now();
 
     // Don't delete channel immediately - allow reconnection.
