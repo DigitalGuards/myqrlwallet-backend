@@ -1,4 +1,7 @@
 import rateLimit from 'express-rate-limit';
+import { logger } from '../utils/logger.js';
+
+const log = logger.child({ module: 'rpc-security' });
 
 /**
  * Whitelist of allowed RPC methods.
@@ -19,8 +22,8 @@ const ALLOWED_RPC_METHODS = new Set([
 
   // Contract Operations
   'zond_getCode',
-  'zond_call',           // Used for ERC20 calls (balanceOf, name, symbol, decimals)
-  'zond_getLogs',        // Used for fetching event logs (token transfers, contract events)
+  'zond_call', // Used for ERC20 calls (balanceOf, name, symbol, decimals)
+  'zond_getLogs', // Used for fetching event logs (token transfers, contract events)
 
   // Block info (needed by web3.js internally)
   'zond_chainId',
@@ -32,10 +35,7 @@ const ALLOWED_RPC_METHODS = new Set([
 /**
  * Methods that modify state or are expensive - apply stricter rate limits
  */
-const WRITE_METHODS = new Set([
-  'zond_sendRawTransaction',
-  'zond_sendTransaction',
-]);
+const WRITE_METHODS = new Set(['zond_sendRawTransaction', 'zond_sendTransaction']);
 
 /**
  * Helper function to send JSON-RPC error responses
@@ -44,7 +44,7 @@ const sendRpcError = (res, statusCode, id, errorCode, message) => {
   return res.status(statusCode).json({
     jsonrpc: '2.0',
     id: id || null,
-    error: { code: errorCode, message }
+    error: { code: errorCode, message },
   });
 };
 
@@ -54,7 +54,13 @@ const sendRpcError = (res, statusCode, id, errorCode, message) => {
  */
 export const rpcBatchReject = (req, res, next) => {
   if (Array.isArray(req.body)) {
-    return sendRpcError(res, 400, null, -32600, 'Batch requests are not supported on this endpoint.');
+    return sendRpcError(
+      res,
+      400,
+      null,
+      -32600,
+      'Batch requests are not supported on this endpoint.'
+    );
   }
   next();
 };
@@ -72,7 +78,7 @@ export const rpcMethodWhitelist = (req, res, next) => {
 
   // Check if method is allowed
   if (!ALLOWED_RPC_METHODS.has(method)) {
-    console.warn(`Blocked RPC method: ${method} from IP: ${req.ip}`);
+    log.warn({ method, ip: req.ip }, 'Blocked RPC method');
     return sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
   }
 
@@ -98,7 +104,7 @@ export const rpcRateLimitGeneral = rateLimit({
   skip: (req) => req.rpcMethodType === 'write', // Skip for write methods (they have their own limiter)
   handler: (req, res) => {
     sendRpcError(res, 429, req.body?.id, -32005, 'Rate limit exceeded. Please try again later.');
-  }
+  },
 });
 
 /**
@@ -115,8 +121,14 @@ export const rpcRateLimitWrite = rateLimit({
   },
   skip: (req) => req.rpcMethodType !== 'write', // Only apply to write methods
   handler: (req, res) => {
-    sendRpcError(res, 429, req.body?.id, -32005, 'Transaction rate limit exceeded. Please wait before sending more transactions.');
-  }
+    sendRpcError(
+      res,
+      429,
+      req.body?.id,
+      -32005,
+      'Transaction rate limit exceeded. Please wait before sending more transactions.'
+    );
+  },
 });
 
 /**
@@ -167,7 +179,13 @@ export const rpcParamsValidator = (req, res, next) => {
       }
       // Validate it starts with 0x
       if (!params[0].startsWith('0x')) {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
+        return sendRpcError(
+          res,
+          400,
+          id,
+          -32602,
+          'Invalid params: transaction must be hex-encoded'
+        );
       }
       break;
 
@@ -178,7 +196,13 @@ export const rpcParamsValidator = (req, res, next) => {
       }
       // Validate tx hash format (0x + 64 hex chars)
       if (!/^0x[a-fA-F0-9]{64}$/.test(params[0])) {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid transaction hash format');
+        return sendRpcError(
+          res,
+          400,
+          id,
+          -32602,
+          'Invalid params: invalid transaction hash format'
+        );
       }
       break;
 
@@ -210,12 +234,12 @@ export const rpcSecurityLogger = (req, res, next) => {
       network: req.params.network,
       method,
       statusCode: res.statusCode,
-      duration: `${duration}ms`
+      duration: `${duration}ms`,
     };
 
     // Log errors or slow requests
     if (res.statusCode >= 400 || duration > 5000) {
-      console.warn('RPC Security Log:', JSON.stringify(logEntry));
+      log.warn(logEntry, 'RPC security event');
     }
   });
 

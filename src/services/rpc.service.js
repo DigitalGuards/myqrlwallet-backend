@@ -42,9 +42,11 @@ function validateCustomRpcUrl(url) {
     if (a === 0) throw new Error('Custom RPC URL cannot target reserved addresses');
     if (a === 127) throw new Error('Custom RPC URL cannot target localhost');
     if (a === 10) throw new Error('Custom RPC URL cannot target private networks');
-    if (a === 172 && b >= 16 && b <= 31) throw new Error('Custom RPC URL cannot target private networks');
+    if (a === 172 && b >= 16 && b <= 31)
+      throw new Error('Custom RPC URL cannot target private networks');
     if (a === 192 && b === 168) throw new Error('Custom RPC URL cannot target private networks');
-    if (a === 169 && b === 254) throw new Error('Custom RPC URL cannot target link-local addresses');
+    if (a === 169 && b === 254)
+      throw new Error('Custom RPC URL cannot target link-local addresses');
   }
 }
 
@@ -92,8 +94,7 @@ class RPCService {
       cache.set(cacheKey, result);
       return result;
     }
-
   }
 }
 
-export const rpcService = new RPCService(); 
+export const rpcService = new RPCService();
