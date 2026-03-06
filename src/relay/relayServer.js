@@ -103,6 +103,54 @@ export function createRelayServer(httpServer) {
     }
   }
 
+  /**
+   * Normalize a client IP string from proxy/socket metadata.
+   * @param {unknown} rawIp
+   * @returns {string}
+   */
+  function normalizeClientIp(rawIp) {
+    if (typeof rawIp !== 'string') return '';
+    const trimmed = rawIp.trim();
+    if (!trimmed) return '';
+    if (trimmed.startsWith('::ffff:')) {
+      return trimmed.slice('::ffff:'.length);
+    }
+    return trimmed;
+  }
+
+  /**
+   * Resolve client IP for rate limiting across direct and proxied setups.
+   * @param {import('socket.io').Socket} socket
+   * @returns {string}
+   */
+  function getClientIp(socket) {
+    const headers = socket.handshake.headers || {};
+    const xff = headers['x-forwarded-for'];
+    const forwardedFor = typeof xff === 'string'
+      ? xff.split(',')[0]
+      : Array.isArray(xff)
+        ? xff[0]
+        : '';
+
+    const candidates = [
+      headers['cf-connecting-ip'],
+      headers['true-client-ip'],
+      headers['x-real-ip'],
+      forwardedFor,
+      socket.handshake.address,
+      socket.conn?.remoteAddress,
+    ];
+
+    for (const candidate of candidates) {
+      const normalized = normalizeClientIp(candidate);
+      if (normalized) {
+        return normalized;
+      }
+    }
+
+    return 'unknown';
+  }
+
   // Cleanup rate limit entries periodically
   const rateLimitCleanupTimer = setInterval(() => {
     const now = Date.now();
@@ -114,31 +162,31 @@ export function createRelayServer(httpServer) {
   }, RATE_LIMIT_WINDOW_MS);
 
   io.on('connection', (socket) => {
-    const ip = socket.handshake.address || 'unknown';
+    const clientIp = getClientIp(socket);
 
-    if (!checkRateLimit(ip, 'connect', RATE_LIMIT_MAX_CONNECTIONS)) {
+    if (!checkRateLimit(clientIp, 'connect', RATE_LIMIT_MAX_CONNECTIONS)) {
       metrics.rateLimitHits.inc({ bucket: 'connect' });
       socket.disconnect(true);
       return;
     }
 
-    const activeForIp = (activeSocketsByIp.get(ip) || 0) + 1;
-    activeSocketsByIp.set(ip, activeForIp);
+    const activeForIp = (activeSocketsByIp.get(clientIp) || 0) + 1;
+    activeSocketsByIp.set(clientIp, activeForIp);
     if (activeForIp > CONFIG.RELAY_MAX_SOCKETS_PER_IP) {
-      activeSocketsByIp.set(ip, activeForIp - 1);
+      activeSocketsByIp.set(clientIp, activeForIp - 1);
       if (activeForIp - 1 <= 0) {
-        activeSocketsByIp.delete(ip);
+        activeSocketsByIp.delete(clientIp);
       }
       metrics.rateLimitHits.inc({ bucket: 'per_ip_cap' });
       socket.disconnect(true);
       return;
     }
     if (io.engine.clientsCount > CONFIG.RELAY_MAX_ACTIVE_SOCKETS) {
-      const updatedCount = (activeSocketsByIp.get(ip) || 1) - 1;
+      const updatedCount = (activeSocketsByIp.get(clientIp) || 1) - 1;
       if (updatedCount > 0) {
-        activeSocketsByIp.set(ip, updatedCount);
+        activeSocketsByIp.set(clientIp, updatedCount);
       } else {
-        activeSocketsByIp.delete(ip);
+        activeSocketsByIp.delete(clientIp);
       }
       metrics.rateLimitHits.inc({ bucket: 'global_cap' });
       socket.disconnect(true);
@@ -155,11 +203,11 @@ export function createRelayServer(httpServer) {
         return;
       }
       releasedSocketCounter = true;
-      const count = activeSocketsByIp.get(ip) || 0;
+      const count = activeSocketsByIp.get(clientIp) || 0;
       if (count <= 1) {
-        activeSocketsByIp.delete(ip);
+        activeSocketsByIp.delete(clientIp);
       } else {
-        activeSocketsByIp.set(ip, count - 1);
+        activeSocketsByIp.set(clientIp, count - 1);
       }
     };
 
@@ -168,7 +216,7 @@ export function createRelayServer(httpServer) {
      * Payload: { channelId: string, clientType: 'dapp' | 'wallet' }
      */
     socket.on('join_channel', (payload, callback) => {
-      if (!checkRateLimit(ip, 'join', RATE_LIMIT_MAX_JOINS)) {
+      if (!checkRateLimit(clientIp, 'join', RATE_LIMIT_MAX_JOINS)) {
         metrics.rateLimitHits.inc({ bucket: 'join' });
         return callback?.({ success: false, error: 'Join rate limit exceeded' });
       }
@@ -226,7 +274,7 @@ export function createRelayServer(httpServer) {
      * Payload: { id: channelId, message: encryptedData, clientType: string }
      */
     socket.on('message', (payload, callback) => {
-      if (!checkRateLimit(ip, 'message', RATE_LIMIT_MAX_MESSAGES)) {
+      if (!checkRateLimit(clientIp, 'message', RATE_LIMIT_MAX_MESSAGES)) {
         metrics.rateLimitHits.inc({ bucket: 'message' });
         return callback?.({ success: false, error: 'Rate limit exceeded' });
       }
