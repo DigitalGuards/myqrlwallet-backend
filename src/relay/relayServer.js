@@ -126,11 +126,8 @@ export function createRelayServer(httpServer) {
   function getClientIp(socket) {
     const headers = socket.handshake.headers || {};
     const xff = headers['x-forwarded-for'];
-    const forwardedFor = typeof xff === 'string'
-      ? xff.split(',')[0]
-      : Array.isArray(xff)
-        ? xff[0]
-        : '';
+    const forwardedFor =
+      typeof xff === 'string' ? xff.split(',')[0] : Array.isArray(xff) ? xff[0] : '';
 
     const candidates = [
       headers['cf-connecting-ip'],
