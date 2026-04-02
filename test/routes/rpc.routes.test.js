@@ -24,7 +24,7 @@ describe('RPC Routes', () => {
 
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
-      .send({ method: 'zond_blockNumber', params: [] });
+      .send({ method: 'qrl_blockNumber', params: [] });
 
     expect(res).to.have.status(200);
     expect(res.body).to.deep.equal(mockResult);
@@ -35,7 +35,7 @@ describe('RPC Routes', () => {
 
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
-      .send({ method: 'zond_blockNumber', params: [] });
+      .send({ method: 'qrl_blockNumber', params: [] });
 
     expect(res).to.have.status(500);
     expect(res.body.error.message).to.equal('RPC Error');
@@ -55,8 +55,8 @@ describe('RPC Routes', () => {
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
       .send([
-        { method: 'zond_blockNumber', params: [] },
-        { method: 'zond_gasPrice', params: [] }
+        { method: 'qrl_blockNumber', params: [] },
+        { method: 'qrl_gasPrice', params: [] }
       ]);
 
     expect(res).to.have.status(400);
@@ -66,7 +66,7 @@ describe('RPC Routes', () => {
   it('should validate address format', async () => {
     const res = await request.execute(app)
       .post('/api/zond-rpc/dev')
-      .send({ method: 'zond_getBalance', params: ['invalid-address', 'latest'] });
+      .send({ method: 'qrl_getBalance', params: ['invalid-address', 'latest'] });
 
     expect(res).to.have.status(400);
     expect(res.body.error.code).to.equal(-32602);
