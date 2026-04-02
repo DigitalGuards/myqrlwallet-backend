@@ -167,7 +167,7 @@ export const rpcParamsValidator = (req, res, next) => {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
       }
       // Validate address format (Z or 0x + 40 hex chars)
-      if (!/^(Z|0x)[a-fA-F0-9]{40}$/i.test(params[0])) {
+      if (!/^(Q|0x)[a-fA-F0-9]{40}$/i.test(params[0])) {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
       }
       break;

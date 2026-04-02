@@ -100,11 +100,11 @@ appRouter.post('/tx-history', txHistoryRateLimit, async (req, res) => {
   const { address, page = 1, limit = 5 } = req.body;
 
   // Validate address format to prevent path traversal
-  if (!address || typeof address !== 'string' || !/^(Z|0x)[a-fA-F0-9]{40}$/i.test(address)) {
+  if (!address || typeof address !== 'string' || !/^(Q|0x)[a-fA-F0-9]{40}$/i.test(address)) {
     return res.status(400).json({ message: 'Invalid address format' });
   }
 
-  const formattedAddress = 'Z' + address.toLowerCase().substring(1);
+  const formattedAddress = 'Q' + address.toLowerCase().substring(1);
   axios
     .get(`https://zondscan.com/api/address/${formattedAddress}/transactions`, {
       params: {
