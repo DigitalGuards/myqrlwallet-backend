@@ -352,8 +352,8 @@ DNS resolution is checked at connection time to prevent rebinding attacks.
 
 ### Balance & Confirmation Tracking
 
-- **Pending payments**: RPC `zond_getBalance` polled each tick. Non-zero → `detected`.
-- **Detected payments**: RPC `zond_getTransactionReceipt` for confirmation count. Once confirmations >= required: evaluate amount.
+- **Pending payments**: RPC `qrl_getBalance` polled each tick. Non-zero → `detected`.
+- **Detected payments**: RPC `qrl_getTransactionReceipt` for confirmation count. Once confirmations >= required: evaluate amount.
 - **Amount evaluation**: If received >= expected (or within threshold) → `confirmed`. Otherwise → `underpaid`.
 
 Only `pending` and `detected` payments are actively monitored.

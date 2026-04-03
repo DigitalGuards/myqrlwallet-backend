@@ -26,7 +26,7 @@ import (
 type fakeRPCState struct {
 	mu          sync.Mutex
 	blockNumber uint64
-	balances    map[string]*big.Int    // Z-prefix address -> balance
+	balances    map[string]*big.Int    // Q-prefix address -> balance
 	receipts    map[string]interface{} // txHash -> *rpc.TxReceipt or nil
 }
 
@@ -48,10 +48,10 @@ func rpcHandler(state *fakeRPCState) http.Handler {
 		var result interface{}
 
 		switch req.Method {
-		case "zond_blockNumber":
+		case "qrl_blockNumber":
 			result = fmt.Sprintf("0x%x", state.blockNumber)
 
-		case "zond_getBalance":
+		case "qrl_getBalance":
 			var addr string
 			if len(req.Params) > 0 {
 				json.Unmarshal(req.Params[0], &addr)
@@ -63,7 +63,7 @@ func rpcHandler(state *fakeRPCState) http.Handler {
 				result = "0x" + bal.Text(16)
 			}
 
-		case "zond_getTransactionReceipt":
+		case "qrl_getTransactionReceipt":
 			var txHash string
 			if len(req.Params) > 0 {
 				json.Unmarshal(req.Params[0], &txHash)
@@ -248,9 +248,9 @@ func TestMonitor_DetectsDeposit(t *testing.T) {
 	}
 	ms.SeedPayment(p)
 
-	// RPC client converts Q→Z, so set balance on the Z-prefix version.
+	// Balance keyed by Q-prefix address (v2 RPC uses Q-prefix directly).
 	rpcState.mu.Lock()
-	rpcState.balances["Zaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] = big.NewInt(1000)
+	rpcState.balances["Qaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"] = big.NewInt(1000)
 	rpcState.blockNumber = 50
 	rpcState.mu.Unlock()
 
@@ -346,8 +346,8 @@ func TestMonitor_ConfirmsPayment(t *testing.T) {
 		TransactionHash: "0xdeadbeef",
 		BlockNumber:     "0xa", // 10
 		Status:          "0x1",
-		From:            "Zsender",
-		To:              "Zcccccccccccccccccccccccccccccccccccccccc",
+		From:            "Qsender",
+		To:              "Qcccccccccccccccccccccccccccccccccccccccc",
 	}
 	rpcState.mu.Unlock()
 
@@ -397,8 +397,8 @@ func TestMonitor_UnderpaidStaysDetected(t *testing.T) {
 		TransactionHash: "0xbadcafe",
 		BlockNumber:     "0xa", // block 10, so 10 confirmations — more than enough
 		Status:          "0x1",
-		From:            "Zsender",
-		To:              "Zdddddddddddddddddddddddddddddddddddddd",
+		From:            "Qsender",
+		To:              "Qdddddddddddddddddddddddddddddddddddddd",
 	}
 	rpcState.mu.Unlock()
 
@@ -452,8 +452,8 @@ func TestMonitor_UnderpaidWithinThresholdAutoConfirms(t *testing.T) {
 		TransactionHash: "0xwithin",
 		BlockNumber:     "0xa",
 		Status:          "0x1",
-		From:            "Zsender",
-		To:              "Zwithin",
+		From:            "Qsender",
+		To:              "Qwithin",
 	}
 	rpcState.mu.Unlock()
 
@@ -507,8 +507,8 @@ func TestMonitor_UnderpaidBeyondThresholdMarksUnderpaid(t *testing.T) {
 		TransactionHash: "0xbeyond",
 		BlockNumber:     "0xa",
 		Status:          "0x1",
-		From:            "Zsender",
-		To:              "Zbeyond",
+		From:            "Qsender",
+		To:              "Qbeyond",
 	}
 	rpcState.mu.Unlock()
 
@@ -562,8 +562,8 @@ func TestMonitor_UnderpaidExactlyAtThresholdAutoConfirms(t *testing.T) {
 		TransactionHash: "0xexact",
 		BlockNumber:     "0xa",
 		Status:          "0x1",
-		From:            "Zsender",
-		To:              "Zexact",
+		From:            "Qsender",
+		To:              "Qexact",
 	}
 	rpcState.mu.Unlock()
 
@@ -653,7 +653,7 @@ func TestMonitor_NoTxHashReChecksBalance(t *testing.T) {
 
 	// Balance is 2000 — should update ReceivedAmountWei but stay detected.
 	rpcState.mu.Lock()
-	rpcState.balances["Zfffffffffffffffffffffffffffffffffffffffr"] = big.NewInt(2000)
+	rpcState.balances["Qfffffffffffffffffffffffffffffffffffffffr"] = big.NewInt(2000)
 	rpcState.blockNumber = 50
 	rpcState.mu.Unlock()
 
@@ -731,12 +731,12 @@ func TestMonitor_ScanBlocks_DetectsTx(t *testing.T) {
 
 	zsState.mu.Lock()
 	zsState.latestBlock = 100
-	// Block 100 has a tx to our address (Z-prefix, which normalizes to Q-prefix).
+	// Block 100 has a tx to our address (Q-prefix address).
 	zsState.blocks[100] = makeZondscanBlock(100, []zondscan.Transaction{
 		{
 			Hash:   "0xabc123def456",
-			From:   "Zsender000000000000000000000000000000000",
-			To:     "Zaaaa11111111111111111111111111111111111a", // Z-prefix of our address
+			From:   "Qsender000000000000000000000000000000000",
+			To:     "Qaaaa11111111111111111111111111111111111a", // Q-prefix of our address
 			Value:  "5000",
 			Status: "0x1",
 		},
@@ -746,7 +746,7 @@ func TestMonitor_ScanBlocks_DetectsTx(t *testing.T) {
 	rpcState.mu.Lock()
 	rpcState.blockNumber = 100
 	// Set a non-zero balance so checkPendingPayment also detects it.
-	rpcState.balances["Zaaaa11111111111111111111111111111111111a"] = big.NewInt(5000)
+	rpcState.balances["Qaaaa11111111111111111111111111111111111a"] = big.NewInt(5000)
 	rpcState.mu.Unlock()
 
 	mon.tick(ctx)
@@ -792,8 +792,8 @@ func TestMonitor_ScanBlocks_SkipsFailedTx(t *testing.T) {
 	zsState.blocks[100] = makeZondscanBlock(100, []zondscan.Transaction{
 		{
 			Hash:   "0xfailedtx",
-			From:   "Zsender000000000000000000000000000000000",
-			To:     "Zbbbb22222222222222222222222222222222222b",
+			From:   "Qsender000000000000000000000000000000000",
+			To:     "Qbbbb22222222222222222222222222222222222b",
 			Value:  "5000",
 			Status: "0x0", // Failed transaction
 		},

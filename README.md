@@ -84,9 +84,9 @@ npm test        # Run tests
 ### RPC Proxy Example
 
 ```bash
-curl -X POST https://qrlwallet.com/api/zond-rpc/testnet \
+curl -X POST https://qrlwallet.com/api/qrl-rpc/testnet \
   -H "Content-Type: application/json" \
-  -d '{"method": "eth_blockNumber", "params": []}'
+  -d '{"method": "qrl_blockNumber", "params": []}'
 ```
 
 ### Transaction History Example
@@ -94,7 +94,7 @@ curl -X POST https://qrlwallet.com/api/zond-rpc/testnet \
 ```bash
 curl -X POST https://qrlwallet.com/api/tx-history \
   -H "Content-Type: application/json" \
-  -d '{"address": "Z1234...", "page": 1, "limit": 10}'
+  -d '{"address": "Q1234...", "page": 1, "limit": 10}'
 ```
 
 ## Docker Deployment
