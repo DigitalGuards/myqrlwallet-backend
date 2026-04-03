@@ -50,7 +50,7 @@ func main() {
 	}
 
 	// Initialize RPC client
-	rpcClient := rpc.NewClient(cfg.ZondRPCEndpoint, 10*time.Second)
+	rpcClient := rpc.NewClient(cfg.QrlRPCEndpoint, 10*time.Second)
 
 	// Build HTTP router
 	router := handler.NewRouter(s, cfg.AdminAPIKey, cfg.MasterEncryptionKey, cfg.DefaultRequiredConfs, cfg.DefaultPaymentTTL, cfg.RateLimitRate, cfg.RateLimitBurst)
