@@ -23,7 +23,7 @@ describe('RPC Routes', () => {
     rpcServiceStub.resolves(mockResult);
 
     const res = await request.execute(app)
-      .post('/api/zond-rpc/dev')
+      .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_blockNumber', params: [] });
 
     expect(res).to.have.status(200);
@@ -34,7 +34,7 @@ describe('RPC Routes', () => {
     rpcServiceStub.rejects(new Error('RPC Error'));
 
     const res = await request.execute(app)
-      .post('/api/zond-rpc/dev')
+      .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_blockNumber', params: [] });
 
     expect(res).to.have.status(500);
@@ -43,7 +43,7 @@ describe('RPC Routes', () => {
 
   it('should reject disallowed RPC methods', async () => {
     const res = await request.execute(app)
-      .post('/api/zond-rpc/dev')
+      .post('/api/qrl-rpc/dev')
       .send({ method: 'debug_traceTransaction', params: [] });
 
     expect(res).to.have.status(403);
@@ -53,7 +53,7 @@ describe('RPC Routes', () => {
 
   it('should reject batch requests', async () => {
     const res = await request.execute(app)
-      .post('/api/zond-rpc/dev')
+      .post('/api/qrl-rpc/dev')
       .send([
         { method: 'qrl_blockNumber', params: [] },
         { method: 'qrl_gasPrice', params: [] }
@@ -65,7 +65,7 @@ describe('RPC Routes', () => {
 
   it('should validate address format', async () => {
     const res = await request.execute(app)
-      .post('/api/zond-rpc/dev')
+      .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_getBalance', params: ['invalid-address', 'latest'] });
 
     expect(res).to.have.status(400);
