@@ -1,6 +1,6 @@
 # MyQRLWallet Backend
 
-Backend API service for [MyQRLWallet](https://qrlwallet.com) - a web wallet for the QRL Zond blockchain.
+Backend API service for [MyQRLWallet](https://qrlwallet.com) - a web wallet for the QRL blockchain.
 
 **Production**: https://qrlwallet.com/api
 
@@ -8,8 +8,8 @@ Backend API service for [MyQRLWallet](https://qrlwallet.com) - a web wallet for 
 
 The backend provides three main services:
 
-### 1. RPC Proxy (`POST /api/zond-rpc/:network`)
-- Routes JSON-RPC calls to Zond blockchain nodes
+### 1. RPC Proxy (`POST /api/qrl-rpc/:network`)
+- Routes JSON-RPC calls to QRL blockchain nodes
 - Supports testnet, mainnet, and custom RPC endpoints
 - Response caching via node-cache
 - CORS handling for browser requests
@@ -20,7 +20,7 @@ The backend provides three main services:
 - Rate limited: 10 requests per 15 minutes per IP
 
 ### 3. Transaction History (`POST /api/tx-history`)
-- Proxies transaction history requests to ZondScan API
+- Proxies transaction history requests to Explorer (zondscan.com) API
 - Pagination support
 
 ## Getting Started
@@ -49,8 +49,8 @@ Edit `.env` with your settings:
 PORT=3000
 
 # RPC Endpoints
-RPC_URL_TESTNET=https://qrlwallet.com/api/zond-rpc/testnet
-RPC_URL_MAINNET=https://qrlwallet.com/api/zond-rpc/mainnet
+RPC_URL_TESTNET=https://qrlwallet.com/api/qrl-rpc/testnet
+RPC_URL_MAINNET=https://qrlwallet.com/api/qrl-rpc/mainnet
 
 # SMTP Configuration (for support emails)
 SMTP_HOST=smtp.example.com
@@ -76,7 +76,7 @@ npm test        # Run tests
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/zond-rpc/:network` | Proxy RPC calls (network: testnet, mainnet, custom) |
+| POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet, custom) |
 | POST | `/api/support` | Send support email |
 | POST | `/api/tx-history` | Get transaction history for address |
 | GET | `/health` | Health check |
@@ -84,9 +84,9 @@ npm test        # Run tests
 ### RPC Proxy Example
 
 ```bash
-curl -X POST https://qrlwallet.com/api/zond-rpc/testnet \
+curl -X POST https://qrlwallet.com/api/qrl-rpc/testnet \
   -H "Content-Type: application/json" \
-  -d '{"method": "eth_blockNumber", "params": []}'
+  -d '{"method": "qrl_blockNumber", "params": []}'
 ```
 
 ### Transaction History Example
@@ -94,7 +94,7 @@ curl -X POST https://qrlwallet.com/api/zond-rpc/testnet \
 ```bash
 curl -X POST https://qrlwallet.com/api/tx-history \
   -H "Content-Type: application/json" \
-  -d '{"address": "Z1234...", "page": 1, "limit": 10}'
+  -d '{"address": "Q1234...", "page": 1, "limit": 10}'
 ```
 
 ## Docker Deployment

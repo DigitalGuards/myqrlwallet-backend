@@ -12,7 +12,7 @@ describe('RPC Service', () => {
 
   it('should validate network parameter', async () => {
     try {
-      await rpcService.executeRPC('invalid-network', 'zond_blockNumber', []);
+      await rpcService.executeRPC('invalid-network', 'qrl_blockNumber', []);
       expect.fail('Should have thrown an error');
     } catch (error) {
       expect(error.message).to.equal('Invalid network');
@@ -27,7 +27,7 @@ describe('RPC Service', () => {
     stub.rejects(new Error('HTTP error! status: 404'));
 
     try {
-      await rpcService.executeRPC('testnet', 'zond_blockNumber', []);
+      await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
       expect.fail('Expected an error to be thrown');
     } catch (error) {
       expect(error.message).to.equal('HTTP error! status: 404');

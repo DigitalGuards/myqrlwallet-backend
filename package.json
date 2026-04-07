@@ -1,7 +1,7 @@
 {
-  "name": "zond-wallet-backend",
+  "name": "qrl-wallet-backend",
   "version": "1.0.0",
-  "description": "Backend service for Zond Web Wallet",
+  "description": "Backend service for QRL Web Wallet",
   "main": "server.js",
   "type": "module",
   "overrides": {
