@@ -104,7 +104,7 @@ appRouter.post('/tx-history', txHistoryRateLimit, async (req, res) => {
     return res.status(400).json({ message: 'Invalid address format' });
   }
 
-  const formattedAddress = 'Q' + address.toLowerCase().substring(1);
+  const formattedAddress = 'Q' + address.toLowerCase().replace(/^(0x|q)/, '');
   axios
     .get(`https://zondscan.com/api/address/${formattedAddress}/transactions`, {
       params: {

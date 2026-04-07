@@ -208,6 +208,7 @@ export const rpcParamsValidator = (req, res, next) => {
 
     case 'qrl_call':
     case 'qrl_estimateGas':
+    case 'qrl_sendTransaction':
       // These require a transaction object
       if (!params || params.length < 1 || typeof params[0] !== 'object') {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
