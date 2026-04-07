@@ -20,7 +20,7 @@ The backend provides three main services:
 - Rate limited: 10 requests per 15 minutes per IP
 
 ### 3. Transaction History (`POST /api/tx-history`)
-- Proxies transaction history requests to ZondScan API
+- Proxies transaction history requests to Explorer (zondscan.com) API
 - Pagination support
 
 ## Getting Started
