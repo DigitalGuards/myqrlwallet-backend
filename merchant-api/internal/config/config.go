@@ -14,7 +14,7 @@ type Config struct {
 	AdminAPIKey             string
 	MasterEncryptionKey     [32]byte
 	DatabaseURL             string
-	ZondRPCEndpoint         string
+	QrlRPCEndpoint          string
 	ZondscanURL             string
 	MonitorInterval         time.Duration
 	DefaultRequiredConfs    int
@@ -74,7 +74,7 @@ func Load() (*Config, error) {
 		AdminAPIKey:             adminKey,
 		MasterEncryptionKey:     masterKey,
 		DatabaseURL:             dbURL,
-		ZondRPCEndpoint:         getEnvStr("ZOND_RPC_ENDPOINT", "http://localhost:8545"),
+		QrlRPCEndpoint:          getEnvStr("QRL_RPC_ENDPOINT", "http://localhost:8545"),
 		ZondscanURL:             getEnvStr("ZONDSCAN_URL", "https://zondscan.com/api"),
 		MonitorInterval:         time.Duration(monitorSecs) * time.Second,
 		DefaultRequiredConfs:    getEnvInt("DEFAULT_REQUIRED_CONFIRMATIONS", 1),

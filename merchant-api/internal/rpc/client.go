@@ -12,7 +12,7 @@ import (
 	"time"
 )
 
-// Client is a minimal Zond JSON-RPC client.
+// Client is a minimal QRL JSON-RPC client.
 // It only uses whitelisted methods compatible with the qrlwallet.com proxy.
 type Client struct {
 	endpoint   string
@@ -29,12 +29,10 @@ func NewClient(endpoint string, timeout time.Duration) *Client {
 	}
 }
 
-// GetBalance returns the balance of an address in wei.
-// The address should be in Q-format ("Q..." 41 chars) — it will be
-// converted to 0x-format for the RPC call.
+// GetBalance returns the balance of an address in planck.
+// The address should be in Q-format ("Q..." 41 chars).
 func (c *Client) GetBalance(ctx context.Context, qAddress string) (*big.Int, error) {
-	hexAddr := qAddressToZond(qAddress)
-	result, err := c.call(ctx, "zond_getBalance", hexAddr, "latest")
+	result, err := c.call(ctx, "qrl_getBalance", qAddress, "latest")
 	if err != nil {
 		return nil, err
 	}
@@ -55,7 +53,7 @@ func (c *Client) GetBalance(ctx context.Context, qAddress string) (*big.Int, err
 
 // GetBlockNumber returns the current block number.
 func (c *Client) GetBlockNumber(ctx context.Context) (uint64, error) {
-	result, err := c.call(ctx, "zond_blockNumber")
+	result, err := c.call(ctx, "qrl_blockNumber")
 	if err != nil {
 		return 0, err
 	}
@@ -72,7 +70,7 @@ func (c *Client) GetBlockNumber(ctx context.Context) (uint64, error) {
 // GetTransactionReceipt returns the receipt for a transaction hash.
 // Returns nil if the transaction is not yet mined.
 func (c *Client) GetTransactionReceipt(ctx context.Context, txHash string) (*TxReceipt, error) {
-	result, err := c.call(ctx, "zond_getTransactionReceipt", txHash)
+	result, err := c.call(ctx, "qrl_getTransactionReceipt", txHash)
 	if err != nil {
 		return nil, err
 	}
@@ -133,15 +131,4 @@ func (c *Client) call(ctx context.Context, method string, params ...interface{})
 	}
 
 	return rpcResp.Result, nil
-}
-
-// qAddressToZond converts a Q-format address ("Q" + 40 hex) to Z-format for Zond RPC.
-func qAddressToZond(addr string) string {
-	if strings.HasPrefix(addr, "Q") {
-		return "Z" + addr[1:]
-	}
-	if strings.HasPrefix(addr, "Z") || strings.HasPrefix(addr, "0x") || strings.HasPrefix(addr, "0X") {
-		return addr
-	}
-	return "Z" + addr
 }

@@ -9,33 +9,33 @@ const log = logger.child({ module: 'rpc-security' });
  */
 const ALLOWED_RPC_METHODS = new Set([
   // Account/Balance Operations
-  'zond_getBalance',
-  'zond_getTransactionCount',
+  'qrl_getBalance',
+  'qrl_getTransactionCount',
   'net_listening',
 
   // Transaction Operations
-  'zond_gasPrice',
-  'zond_estimateGas',
-  'zond_sendRawTransaction',
-  'zond_sendTransaction',
-  'zond_getTransactionReceipt',
+  'qrl_gasPrice',
+  'qrl_estimateGas',
+  'qrl_sendRawTransaction',
+  'qrl_sendTransaction',
+  'qrl_getTransactionReceipt',
 
   // Contract Operations
-  'zond_getCode',
-  'zond_call', // Used for ERC20 calls (balanceOf, name, symbol, decimals)
-  'zond_getLogs', // Used for fetching event logs (token transfers, contract events)
+  'qrl_getCode',
+  'qrl_call', // Used for ERC20 calls (balanceOf, name, symbol, decimals)
+  'qrl_getLogs', // Used for fetching event logs (token transfers, contract events)
 
   // Block info (needed by web3.js internally)
-  'zond_chainId',
-  'zond_blockNumber',
-  'zond_getBlockByNumber', // Needed for event watching (token transfers, contract events)
+  'qrl_chainId',
+  'qrl_blockNumber',
+  'qrl_getBlockByNumber', // Needed for event watching (token transfers, contract events)
   'net_version',
 ]);
 
 /**
  * Methods that modify state or are expensive - apply stricter rate limits
  */
-const WRITE_METHODS = new Set(['zond_sendRawTransaction', 'zond_sendTransaction']);
+const WRITE_METHODS = new Set(['qrl_sendRawTransaction', 'qrl_sendTransaction']);
 
 /**
  * Helper function to send JSON-RPC error responses
@@ -94,7 +94,7 @@ export const rpcMethodWhitelist = (req, res, next) => {
  */
 export const rpcRateLimitGeneral = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 300, // 300 requests per minute per IP
+  max: 1000, // 1000 requests per minute per IP
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
@@ -159,20 +159,20 @@ export const rpcParamsValidator = (req, res, next) => {
 
   // Basic validation for specific methods
   switch (method) {
-    case 'zond_getBalance':
-    case 'zond_getTransactionCount':
-    case 'zond_getCode':
+    case 'qrl_getBalance':
+    case 'qrl_getTransactionCount':
+    case 'qrl_getCode':
       // These require at least an address
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
       }
-      // Validate address format (Z or 0x + 40 hex chars)
-      if (!/^(Z|0x)[a-fA-F0-9]{40}$/i.test(params[0])) {
+      // Validate address format (Q + 40 hex chars)
+      if (!/^Q[a-fA-F0-9]{40}$/i.test(params[0])) {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
       }
       break;
 
-    case 'zond_sendRawTransaction':
+    case 'qrl_sendRawTransaction':
       // Requires a hex-encoded signed transaction
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: signed transaction required');
@@ -189,7 +189,7 @@ export const rpcParamsValidator = (req, res, next) => {
       }
       break;
 
-    case 'zond_getTransactionReceipt':
+    case 'qrl_getTransactionReceipt':
       // Requires a transaction hash
       if (!params || params.length < 1 || typeof params[0] !== 'string') {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction hash required');
@@ -206,8 +206,9 @@ export const rpcParamsValidator = (req, res, next) => {
       }
       break;
 
-    case 'zond_call':
-    case 'zond_estimateGas':
+    case 'qrl_call':
+    case 'qrl_estimateGas':
+    case 'qrl_sendTransaction':
       // These require a transaction object
       if (!params || params.length < 1 || typeof params[0] !== 'object') {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
