@@ -19,7 +19,8 @@ router.get('/:network', (req, res) => {
   res.json({
     name: 'QRL RPC Proxy',
     network: req.params.network,
-    description: 'JSON-RPC 2.0 proxy for the QRL Zond blockchain. Send POST requests with a JSON-RPC body.',
+    description:
+      'JSON-RPC 2.0 proxy for the QRL Zond blockchain. Send POST requests with a JSON-RPC body.',
     usage: {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
