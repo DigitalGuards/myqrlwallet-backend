@@ -83,7 +83,11 @@ class ChannelManager {
     // attempt (someone else trying to claim the same channelId with a
     // different PK) fails loudly instead of silently routing the wallet
     // to an attacker.
-    if (clientType === 'dapp' && typeof publicKeyBase64 === 'string' && publicKeyBase64.length > 0) {
+    if (
+      clientType === 'dapp' &&
+      typeof publicKeyBase64 === 'string' &&
+      publicKeyBase64.length > 0
+    ) {
       // Validate via a real base64 decode so non-base64 characters are
       // rejected and we can compare by decoded bytes. Encoding the
       // decoded buffer and comparing to the input also canonicalises it:
