@@ -8,6 +8,11 @@ const MAX_PARTICIPANTS = 2;
 const MAX_BUFFERED_MESSAGES = 50;
 const BUFFER_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Run cleanup every minute
+// ML-KEM-768 public key is 1184 bytes → ~1580 chars base64. Cap at 2048
+// raw bytes (~2730 chars) so a future KEM doesn't require a protocol
+// change on the relay, but tightly enough that a malicious client can't
+// bloat channel state.
+const MAX_PUBLIC_KEY_BYTES = 2048;
 
 class ChannelManager {
   constructor(options = {}) {
@@ -18,13 +23,27 @@ class ChannelManager {
   }
 
   /**
-   * Join or create a channel. Returns buffered messages if any.
+   * Join or create a channel. Returns buffered messages if any and, for
+   * wallet joins, the dApp's public key bound to the channel.
+   *
+   * v2 protocol: the dApp uploads its KEM public key with its first
+   * join_channel. The relay binds that PK to the channel and serves it
+   * to the wallet on its join. The QR carries only `SHA-256(label||cid||pk)`
+   * so the wallet can verify the served PK against that out-of-band
+   * commitment. That means:
+   *  - An attacker can't substitute the PK via the relay (fp mismatch).
+   *  - The PK is no longer carried in the QR (24× smaller URI).
+   *
    * @param {string} channelId
    * @param {string} socketId
    * @param {string} clientType - 'dapp' or 'wallet'
-   * @returns {{ success: boolean, error?: string, bufferedMessages?: Array }}
+   * @param {string} [publicKeyBase64] - dApp-only; base64-encoded KEM PK.
+   *   Ignored for wallet joins. First dApp sets it; later dApp joins must
+   *   match the stored value (protects against impersonation attempts on
+   *   stale channels).
+   * @returns {{ success: boolean, error?: string, bufferedMessages?: Array, channelPublicKey?: string }}
    */
-  join(channelId, socketId, clientType) {
+  join(channelId, socketId, clientType, publicKeyBase64) {
     let channel = this.channels.get(channelId);
 
     if (!channel) {
@@ -34,6 +53,8 @@ class ChannelManager {
         messageBuffer: [],
         /** @type {Map<string, number>} Monotonic sequence numbers per sender socketId */
         seqNumbers: new Map(),
+        /** @type {string|null} dApp's base64-encoded KEM public key. */
+        publicKey: null,
       };
       this.channels.set(channelId, channel);
     }
@@ -58,6 +79,49 @@ class ChannelManager {
       return { success: false, error: 'Channel is full (max 2 participants)' };
     }
 
+    // Bind the dApp PK on first dApp join. Reject mismatches so a hijack
+    // attempt (someone else trying to claim the same channelId with a
+    // different PK) fails loudly instead of silently routing the wallet
+    // to an attacker.
+    if (
+      clientType === 'dapp' &&
+      typeof publicKeyBase64 === 'string' &&
+      publicKeyBase64.length > 0
+    ) {
+      // Strict base64 validation up front. `Buffer.from(s, 'base64')`
+      // silently drops non-base64 characters instead of throwing, so we
+      // reject anything that doesn't match the canonical alphabet first.
+      // Re-encoding the decoded buffer and comparing to the input also
+      // canonicalises it — a dApp re-joining with equivalent-but-not-
+      // identical padding will still match the stored value byte-wise.
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKeyBase64)) {
+        return { success: false, error: 'Public key is not valid base64' };
+      }
+      const decoded = Buffer.from(publicKeyBase64, 'base64');
+      if (decoded.length === 0) {
+        return { success: false, error: 'Public key is empty' };
+      }
+      if (decoded.length > MAX_PUBLIC_KEY_BYTES) {
+        return { success: false, error: 'Public key exceeds size limit' };
+      }
+      const canonical = decoded.toString('base64');
+      if (channel.publicKey === null) {
+        channel.publicKey = canonical;
+      } else if (channel.publicKey !== canonical) {
+        return {
+          success: false,
+          error: 'Channel is already bound to a different dApp public key',
+        };
+      }
+    }
+
+    // Note: a wallet may legitimately join a channel with no PK bound —
+    // either the dApp hasn't arrived yet (fresh scan race), or the relay
+    // restarted and forgot the binding (wallet has a persisted session
+    // and doesn't need to re-verify). The wallet's join ack carries
+    // `channelPublicKey: null` in both cases; the wallet decides what to
+    // do with that based on whether it's in a fresh-handshake flow.
+
     channel.participants.set(socketId, { clientType, joinedAt: Date.now() });
     channel.lastActivity = Date.now();
 
@@ -76,6 +140,7 @@ class ChannelManager {
     return {
       success: true,
       bufferedMessages: buffered.map((msg) => msg.data),
+      channelPublicKey: channel.publicKey,
     };
   }
 
