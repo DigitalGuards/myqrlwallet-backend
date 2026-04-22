@@ -65,10 +65,23 @@ function connect(port, opts = {}) {
   });
 }
 
+// Arbitrary base64 blob standing in for a KEM public key. The relay
+// is opaque about the key's contents — it just binds it to the channel
+// and hands it back to the wallet for fingerprint verification.
+const TEST_DAPP_PK = 'dGVzdC1kYXBwLXB1YmxpYy1rZXk=';
+
 /** Join a channel and return the ack response. */
-function joinChannel(socket, channelId, clientType) {
+function joinChannel(socket, channelId, clientType, publicKey) {
   return new Promise((resolve) => {
-    socket.emit('join_channel', { channelId, clientType }, (resp) => resolve(resp));
+    const payload = { channelId, clientType };
+    // v2: dApp joins must carry a publicKey so the relay can bind it.
+    // Tests that don't pass one explicitly get the shared test PK by default.
+    if (publicKey !== undefined) {
+      payload.publicKey = publicKey;
+    } else if (clientType === 'dapp') {
+      payload.publicKey = TEST_DAPP_PK;
+    }
+    socket.emit('join_channel', payload, (resp) => resolve(resp));
   });
 }
 
@@ -218,6 +231,72 @@ describe('Relay Server', function () {
       expect(resp.success).to.be.false;
       expect(resp.error).to.include('clientType');
       await disconnect(socket);
+    });
+
+    // ── v2 PK-binding semantics ─────────────────────────────────────────
+
+    it('should bind a dapp public key to the channel on first join', async () => {
+      const dapp = await connect(relay.port);
+      const resp = await joinChannel(dapp, 'ch-pk-bind', 'dapp', TEST_DAPP_PK);
+      expect(resp.success).to.be.true;
+      expect(resp.channelPublicKey).to.equal(TEST_DAPP_PK);
+      await disconnect(dapp);
+    });
+
+    it('should echo the dapp public key to the wallet on join', async () => {
+      const dapp = await connect(relay.port);
+      await joinChannel(dapp, 'ch-pk-echo', 'dapp', TEST_DAPP_PK);
+
+      const wallet = await connect(relay.port);
+      const resp = await joinChannel(wallet, 'ch-pk-echo', 'wallet');
+      expect(resp.success).to.be.true;
+      expect(resp.channelPublicKey).to.equal(TEST_DAPP_PK);
+
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+
+    it('should reject a second dapp join that supplies a different PK', async () => {
+      const dapp1 = await connect(relay.port);
+      await joinChannel(dapp1, 'ch-pk-conflict', 'dapp', TEST_DAPP_PK);
+
+      // First dApp stays connected; second dApp attempts to hijack with a
+      // different PK. Relay must reject rather than silently rebinding —
+      // otherwise a wallet scanning the original QR would be routed to
+      // the attacker's key without the fp check ever firing.
+      const dapp2 = await connect(relay.port);
+      const resp = await joinChannel(
+        dapp2,
+        'ch-pk-conflict',
+        'dapp',
+        'c29tZS1vdGhlci1rZXk='
+      );
+      expect(resp.success).to.be.false;
+      expect(resp.error).to.match(/bound|already/i);
+
+      await disconnect(dapp1);
+      await disconnect(dapp2);
+    });
+
+    it('should allow a wallet to join without a bound PK (returns null)', async () => {
+      // Wallet reconnects (persisted session) or wins the race against
+      // the dApp — either way, let it in and signal "no PK yet" via null.
+      // The wallet decides whether that's a problem based on its own
+      // session state.
+      const wallet = await connect(relay.port);
+      const resp = await joinChannel(wallet, 'ch-pk-early', 'wallet');
+      expect(resp.success).to.be.true;
+      expect(resp.channelPublicKey).to.be.null;
+      await disconnect(wallet);
+    });
+
+    it('should reject a dapp PK exceeding size limit', async () => {
+      const dapp = await connect(relay.port);
+      const tooBig = 'A'.repeat(3000); // ~2250 bytes when decoded — over 2048B cap
+      const resp = await joinChannel(dapp, 'ch-pk-big', 'dapp', tooBig);
+      expect(resp.success).to.be.false;
+      expect(resp.error).to.match(/size|limit/i);
+      await disconnect(dapp);
     });
   });
 

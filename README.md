@@ -6,7 +6,7 @@ Backend API service for [MyQRLWallet](https://qrlwallet.com) - a web wallet for 
 
 ## Features
 
-The backend provides three main services:
+The backend provides two main services:
 
 ### 1. RPC Proxy (`POST /api/qrl-rpc/:network`)
 - Routes JSON-RPC calls to QRL blockchain nodes
@@ -14,12 +14,7 @@ The backend provides three main services:
 - Response caching via node-cache
 - CORS handling for browser requests
 
-### 2. Support Email (`POST /api/support`)
-- Sends support request emails via SMTP
-- Sends confirmation email to user
-- Rate limited: 10 requests per 15 minutes per IP
-
-### 3. Transaction History (`POST /api/tx-history`)
+### 2. Transaction History (`POST /api/tx-history`)
 - Proxies transaction history requests to Explorer (zondscan.com) API
 - Pagination support
 
@@ -52,14 +47,6 @@ PORT=3000
 RPC_URL_TESTNET=https://qrlwallet.com/api/qrl-rpc/testnet
 RPC_URL_MAINNET=https://qrlwallet.com/api/qrl-rpc/mainnet
 
-# SMTP Configuration (for support emails)
-SMTP_HOST=smtp.example.com
-SMTP_PORT=587
-SMTP_USER=your-user
-SMTP_TOKEN=your-password
-SMTP_FROM=noreply@example.com
-SMTP_TO=support@example.com
-
 # CORS Origins
 CORS_ORIGINS=http://localhost:5173,https://qrlwallet.com
 ```
@@ -77,7 +64,6 @@ npm test        # Run tests
 | Method | Endpoint | Description |
 |--------|----------|-------------|
 | POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet, custom) |
-| POST | `/api/support` | Send support email |
 | POST | `/api/tx-history` | Get transaction history for address |
 | GET | `/health` | Health check |
 
@@ -108,14 +94,7 @@ docker build -t myqrlwallet-backend:latest .
 ### Run Container
 
 ```bash
-docker run -d -p 3000:3000 \
-  -e SMTP_HOST=smtp.example.com \
-  -e SMTP_PORT=587 \
-  -e SMTP_USER=your-user \
-  -e SMTP_TOKEN=your-password \
-  -e SMTP_FROM=noreply@example.com \
-  -e SMTP_TO=support@example.com \
-  myqrlwallet-backend:latest
+docker run -d -p 3000:3000 myqrlwallet-backend:latest
 ```
 
 The container:
@@ -136,17 +115,6 @@ Kubernetes manifests are provided in the `k8s/` directory.
 ### Deploy
 
 ```bash
-# Update secrets first!
-# Edit k8s/secret.yaml or create via kubectl:
-kubectl create secret generic myqrlwallet-backend-secrets \
-  --namespace=myqrlwallet \
-  --from-literal=SMTP_HOST=smtp.example.com \
-  --from-literal=SMTP_PORT=587 \
-  --from-literal=SMTP_USER=your-user \
-  --from-literal=SMTP_PASS=your-password \
-  --from-literal=SMTP_FROM=noreply@example.com \
-  --from-literal=SUPPORT_EMAIL=support@example.com
-
 # Apply all manifests
 kubectl apply -k k8s/
 
@@ -164,7 +132,6 @@ kubectl apply -f k8s/hpa.yaml
 | `deployment.yaml` | 2 replicas with health checks, security context |
 | `service.yaml` | ClusterIP service on port 3000 |
 | `configmap.yaml` | Non-sensitive config (RPC URLs, CORS) |
-| `secret.yaml` | Template for SMTP credentials |
 | `hpa.yaml` | Horizontal Pod Autoscaler (2-10 replicas) |
 
 ### Security Features
@@ -199,7 +166,6 @@ The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
 |----------|------------|
 | Runtime | Node.js 20 |
 | Framework | Express.js |
-| Email | Nodemailer |
 | HTTP Client | Axios |
 | Caching | node-cache |
 | Rate Limiting | express-rate-limit |
@@ -216,7 +182,7 @@ src/
 │   └── error-handler.js
 ├── routes/
 │   ├── index.js        # Route aggregator
-│   ├── app.routes.js   # Support & tx-history routes
+│   ├── app.routes.js   # tx-history route
 │   ├── rpc.routes.js   # RPC proxy routes
 │   └── health.routes.js
 ├── services/
