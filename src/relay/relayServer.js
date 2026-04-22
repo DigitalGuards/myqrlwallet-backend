@@ -254,8 +254,15 @@ export function createRelayServer(httpServer) {
       const result = channelManager.join(channelId, socket.id, clientType, publicKey);
 
       if (!result.success) {
+        console.log(
+          `[relay] JOIN REJECTED cid=${channelId} sock=${socket.id} type=${clientType} reason="${result.error}"`
+        );
         return callback?.({ success: false, error: result.error });
       }
+
+      console.log(
+        `[relay] JOIN OK cid=${channelId} sock=${socket.id} type=${clientType} pkLen=${publicKey?.length || 0} channelPkLen=${result.channelPublicKey?.length || 0}`
+      );
 
       socket.join(channelId);
       metrics.channelJoins.inc({ status: 'success' });
@@ -347,17 +354,23 @@ export function createRelayServer(httpServer) {
     /**
      * Handle disconnection - clean up channel membership.
      */
-    socket.on('disconnect', () => {
+    socket.on('disconnect', (reason) => {
       metrics.activeSockets.dec();
       releaseSocketCounter();
       if (currentChannelId) {
         const participant = channelManager.leave(socket.id, currentChannelId);
-
+        console.log(
+          `[relay] DISCONNECT cid=${currentChannelId} sock=${socket.id} type=${participant?.clientType || 'unknown'} reason="${reason}"`
+        );
         // Notify remaining participant
         socket.to(currentChannelId).emit('participants_changed', {
           event: 'disconnect',
           clientType: participant?.clientType || null,
         });
+      } else {
+        console.log(
+          `[relay] DISCONNECT sock=${socket.id} (never joined a channel) reason="${reason}"`
+        );
       }
     });
   });
