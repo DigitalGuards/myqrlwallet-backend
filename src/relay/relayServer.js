@@ -210,7 +210,11 @@ export function createRelayServer(httpServer) {
 
     /**
      * join_channel - Join or create a channel room.
-     * Payload: { channelId: string, clientType: 'dapp' | 'wallet' }
+     * Payload:
+     *   { channelId: string, clientType: 'dapp' | 'wallet', publicKey?: string }
+     * `publicKey` is only honoured for the first dApp join (v2 protocol).
+     * The relay binds it to the channel and echoes it back to the wallet
+     * on its join so the wallet can verify the fingerprint from the QR.
      */
     socket.on('join_channel', (payload, callback) => {
       if (!checkRateLimit(clientIp, 'join', RATE_LIMIT_MAX_JOINS)) {
@@ -218,7 +222,7 @@ export function createRelayServer(httpServer) {
         return callback?.({ success: false, error: 'Join rate limit exceeded' });
       }
 
-      const { channelId, clientType } = payload || {};
+      const { channelId, clientType, publicKey } = payload || {};
 
       if (!isValidChannelId(channelId)) {
         return callback?.({ success: false, error: 'Invalid channelId' });
@@ -237,13 +241,17 @@ export function createRelayServer(httpServer) {
         });
       }
 
+      if (publicKey !== undefined && typeof publicKey !== 'string') {
+        return callback?.({ success: false, error: 'publicKey must be a base64 string' });
+      }
+
       // Leave previous channel if any
       if (currentChannelId && currentChannelId !== channelId) {
         socket.leave(currentChannelId);
         channelManager.leave(socket.id, currentChannelId);
       }
 
-      const result = channelManager.join(channelId, socket.id, clientType);
+      const result = channelManager.join(channelId, socket.id, clientType, publicKey);
 
       if (!result.success) {
         return callback?.({ success: false, error: result.error });
@@ -263,6 +271,7 @@ export function createRelayServer(httpServer) {
       callback?.({
         success: true,
         bufferedMessages: result.bufferedMessages || [],
+        channelPublicKey: result.channelPublicKey || null,
       });
     });
 
