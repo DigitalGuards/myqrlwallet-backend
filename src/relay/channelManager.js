@@ -84,13 +84,27 @@ class ChannelManager {
     // different PK) fails loudly instead of silently routing the wallet
     // to an attacker.
     if (clientType === 'dapp' && typeof publicKeyBase64 === 'string' && publicKeyBase64.length > 0) {
-      const pkByteLength = Math.floor((publicKeyBase64.replace(/=+$/, '').length * 3) / 4);
-      if (pkByteLength > MAX_PUBLIC_KEY_BYTES) {
+      // Validate via a real base64 decode so non-base64 characters are
+      // rejected and we can compare by decoded bytes. Encoding the
+      // decoded buffer and comparing to the input also canonicalises it:
+      // a dApp that later re-joins with extra `=` padding or different
+      // (but equivalent) spacing still matches the stored value byte-wise.
+      let decoded;
+      try {
+        decoded = Buffer.from(publicKeyBase64, 'base64');
+      } catch {
+        return { success: false, error: 'Public key is not valid base64' };
+      }
+      if (decoded.length === 0) {
+        return { success: false, error: 'Public key is empty or invalid base64' };
+      }
+      if (decoded.length > MAX_PUBLIC_KEY_BYTES) {
         return { success: false, error: 'Public key exceeds size limit' };
       }
+      const canonical = decoded.toString('base64');
       if (channel.publicKey === null) {
-        channel.publicKey = publicKeyBase64;
-      } else if (channel.publicKey !== publicKeyBase64) {
+        channel.publicKey = canonical;
+      } else if (channel.publicKey !== canonical) {
         return {
           success: false,
           error: 'Channel is already bound to a different dApp public key',
