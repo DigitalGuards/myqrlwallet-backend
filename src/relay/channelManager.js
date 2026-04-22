@@ -88,19 +88,18 @@ class ChannelManager {
       typeof publicKeyBase64 === 'string' &&
       publicKeyBase64.length > 0
     ) {
-      // Validate via a real base64 decode so non-base64 characters are
-      // rejected and we can compare by decoded bytes. Encoding the
-      // decoded buffer and comparing to the input also canonicalises it:
-      // a dApp that later re-joins with extra `=` padding or different
-      // (but equivalent) spacing still matches the stored value byte-wise.
-      let decoded;
-      try {
-        decoded = Buffer.from(publicKeyBase64, 'base64');
-      } catch {
+      // Strict base64 validation up front. `Buffer.from(s, 'base64')`
+      // silently drops non-base64 characters instead of throwing, so we
+      // reject anything that doesn't match the canonical alphabet first.
+      // Re-encoding the decoded buffer and comparing to the input also
+      // canonicalises it — a dApp re-joining with equivalent-but-not-
+      // identical padding will still match the stored value byte-wise.
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKeyBase64)) {
         return { success: false, error: 'Public key is not valid base64' };
       }
+      const decoded = Buffer.from(publicKeyBase64, 'base64');
       if (decoded.length === 0) {
-        return { success: false, error: 'Public key is empty or invalid base64' };
+        return { success: false, error: 'Public key is empty' };
       }
       if (decoded.length > MAX_PUBLIC_KEY_BYTES) {
         return { success: false, error: 'Public key exceeds size limit' };
