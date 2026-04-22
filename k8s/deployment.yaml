@@ -30,8 +30,6 @@ spec:
           envFrom:
             - configMapRef:
                 name: myqrlwallet-backend-config
-            - secretRef:
-                name: myqrlwallet-backend-secrets
           livenessProbe:
             httpGet:
               path: /health
