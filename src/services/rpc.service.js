@@ -3,6 +3,19 @@ import { CONFIG } from '../config/index.js';
 import { cache } from '../utils/cache.js';
 
 /**
+ * RPC methods whose result is invariant for a given network and therefore safe
+ * to cache. Everything else — balances, nonces, block numbers, contract state,
+ * gas estimates, receipts, logs, writes — is state-dependent and MUST NOT be
+ * cached, because caching state-dependent responses produces stale reads after
+ * a transaction confirms (tx-state race condition).
+ *
+ * See: src/services/rpc.service.js history for the bug that motivated this
+ * whitelist. Do not add state-dependent methods here without a write-through
+ * invalidation strategy.
+ */
+const CACHEABLE_METHODS = new Set(['qrl_chainId', 'net_version']);
+
+/**
  * Validate a custom RPC URL to prevent SSRF attacks.
  * Blocks private IP ranges, localhost, cloud metadata endpoints, and non-HTTP protocols.
  */
@@ -77,23 +90,28 @@ class RPCService {
       throw new Error('Invalid network');
     }
 
-    const cacheKey = `${network}-${method}-${JSON.stringify(params)}`;
-    const cachedResult = cache.get(cacheKey);
+    const isCacheable = CACHEABLE_METHODS.has(method);
+    const cacheKey = isCacheable ? `${network}-${method}-${JSON.stringify(params)}` : null;
 
-    if (cachedResult) {
-      return cachedResult;
+    if (isCacheable) {
+      const cachedResult = cache.get(cacheKey);
+      if (cachedResult) {
+        return cachedResult;
+      }
     }
 
+    let result;
     if (network === 'custom' && customRpcUrl !== '') {
       validateCustomRpcUrl(customRpcUrl);
-      const result = await this.makeRPCCall(customRpcUrl, method, params);
-      cache.set(cacheKey, result);
-      return result;
+      result = await this.makeRPCCall(customRpcUrl, method, params);
     } else {
-      const result = await this.makeRPCCall(CONFIG.RPC_ENDPOINTS[network], method, params);
-      cache.set(cacheKey, result);
-      return result;
+      result = await this.makeRPCCall(CONFIG.RPC_ENDPOINTS[network], method, params);
     }
+
+    if (isCacheable) {
+      cache.set(cacheKey, result);
+    }
+    return result;
   }
 }
 
