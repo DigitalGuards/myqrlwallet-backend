@@ -17,5 +17,5 @@ module.exports = {
     'no-unused-vars': ['error', { argsIgnorePattern: '^_' }],
     'no-console': 'off',
   },
-  ignorePatterns: ['node_modules/', 'go-qrllib/', 'merchant-api/', 'myqrlwallet-frontend/'],
+  ignorePatterns: ['node_modules/', 'myqrlwallet-frontend/'],
 };
