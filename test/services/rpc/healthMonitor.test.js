@@ -69,6 +69,34 @@ describe('healthMonitor', () => {
       expect(ep.state).to.equal(STATE_UP);
     });
 
+    it('does not reset the stall timer on a height regression', () => {
+      healthMonitor.__setEndpointsForTesting('testnet', ['http://x:8545']);
+      const ep = healthMonitor.networks.get('testnet')[0];
+      ep.state = STATE_UP;
+      ep.lastHeight = 100;
+      const tenMinAgo = Date.now() - 10 * 60 * 1000;
+      ep.lastHeightChangeAt = tenMinAgo;
+
+      // Observed height regresses (chain reorg or bad node serving old head).
+      // The stall timer must NOT reset, so the next equal-height poll should
+      // still flip the endpoint to STALLED.
+      healthMonitor.applyPollSuccess('testnet', ep, 99);
+      expect(ep.lastHeight).to.equal(99);
+      expect(ep.lastHeightChangeAt).to.equal(tenMinAgo);
+
+      healthMonitor.applyPollSuccess('testnet', ep, 99);
+      expect(ep.state).to.equal(STATE_STALLED);
+    });
+
+    it('flips an unknown endpoint to up on a successful real request', () => {
+      healthMonitor.__setEndpointsForTesting('testnet', ['http://x:8545']);
+      const ep = healthMonitor.networks.get('testnet')[0];
+      expect(ep.state).to.equal(STATE_UNKNOWN);
+
+      healthMonitor.applyRequestSuccess('testnet', ep);
+      expect(ep.state).to.equal(STATE_UP);
+    });
+
     it('moves unknown → up on first successful poll even without height advance', () => {
       healthMonitor.__setEndpointsForTesting('testnet', ['http://x:8545']);
       const ep = healthMonitor.networks.get('testnet')[0];
@@ -80,15 +108,22 @@ describe('healthMonitor', () => {
   });
 
   describe('hasHealthyForNetwork', () => {
-    it('treats up and unknown as healthy, down/stalled as not', () => {
+    it('returns true for up/unknown/stalled (any non-down state)', () => {
+      // Stalled endpoints still route requests (with stale data), so /health
+      // should report 200 — operators rely on the per-endpoint state field
+      // to spot the stall.
       healthMonitor.__setEndpointsForTesting('testnet', ['http://x:8545']);
       expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.true;
-      healthMonitor.__forceStateForTesting('testnet', 'http://x:8545', STATE_DOWN);
-      expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.false;
       healthMonitor.__forceStateForTesting('testnet', 'http://x:8545', STATE_STALLED);
-      expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.false;
+      expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.true;
       healthMonitor.__forceStateForTesting('testnet', 'http://x:8545', STATE_UP);
       expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.true;
+    });
+
+    it('returns false only when every endpoint is down', () => {
+      healthMonitor.__setEndpointsForTesting('testnet', ['http://x:8545']);
+      healthMonitor.__forceStateForTesting('testnet', 'http://x:8545', STATE_DOWN);
+      expect(healthMonitor.hasHealthyForNetwork('testnet')).to.be.false;
     });
   });
 });
