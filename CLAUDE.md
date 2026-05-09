@@ -1,0 +1,138 @@
+# CLAUDE.md
+
+Operational rules for coding agents working in `myqrlwallet-backend`.
+
+This is the backend service for `qrlwallet.com` — a Node.js (Express + Socket.IO) process that does three things:
+
+1. **JSON-RPC proxy** at `/api/qrl-rpc/<network>` — forwards wallet read/write calls to the QRL Zond execution layer with caching, security hardening, and multi-endpoint health-aware failover.
+2. **dApp Connect relay** at `/relay` (Socket.IO) — the broker that lets a browser-extension dApp pair with a wallet over an end-to-end-encrypted channel.
+3. **Misc app endpoints** at `/api/...` (`src/routes/app.routes.js`) — currently a transaction-history proxy that calls `zondscan.com/api/...`.
+
+It is **not** a custodial wallet, an indexer, or a node.
+
+## Priority Order
+
+1. Follow explicit user instructions.
+2. Preserve correctness and production safety — this service sits in the request path of every wallet RPC call and every dApp pairing handshake. Regressions here break wallets in the wild.
+3. Maintain momentum: implement, validate, and finish end-to-end.
+
+If rules conflict, follow the highest item.
+
+## High-signal map
+
+| Path | Role |
+|---|---|
+| `server.js` | Process entry: HTTP server + Socket.IO relay + healthMonitor lifecycle + Prometheus `/metrics` endpoint (token-protected). |
+| `src/app.js` | Express app wiring (CORS, JSON, routes, error handler). Imported by `server.js` and tests. |
+| `src/config/index.js` | dotenv-loaded config singleton. **Endpoint resolution** (`RPC_ENDPOINTS_<NETWORK>` comma-list, back-compat to `RPC_ENDPOINT_<NETWORK>`) lives here. Add tunables to `RPC_HEALTH.*`. |
+| `src/services/rpc.service.js` | RPC proxy: cache for invariant methods, SSRF-validated `custom` RPC, primary-only routing for `txpool_*` / `debug_*` / `admin_*`, `AbortController`-bounded fetch. |
+| `src/services/rpc/healthMonitor.js` | Per-endpoint state machine (`up` / `down` / `stalled` / `unknown`). Background poller (default 10 s) issues `qrl_blockNumber` against each endpoint. Passive signals come from real request results. |
+| `src/services/notifier.js` | Single integration seam for ops alerting. Currently emits structured logs only — add Discord/Telegram/Sentry here, not at call sites. |
+| `src/middleware/rpc-security.js` | Method whitelist, batch reject, request-size limit, two-tier rate limit (read vs write). Source of truth for what's exposed via the proxy. |
+| `src/relay/relayServer.js` | Socket.IO relay for the dApp Connect protocol. PQ-encrypted (ML-KEM + AES-GCM) handshake; backend never sees plaintext payloads. |
+| `src/relay/channelManager.js` | Per-channel state: participant slots, message buffer, PK binding, capacity caps. |
+| `src/relay/metrics.js` | `prom-client` registry. Surfaces relay metrics; `/metrics` endpoint is token-gated by `RELAY_STATS_TOKEN`. |
+| `src/routes/health.routes.js` | `/health` — per-endpoint snapshot from `healthMonitor`. 200 if any endpoint is non-`down`; 503 only when every endpoint is `down`. |
+| `src/routes/rpc.routes.js` | `/api/qrl-rpc/<network>` — applies the security middleware chain, then delegates to `rpcService.executeRPC`. |
+| `src/routes/app.routes.js` | Misc endpoints (currently the tx-history proxy → `zondscan.com`). |
+| `src/utils/cache.js` | `node-cache` instance used only for invariant RPC results (`qrl_chainId`, `net_version`). State-dependent methods MUST NOT be cached. |
+| `test/**/*.test.js` | Mocha + chai + sinon. Run via `npm test` (glob is quoted in `package.json`). |
+
+## Execution Contract
+
+### Default behaviour
+- Do the work end-to-end (implement + validate + git) in one pass when feasible. Don't stop at advice unless explicitly asked.
+- Don't leave TODOs for steps you can execute now.
+
+### Validation gate (mandatory before merge / push / deploy)
+```bash
+npm run format:check    # CI fails on formatting drift
+npm run lint
+npm test
+```
+There is no `typecheck` (this is plain JS) and no `build`. State exactly what you ran and what failed if anything did not run.
+
+### Review requests
+When asked for a "review", output findings first, ordered by severity, each with `path:line` references. Bugs/regressions/risks before summaries. If no findings, say so explicitly and list residual risks/testing gaps.
+
+## Deployment
+
+Auto-deploy via the workspace `myqrlwallet-cicd` GitHub-webhook listener on `ops@49.13.162.117`:
+
+| Branch push | Deploys to | Script | PM2 process | Port |
+|---|---|---|---|---|
+| `main` | prod (`qrlwallet.com`) | `deploy-backend-prod.sh` | `myqrlwallet-backend` | `3000` |
+| `dev`  | dev (`dev.qrlwallet.com`) | `deploy-backend-dev.sh` | `myqrlwallet-backend-dev` | `3002` |
+
+Both run `git pull && pm2 restart` (no `--update-env`). After **env-var** changes you must restart manually:
+
+```bash
+ssh ops@49.13.162.117 \
+  "export PATH=\$HOME/.nvm/versions/node/v22.18.0/bin:\$PATH; \
+   pm2 restart myqrlwallet-backend{,-dev} --update-env"
+```
+
+`/health` is **not** exposed through the public domain — nginx routes `/health` to the static frontend. To probe the live backend, hit `127.0.0.1:3000` via SSH:
+
+```bash
+ssh ops@49.13.162.117 'curl -s http://127.0.0.1:3000/health' | jq .
+```
+
+## Branching
+
+- Default integration branch is `dev`. Prod tracks `main`.
+- For features/fixes: feature branch → PR to `dev` → review → merge.
+- For dev → main releases: PR or fast-forward push (`git push origin dev:main`) when the diff is reviewed and you want both auto-deploys to fire.
+- For ops-style env-only rollouts (no code change): do not push noise commits — edit `.env` on the host and `pm2 restart … --update-env`.
+- Don't force-push `main` (auto-deploys prod). Don't `--no-verify` unless explicitly asked.
+
+## Critical invariants
+
+### RPC caching
+`src/services/rpc.service.js` only caches **invariant** RPC methods (`qrl_chainId`, `net_version`). Every state-dependent method (balances, nonces, block numbers, contract state, gas estimates, receipts, logs, writes) MUST go uncached, otherwise wallets serve stale reads after a tx confirms. Adding to `CACHEABLE_METHODS` requires a write-through invalidation strategy.
+
+### Primary-only methods
+`txpool_*`, `debug_*`, `admin_*` are pinned to the **first** endpoint in `RPC_ENDPOINTS_<NETWORK>`. The QRL Foundation public RPC (currently `209.250.255.226:8545`, used as the testnet failover) does **not** expose those namespaces — failing over would surface a misleading "method not found". Don't remove the primary-only list unless you're certain every configured endpoint exposes the method.
+
+### Endpoint env precedence
+- `RPC_ENDPOINTS_<NETWORK>` (comma-separated) is preferred.
+- `RPC_ENDPOINT_<NETWORK>` (single URL) is the legacy fallback.
+- Both unset → defaults to `['http://localhost:8545']` (only meaningful for local dev).
+
+When ops adds a new failover entry, it's an env edit + pm2 restart, not a code change.
+
+### Health-state semantics
+`healthMonitor` distinguishes `up` / `down` / `stalled` / `unknown`. Stall is detected by the **background poller** (block height unchanged for `RPC_STALL_AFTER_MS`, default 5 min). Strictly-increasing block height is required to count as forward progress; reorgs/regressions do not reset the stall timer and emit a `height-regression` notifier event. Real wallet requests update health state passively via `recordRequestResult` and can flip `unknown → up` immediately on success.
+
+### Custom RPC SSRF guard
+`validateCustomRpcUrl` (in `rpc.service.js`) is the SSRF perimeter for the `custom` network path. It currently blocks: localhost, RFC-1918, link-local (169.254/16), reserved 0/8, IPv6 `::1`. **Known gaps** worth a dedicated security pass before promoting `custom` to a more user-facing flow: CGNAT (100.64/10), IETF Protocol Assignments (192.0.0/24), benchmark (198.18/15), IPv6 ULA (`fc00::/7`), IPv6 link-local (`fe80::/10`), invalid octet ranges, and DNS rebinding (host that resolves to a private IP). Changes to this function are security-critical — keep tests around it.
+
+### dApp Connect canonical behaviour
+The relay protocol contract — handshake idempotency, channel rotation, participant types, stale-session cleanup — lives in the workspace-root CLAUDE.md §4. Read that section before touching `src/relay/`. A regression in the dApp Connect surface is high-priority because it ships in mobile + web wallets that may be many days out of date.
+
+## Useful commands
+
+```bash
+# Quick dev loop
+npm run dev                    # nodemon
+npm test
+npm run lint:fix && npm run format
+
+# Tail prod logs (cicd + backend)
+ssh ops@49.13.162.117 'tail -f ~/.pm2/logs/myqrlwallet-backend-out.log'
+ssh ops@49.13.162.117 'tail -f ~/.pm2/logs/myqrlwallet-cicd-out.log'
+
+# Inspect live health (per-endpoint state)
+ssh ops@49.13.162.117 'curl -s http://127.0.0.1:3000/health' | jq .
+ssh ops@49.13.162.117 'curl -s http://127.0.0.1:3002/health' | jq .   # dev
+
+# Smoke a public RPC call against the proxy
+curl -s -X POST https://qrlwallet.com/api/qrl-rpc/testnet \
+  -H 'Content-Type: application/json' \
+  -d '{"jsonrpc":"2.0","method":"qrl_blockNumber","params":[],"id":1}'
+```
+
+## See also
+
+- Workspace root `CLAUDE.md` — cross-repo workspace map, dApp Connect protocol contract (§4), and the canonical RPC failover runbook (§5.4).
+- `SECURITY.md` — vulnerability disclosure.
