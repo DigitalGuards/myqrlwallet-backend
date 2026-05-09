@@ -161,7 +161,12 @@ class RPCService {
     }
 
     if (chosenUrl === undefined) {
-      throw lastError;
+      // Defensive: in current code paths `order` is always non-empty (we
+      // throw earlier if `attemptOrder` is empty), so the loop runs at least
+      // once and either sets `chosenUrl` or `lastError`. The `|| new Error`
+      // fallback is belt-and-braces for future refactors that might widen
+      // this path — never throw `undefined`.
+      throw lastError || new Error('No endpoints attempted');
     }
 
     if (isCacheable) {

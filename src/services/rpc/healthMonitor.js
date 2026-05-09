@@ -54,13 +54,28 @@ class HealthMonitor {
       logger.warn('[healthMonitor] no networks configured; poller not started');
       return;
     }
-    this.pollerTimer = setInterval(
-      () => this.pollAll().catch((err) => logger.error({ err }, '[healthMonitor] poll loop error')),
-      CONFIG.RPC_HEALTH.POLL_INTERVAL_MS
-    );
+    // Re-entrancy guard: setInterval doesn't await its callback, so if a poll
+    // ever runs longer than POLL_INTERVAL_MS the next tick would overlap. With
+    // current settings (10s interval, 5s timeout, parallel polls) overlap is
+    // unreachable, but the guard makes that property explicit and survives
+    // future endpoint-list growth.
+    this.pollerTimer = setInterval(() => {
+      if (this.polling) return;
+      this.polling = true;
+      this.pollAll()
+        .catch((err) => logger.error({ err }, '[healthMonitor] poll loop error'))
+        .finally(() => {
+          this.polling = false;
+        });
+    }, CONFIG.RPC_HEALTH.POLL_INTERVAL_MS);
     if (this.pollerTimer.unref) this.pollerTimer.unref();
     // Kick off an immediate poll so /health is meaningful before the first interval.
-    this.pollAll().catch((err) => logger.error({ err }, '[healthMonitor] initial poll error'));
+    this.polling = true;
+    this.pollAll()
+      .catch((err) => logger.error({ err }, '[healthMonitor] initial poll error'))
+      .finally(() => {
+        this.polling = false;
+      });
   }
 
   stop() {
@@ -99,7 +114,10 @@ class HealthMonitor {
     this.init();
     const endpoints = this.networks.get(network);
     if (!endpoints) return false;
-    return endpoints.some((e) => e.state === STATE_UP || e.state === STATE_UNKNOWN);
+    // Stalled endpoints still route requests (with stale data), so /health
+    // mirrors that — 503 only when every endpoint is fully `down`. The
+    // per-endpoint `state` in the response surfaces stalled vs up.
+    return endpoints.some((e) => e.state !== STATE_DOWN);
   }
 
   recordRequestResult(network, url, ok, error) {
@@ -184,10 +202,26 @@ class HealthMonitor {
   }
 
   applyPollSuccess(network, ep, height) {
-    const advanced = ep.lastHeight !== height;
+    // Only treat strictly increasing height as forward progress. A regression
+    // (chain reorg, bad node serving an older head) must NOT reset the stall
+    // timer — a node going backwards is sick, not "advancing".
+    const advanced = ep.lastHeight === null || height > ep.lastHeight;
     if (advanced) {
       ep.lastHeight = height;
       ep.lastHeightChangeAt = Date.now();
+    } else if (height < ep.lastHeight) {
+      // Height regression — log via notifier so operators see it; keep
+      // tracking the regressed height so a subsequent climb back up registers
+      // as forward progress, but leave lastHeightChangeAt alone (we want stall
+      // detection to fire if the node stays stuck on the lower head).
+      notify({
+        severity: 'warn',
+        network,
+        endpoint: ep.url,
+        event: 'height-regression',
+        detail: { previousHeight: ep.lastHeight, observedHeight: height },
+      });
+      ep.lastHeight = height;
     }
     ep.consecutiveSuccesses += 1;
     ep.consecutiveFailures = 0;
@@ -247,17 +281,27 @@ class HealthMonitor {
     ep.consecutiveFailures = 0;
     ep.consecutiveSuccesses += 1;
     ep.lastError = null;
+    const previousState = ep.state;
+    let newState = previousState;
     if (
-      ep.state === STATE_DOWN &&
+      previousState === STATE_DOWN &&
       ep.consecutiveSuccesses >= CONFIG.RPC_HEALTH.UP_AFTER_SUCCESSES
     ) {
-      ep.state = STATE_UP;
+      newState = STATE_UP;
+    } else if (previousState === STATE_UNKNOWN) {
+      // A real request succeeded — flip out of unknown immediately rather
+      // than waiting for the next background poll. Otherwise the selector
+      // keeps ranking this endpoint behind any sibling already at `up`.
+      newState = STATE_UP;
+    }
+    if (newState !== previousState) {
+      ep.state = newState;
       notify({
         severity: 'info',
         network,
         endpoint: ep.url,
         event: 'up',
-        detail: { source: 'request' },
+        detail: { source: 'request', previousState },
       });
     }
   }
