@@ -191,10 +191,6 @@ src/
     └── cache.js        # Cache configuration
 ```
 
-## Merchant Payment API
-
-A standalone Go microservice for accepting QRL payments. See [docs/merchant-api.md](docs/merchant-api.md) for full documentation.
-
 ## Related Projects
 
 - [myqrlwallet-frontend](https://github.com/DigitalGuards/myqrlwallet-frontend) - React web wallet
