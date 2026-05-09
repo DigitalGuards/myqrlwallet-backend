@@ -5,6 +5,7 @@ import { CONFIG } from './src/config/index.js';
 import { createRelayServer } from './src/relay/relayServer.js';
 import { logger } from './src/utils/logger.js';
 import { register } from './src/relay/metrics.js';
+import { healthMonitor } from './src/services/rpc/healthMonitor.js';
 
 const httpServer = createServer(app);
 
@@ -44,6 +45,7 @@ app.get('/metrics', async (req, res) => {
 
 function shutdown(signal) {
   logger.info({ signal }, 'Shutting down relay server');
+  healthMonitor.stop();
   io.destroy?.();
   httpServer.close(() => {
     process.exit(0);
@@ -56,4 +58,5 @@ process.on('SIGTERM', () => shutdown('SIGTERM'));
 httpServer.listen(CONFIG.PORT, () => {
   logger.info({ port: CONFIG.PORT }, 'Server started');
   logger.info('Socket.IO relay available at /relay');
+  healthMonitor.start();
 });

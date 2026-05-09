@@ -3,6 +3,7 @@ import sinon from 'sinon';
 import { rpcService } from '../../src/services/rpc.service.js';
 import { CONFIG } from '../../src/config/index.js';
 import { cache } from '../../src/utils/cache.js';
+import { healthMonitor, HEALTH_STATES } from '../../src/services/rpc/healthMonitor.js';
 
 const { expect } = chai;
 
@@ -10,6 +11,7 @@ describe('RPC Service', () => {
   afterEach(() => {
     sinon.restore();
     cache.flushAll();
+    healthMonitor.__resetForTesting();
   });
 
   it('should validate network parameter', async () => {
@@ -117,6 +119,86 @@ describe('RPC Service', () => {
       await rpcService.executeRPC('testnet', 'net_version', []);
 
       expect(stub.callCount).to.equal(1);
+    });
+  });
+
+  describe('failover behavior', () => {
+    it('falls back to a second endpoint when the first one fails', async () => {
+      healthMonitor.__setEndpointsForTesting('testnet', [
+        'http://primary.test:8545',
+        'http://secondary.test:8545',
+      ]);
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub
+        .withArgs('http://primary.test:8545')
+        .rejects(new Error('primary down'));
+      stub
+        .withArgs('http://secondary.test:8545')
+        .resolves({ jsonrpc: '2.0', id: 1, result: '0xff' });
+
+      const result = await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
+      expect(result.result).to.equal('0xff');
+      expect(stub.callCount).to.equal(2);
+    });
+
+    it('throws the last error when all endpoints fail within the retry budget', async () => {
+      healthMonitor.__setEndpointsForTesting('testnet', [
+        'http://primary.test:8545',
+        'http://secondary.test:8545',
+      ]);
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.rejects(new Error('all gone'));
+
+      try {
+        await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
+        expect.fail('Expected an error to be thrown');
+      } catch (err) {
+        expect(err.message).to.equal('all gone');
+      }
+      expect(stub.callCount).to.equal(2);
+    });
+
+    it('skips down endpoints in favour of healthy ones (orderEndpointsForAttempt)', async () => {
+      healthMonitor.__setEndpointsForTesting('testnet', [
+        'http://primary.test:8545',
+        'http://secondary.test:8545',
+      ]);
+      healthMonitor.__forceStateForTesting(
+        'testnet',
+        'http://primary.test:8545',
+        HEALTH_STATES.STATE_DOWN
+      );
+      healthMonitor.__forceStateForTesting(
+        'testnet',
+        'http://secondary.test:8545',
+        HEALTH_STATES.STATE_UP
+      );
+
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.resolves({ jsonrpc: '2.0', id: 1, result: '0xee' });
+
+      await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
+      // First (and only) attempt should be the up endpoint, not the down one.
+      expect(stub.firstCall.args[0]).to.equal('http://secondary.test:8545');
+    });
+
+    it('pins txpool_* methods to the primary endpoint only (no failover)', async () => {
+      healthMonitor.__setEndpointsForTesting('testnet', [
+        'http://primary.test:8545',
+        'http://secondary.test:8545',
+      ]);
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.rejects(new Error('primary down'));
+
+      try {
+        await rpcService.executeRPC('testnet', 'txpool_status', []);
+        expect.fail('Expected an error to be thrown');
+      } catch (err) {
+        expect(err.message).to.equal('primary down');
+      }
+      // Only the primary should be tried — txpool_* must not fail over.
+      expect(stub.callCount).to.equal(1);
+      expect(stub.firstCall.args[0]).to.equal('http://primary.test:8545');
     });
   });
 });
