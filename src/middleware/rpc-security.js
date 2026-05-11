@@ -243,8 +243,14 @@ export const rpcParamsValidator = (req, res, next) => {
       const filter = params[0];
 
       if (typeof filter.blockHash !== 'string') {
-        // Open-ended scans from genesis are never legitimate from this proxy.
-        if (filter.fromBlock === 'earliest' || filter.fromBlock === '0x0') {
+        const from = parseBlockTag(filter.fromBlock);
+        const to = parseBlockTag(filter.toBlock);
+
+        // Open-ended scans from genesis are never legitimate. Compare on
+        // the parsed numeric value so all hex variations of zero
+        // ("0x0", "0x00", "0x000", …) are caught — a literal-string
+        // check would be trivially bypassable.
+        if (filter.fromBlock === 'earliest' || from === 0) {
           return sendRpcError(
             res,
             400,
@@ -254,8 +260,6 @@ export const rpcParamsValidator = (req, res, next) => {
           );
         }
 
-        const from = parseBlockTag(filter.fromBlock);
-        const to = parseBlockTag(filter.toBlock);
         // Both sides numeric → enforce the range cap directly.
         if (from !== null && to !== null) {
           const range = to - from;
@@ -269,19 +273,41 @@ export const rpcParamsValidator = (req, res, next) => {
             );
           }
         }
-        // Numeric from + "latest"/"pending" to is allowed: typical event-
-        // watcher pattern polls a small window up to the tip. The
-        // genesis-from check above already covers the dangerous edge.
+        // Known gap: when `to` is "latest"/"pending" and `from` is a
+        // small-but-nonzero number, the range check is bypassed.
+        // Closing that requires querying current chain height from
+        // here (currently the middleware has no access to
+        // healthMonitor's lastHeight). Tracked for the next sprint —
+        // the genesis check above still covers the worst case.
       }
 
-      if (Array.isArray(filter.address) && filter.address.length > MAX_GETLOGS_ADDRESSES) {
-        return sendRpcError(
-          res,
-          400,
-          id,
-          -32602,
-          `Invalid params: too many addresses (max ${MAX_GETLOGS_ADDRESSES})`
-        );
+      // Address filter: reject 0x-prefixed addresses outright. Per QRL v2
+      // protocol rules addresses are Q-prefixed; a 0x-prefixed value here
+      // is either malformed or an attempt to slip Ethereum-style input
+      // through the proxy. Also cap array length so a single request
+      // can't fan out into N parallel address lookups on the node.
+      if (filter.address !== undefined && filter.address !== null) {
+        const addrs = Array.isArray(filter.address) ? filter.address : [filter.address];
+        if (addrs.length > MAX_GETLOGS_ADDRESSES) {
+          return sendRpcError(
+            res,
+            400,
+            id,
+            -32602,
+            `Invalid params: too many addresses (max ${MAX_GETLOGS_ADDRESSES})`
+          );
+        }
+        for (const a of addrs) {
+          if (typeof a === 'string' && a.startsWith('0x')) {
+            return sendRpcError(
+              res,
+              400,
+              id,
+              -32602,
+              'Invalid params: QRL addresses must be Q-prefixed'
+            );
+          }
+        }
       }
       break;
     }
