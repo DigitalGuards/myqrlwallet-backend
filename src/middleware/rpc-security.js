@@ -38,6 +38,24 @@ const ALLOWED_RPC_METHODS = new Set([
 const WRITE_METHODS = new Set(['qrl_sendRawTransaction', 'qrl_sendTransaction']);
 
 /**
+ * qrl_getLogs bounds. Without these a single request can ask the node to
+ * scan the whole chain, monopolising RPC capacity for everyone else.
+ */
+const MAX_GETLOGS_BLOCK_RANGE = 5000; // ~16-17 hours of QRL Zond blocks
+const MAX_GETLOGS_ADDRESSES = 10;
+
+/**
+ * Parse a hex block tag to a Number, or null for named tags / invalid input.
+ */
+const parseBlockTag = (v) => {
+  if (typeof v !== 'string') return null;
+  if (v === 'latest' || v === 'pending' || v === 'earliest') return null;
+  if (!v.startsWith('0x')) return null;
+  const n = parseInt(v, 16);
+  return Number.isFinite(n) ? n : null;
+};
+
+/**
  * Helper function to send JSON-RPC error responses
  */
 const sendRpcError = (res, statusCode, id, errorCode, message) => {
@@ -214,6 +232,59 @@ export const rpcParamsValidator = (req, res, next) => {
         return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
       }
       break;
+
+    case 'qrl_getLogs': {
+      // Bound the request before proxying — otherwise a caller can ask the
+      // node to scan from genesis to tip, blocking the RPC for everyone
+      // else for seconds. blockHash form (single-block) is always fine.
+      if (!params || params.length < 1 || typeof params[0] !== 'object' || params[0] === null) {
+        return sendRpcError(res, 400, id, -32602, 'Invalid params: filter object required');
+      }
+      const filter = params[0];
+
+      if (typeof filter.blockHash !== 'string') {
+        // Open-ended scans from genesis are never legitimate from this proxy.
+        if (filter.fromBlock === 'earliest' || filter.fromBlock === '0x0') {
+          return sendRpcError(
+            res,
+            400,
+            id,
+            -32602,
+            'Invalid params: qrl_getLogs from genesis is not allowed; supply a recent fromBlock'
+          );
+        }
+
+        const from = parseBlockTag(filter.fromBlock);
+        const to = parseBlockTag(filter.toBlock);
+        // Both sides numeric → enforce the range cap directly.
+        if (from !== null && to !== null) {
+          const range = to - from;
+          if (range < 0 || range > MAX_GETLOGS_BLOCK_RANGE) {
+            return sendRpcError(
+              res,
+              400,
+              id,
+              -32602,
+              `Invalid params: qrl_getLogs block range exceeds ${MAX_GETLOGS_BLOCK_RANGE}`
+            );
+          }
+        }
+        // Numeric from + "latest"/"pending" to is allowed: typical event-
+        // watcher pattern polls a small window up to the tip. The
+        // genesis-from check above already covers the dangerous edge.
+      }
+
+      if (Array.isArray(filter.address) && filter.address.length > MAX_GETLOGS_ADDRESSES) {
+        return sendRpcError(
+          res,
+          400,
+          id,
+          -32602,
+          `Invalid params: too many addresses (max ${MAX_GETLOGS_ADDRESSES})`
+        );
+      }
+      break;
+    }
   }
 
   next();
