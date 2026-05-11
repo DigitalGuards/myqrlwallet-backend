@@ -14,7 +14,7 @@ describe('Health Routes', () => {
     healthMonitor.__resetForTesting();
   });
 
-  it('should return status ok with per-endpoint snapshot when at least one endpoint is selectable', async () => {
+  it('should return status ok with per-endpoint snapshot (url redacted) when at least one endpoint is selectable', async () => {
     healthMonitor.__setEndpointsForTesting('testnet', ['http://example.test:8545']);
     const res = await request.execute(app).get('/health');
     expect(res).to.have.status(200);
@@ -22,9 +22,12 @@ describe('Health Routes', () => {
     expect(res.body.endpoints).to.be.an('object');
     expect(res.body.endpoints.testnet).to.be.an('array').with.lengthOf(1);
     expect(res.body.endpoints.testnet[0]).to.include({
-      url: 'http://example.test:8545',
+      index: 0,
       state: HEALTH_STATES.STATE_UNKNOWN,
     });
+    // Internal RPC URL is intentionally stripped from the public response
+    // so anonymous callers can't enumerate backend infrastructure.
+    expect(res.body.endpoints.testnet[0]).to.not.have.property('url');
   });
 
   it('should return 503 degraded when every configured endpoint is down or stalled', async () => {

@@ -3,8 +3,26 @@ import { healthMonitor } from '../services/rpc/healthMonitor.js';
 
 const router = Router();
 
+/**
+ * Strip the `url` field from each endpoint entry. The internal healthMonitor
+ * snapshot exposes the full upstream RPC URLs (primary/secondary nodes); we
+ * don't want anonymous internet scanners enumerating that infra.
+ * Index-by-position is preserved so the order still corresponds to the
+ * configured RPC_ENDPOINTS_<NETWORK> list.
+ */
+const redactSnapshot = (snapshot) => {
+  const out = {};
+  for (const [network, endpoints] of Object.entries(snapshot)) {
+    out[network] = endpoints.map(({ url: _url, ...rest }, index) => ({
+      index,
+      ...rest,
+    }));
+  }
+  return out;
+};
+
 router.get('/', (req, res) => {
-  const endpoints = healthMonitor.getSnapshot();
+  const endpoints = redactSnapshot(healthMonitor.getSnapshot());
   const networks = Object.keys(endpoints);
   const anyHealthy =
     networks.length === 0 || networks.some((n) => healthMonitor.hasHealthyForNetwork(n));
