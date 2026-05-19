@@ -167,6 +167,66 @@ describe('IPFS Routes', () => {
     expect(res.body.error).to.equal('gateway unreachable');
   });
 
+  it('returns 502 when the gateway response has a null body', async () => {
+    // Fetch API allows null body (e.g. 204 No Content). Handler must surface
+    // this as a clean gateway error rather than letting .getReader() blow up.
+    fetchStub.resolves({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          const n = name.toLowerCase();
+          if (n === 'content-type') return 'image/png';
+          if (n === 'content-length') return '0';
+          return null;
+        },
+      },
+      body: null,
+    });
+
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+
+    expect(res).to.have.status(502);
+    expect(res.body.error).to.equal('gateway error');
+  });
+
+  it('returns 504 when an AbortError fires during stream read', async () => {
+    // FETCH_TIMEOUT_MS controller can fire AFTER the response headers are
+    // received — the inner stream-read catch must re-throw AbortError so
+    // the outer catch maps it to 504, not the generic 502 stream error.
+    const abortErr = new Error('aborted mid-stream');
+    abortErr.name = 'AbortError';
+    fetchStub.resolves({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          const n = name.toLowerCase();
+          if (n === 'content-type') return 'image/png';
+          if (n === 'content-length') return '1000';
+          return null;
+        },
+      },
+      body: {
+        getReader() {
+          return {
+            async read() {
+              throw abortErr;
+            },
+            async cancel() {},
+          };
+        },
+      },
+    });
+
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+
+    expect(res).to.have.status(504);
+    expect(res.body.error).to.equal('gateway timeout');
+  });
+
   it('returns 502 when the body stream throws mid-read', async () => {
     fetchStub.resolves({
       ok: true,
