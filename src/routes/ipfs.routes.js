@@ -102,6 +102,14 @@ async function ipfsHandler(req, res) {
 
     const contentType = response.headers.get('content-type') || 'application/octet-stream';
 
+    // Fetch API allows response.body to be null (e.g. 204 No Content). Without
+    // an explicit check, the .getReader() call below would throw a TypeError
+    // that we'd report as "gateway unreachable" — misleading.
+    if (!response.body) {
+      log.warn({ cid, status: response.status }, 'IPFS gateway returned empty body');
+      return res.status(502).json({ error: 'gateway error' });
+    }
+
     const reader = response.body.getReader();
     const chunks = [];
     let received = 0;
@@ -124,10 +132,16 @@ async function ipfsHandler(req, res) {
         chunks.push(value);
       }
     } catch (streamErr) {
+      // An AbortError mid-stream is the FETCH_TIMEOUT_MS controller firing,
+      // not a stream-specific failure. Re-throw so the outer catch maps it
+      // to 504 like the pre-streaming code did. Anything else stays a 502.
+      if (streamErr.name === 'AbortError') throw streamErr;
       log.error({ err: streamErr.message, url }, 'IPFS proxy stream read failed');
       return res.status(502).json({ error: 'gateway stream error' });
     }
-    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
+    // Buffer.concat accepts Uint8Array chunks directly; the previous
+    // .map(Buffer.from) was wasted work in a hot path.
+    const buf = Buffer.concat(chunks);
 
     res.set({
       'Content-Type': contentType,
