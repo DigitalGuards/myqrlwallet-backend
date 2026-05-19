@@ -7,14 +7,31 @@ const { expect } = chai;
 
 import { app } from '../../src/app.js';
 
+/**
+ * Build a stand-in for the Fetch API Response object that lets us drive
+ * the streaming read loop in ipfs.routes.js. `chunks` is an array of
+ * Uint8Array / Buffer pieces emitted in order.
+ */
 function buildFetchResponse({
   ok = true,
   status = 200,
   contentType = 'image/png',
-  body = Buffer.from('PNGDATA'),
   contentLength,
+  chunks = [Buffer.from('PNGDATA')],
 } = {}) {
-  const bufBody = body instanceof Buffer ? body : Buffer.from(body);
+  const queue = chunks.map((c) => (c instanceof Uint8Array ? c : Buffer.from(c)));
+  const totalLen = queue.reduce((n, c) => n + c.byteLength, 0);
+  let i = 0;
+  const reader = {
+    async read() {
+      if (i >= queue.length) return { done: true, value: undefined };
+      const value = queue[i++];
+      return { done: false, value };
+    },
+    async cancel() {
+      i = queue.length;
+    },
+  };
   return {
     ok,
     status,
@@ -22,12 +39,11 @@ function buildFetchResponse({
       get(name) {
         const n = name.toLowerCase();
         if (n === 'content-type') return contentType;
-        if (n === 'content-length') return String(contentLength ?? bufBody.length);
+        if (n === 'content-length') return String(contentLength ?? totalLen);
         return null;
       },
     },
-    arrayBuffer: async () =>
-      bufBody.buffer.slice(bufBody.byteOffset, bufBody.byteOffset + bufBody.byteLength),
+    body: { getReader: () => reader },
   };
 }
 
@@ -64,7 +80,7 @@ describe('IPFS Routes', () => {
 
   it('proxies a valid CIDv0 image through the configured gateway', async () => {
     fetchStub.resolves(
-      buildFetchResponse({ contentType: 'image/png', body: Buffer.from('PNGDATA') }),
+      buildFetchResponse({ contentType: 'image/png', chunks: [Buffer.from('PNGDATA')] }),
     );
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
@@ -83,7 +99,7 @@ describe('IPFS Routes', () => {
     fetchStub.resolves(
       buildFetchResponse({
         contentType: 'application/json',
-        body: Buffer.from('{"name":"x"}'),
+        chunks: [Buffer.from('{"name":"x"}')],
       }),
     );
 
@@ -97,9 +113,9 @@ describe('IPFS Routes', () => {
     );
   });
 
-  it('rejects responses larger than MAX_SIZE', async () => {
+  it('rejects oversize responses up front via declared Content-Length', async () => {
     fetchStub.resolves(
-      buildFetchResponse({ contentLength: 20 * 1024 * 1024, body: Buffer.alloc(8) }),
+      buildFetchResponse({ contentLength: 20 * 1024 * 1024, chunks: [Buffer.alloc(8)] }),
     );
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
@@ -107,6 +123,26 @@ describe('IPFS Routes', () => {
 
     expect(res).to.have.status(413);
     expect(res.body.error).to.equal('too large');
+  });
+
+  it('rejects oversize responses mid-stream even when Content-Length lies', async () => {
+    // Gateway lies in the header (says 10 bytes) but actually streams 12 MB
+    // in 1 MB chunks. The handler must trip the incremental cap and 413
+    // instead of buffering the whole thing into memory.
+    const oneMb = Buffer.alloc(1024 * 1024);
+    fetchStub.resolves(
+      buildFetchResponse({
+        contentLength: 10,
+        chunks: Array(12).fill(oneMb),
+      }),
+    );
+
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+
+    expect(res).to.have.status(413);
+    expect(res.body.error).to.equal('too large');
+    expect(res.body.size).to.be.greaterThan(10 * 1024 * 1024);
   });
 
   it('returns 504 on gateway timeout', async () => {
@@ -131,12 +167,42 @@ describe('IPFS Routes', () => {
     expect(res.body.error).to.equal('gateway unreachable');
   });
 
+  it('returns 502 when the body stream throws mid-read', async () => {
+    fetchStub.resolves({
+      ok: true,
+      status: 200,
+      headers: {
+        get(name) {
+          const n = name.toLowerCase();
+          if (n === 'content-type') return 'image/png';
+          if (n === 'content-length') return '100';
+          return null;
+        },
+      },
+      body: {
+        getReader() {
+          return {
+            async read() {
+              throw new Error('socket hang up');
+            },
+            async cancel() {},
+          };
+        },
+      },
+    });
+
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+
+    expect(res).to.have.status(502);
+    expect(res.body.error).to.equal('gateway stream error');
+  });
+
   it('returns 404 when the gateway returns 404', async () => {
     fetchStub.resolves({
       ok: false,
       status: 404,
       headers: { get: () => null },
-      arrayBuffer: async () => Buffer.alloc(0).buffer,
     });
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
