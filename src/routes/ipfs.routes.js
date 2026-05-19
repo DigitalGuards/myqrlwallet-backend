@@ -136,7 +136,7 @@ async function ipfsHandler(req, res) {
       // not a stream-specific failure. Re-throw so the outer catch maps it
       // to 504 like the pre-streaming code did. Anything else stays a 502.
       if (streamErr.name === 'AbortError') throw streamErr;
-      log.error({ err: streamErr.message, url }, 'IPFS proxy stream read failed');
+      log.error({ err: streamErr, url }, 'IPFS proxy stream read failed');
       return res.status(502).json({ error: 'gateway stream error' });
     }
     // Buffer.concat accepts Uint8Array chunks directly; the previous
