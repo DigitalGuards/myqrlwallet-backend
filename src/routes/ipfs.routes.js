@@ -90,17 +90,44 @@ async function ipfsHandler(req, res) {
         .json({ error: 'gateway error', status: response.status });
     }
 
-    // Reject oversize responses before buffering.
+    // Reject oversize responses up front if the gateway is honest about
+    // Content-Length. A malicious or buggy gateway can still under-declare
+    // (or omit) the header and stream arbitrarily many bytes, so we ALSO
+    // enforce the cap incrementally as we read the body — never let an
+    // attacker buffer >MAX_SIZE into our heap.
     const declaredSize = parseInt(response.headers.get('content-length') || '0', 10);
     if (declaredSize > MAX_SIZE) {
       return res.status(413).json({ error: 'too large', size: declaredSize, max: MAX_SIZE });
     }
 
     const contentType = response.headers.get('content-type') || 'application/octet-stream';
-    const buf = Buffer.from(await response.arrayBuffer());
-    if (buf.length > MAX_SIZE) {
-      return res.status(413).json({ error: 'too large', size: buf.length, max: MAX_SIZE });
+
+    const reader = response.body.getReader();
+    const chunks = [];
+    let received = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (received > MAX_SIZE) {
+          // Stop pulling bytes off the gateway socket before we ever
+          // commit them to our heap. cancel() may reject if the stream
+          // is already closed — swallow that.
+          try {
+            await reader.cancel();
+          } catch {
+            /* noop */
+          }
+          return res.status(413).json({ error: 'too large', size: received, max: MAX_SIZE });
+        }
+        chunks.push(value);
+      }
+    } catch (streamErr) {
+      log.error({ err: streamErr.message, url }, 'IPFS proxy stream read failed');
+      return res.status(502).json({ error: 'gateway stream error' });
     }
+    const buf = Buffer.concat(chunks.map((c) => Buffer.from(c)));
 
     res.set({
       'Content-Type': contentType,
