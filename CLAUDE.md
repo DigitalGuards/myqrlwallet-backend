@@ -25,7 +25,7 @@ If rules conflict, follow the highest item.
 | `server.js` | Process entry: HTTP server + Socket.IO relay + healthMonitor lifecycle + Prometheus `/metrics` endpoint (token-protected). |
 | `src/app.js` | Express app wiring (CORS, JSON, routes, error handler). Imported by `server.js` and tests. |
 | `src/config/index.js` | dotenv-loaded config singleton. **Endpoint resolution** (`RPC_ENDPOINTS_<NETWORK>` comma-list, back-compat to `RPC_ENDPOINT_<NETWORK>`) lives here. Add tunables to `RPC_HEALTH.*`. |
-| `src/services/rpc.service.js` | RPC proxy: cache for invariant methods, SSRF-validated `custom` RPC, primary-only routing for `txpool_*` / `debug_*` / `admin_*`, `AbortController`-bounded fetch. |
+| `src/services/rpc.service.js` | RPC proxy: cache for invariant methods, primary-only routing for `txpool_*` / `debug_*` / `admin_*`, `AbortController`-bounded fetch. |
 | `src/services/rpc/healthMonitor.js` | Per-endpoint state machine (`up` / `down` / `stalled` / `unknown`). Background poller (default 10 s) issues `qrl_blockNumber` against each endpoint. Passive signals come from real request results. |
 | `src/services/notifier.js` | Single integration seam for ops alerting. Currently emits structured logs only — add Discord/Telegram/Sentry here, not at call sites. |
 | `src/middleware/rpc-security.js` | Method whitelist, batch reject, request-size limit, two-tier rate limit (read vs write). Source of truth for what's exposed via the proxy. |
@@ -103,9 +103,6 @@ When ops adds a new failover entry, it's an env edit + pm2 restart, not a code c
 
 ### Health-state semantics
 `healthMonitor` distinguishes `up` / `down` / `stalled` / `unknown`. Stall is detected by the **background poller** (block height unchanged for `RPC_STALL_AFTER_MS`, default 5 min). Strictly-increasing block height is required to count as forward progress; reorgs/regressions do not reset the stall timer and emit a `height-regression` notifier event. Real wallet requests update health state passively via `recordRequestResult` and can flip `unknown → up` immediately on success.
-
-### Custom RPC SSRF guard
-`validateCustomRpcUrl` (in `rpc.service.js`) is the SSRF perimeter for the `custom` network path. It currently blocks: localhost, RFC-1918, link-local (169.254/16), reserved 0/8, IPv6 `::1`. **Known gaps** worth a dedicated security pass before promoting `custom` to a more user-facing flow: CGNAT (100.64/10), IETF Protocol Assignments (192.0.0/24), benchmark (198.18/15), IPv6 ULA (`fc00::/7`), IPv6 link-local (`fe80::/10`), invalid octet ranges, and DNS rebinding (host that resolves to a private IP). Changes to this function are security-critical — keep tests around it.
 
 ### dApp Connect canonical behaviour
 The relay protocol contract — handshake idempotency, channel rotation, participant types, stale-session cleanup — lives in the workspace-root CLAUDE.md §4. Read that section before touching `src/relay/`. A regression in the dApp Connect surface is high-priority because it ships in mobile + web wallets that may be many days out of date.
