@@ -41,7 +41,6 @@ export const CONFIG = {
     dev: parseEndpointList('DEV', ['http://localhost:8545']),
     testnet: parseEndpointList('TESTNET', ['http://localhost:8545']),
     mainnet: parseEndpointList('MAINNET', ['http://localhost:8545']),
-    custom: 'CUSTOM_RPC_URL',
   },
 
   RPC_HEALTH: {

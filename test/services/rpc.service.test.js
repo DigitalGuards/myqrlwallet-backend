@@ -42,7 +42,7 @@ describe('RPC Service', () => {
     expect(CONFIG.RPC_ENDPOINTS).to.have.property('dev');
     expect(CONFIG.RPC_ENDPOINTS).to.have.property('testnet');
     expect(CONFIG.RPC_ENDPOINTS).to.have.property('mainnet');
-    expect(CONFIG.RPC_ENDPOINTS).to.have.property('custom');
+    expect(CONFIG.RPC_ENDPOINTS).to.not.have.property('custom');
   });
 
   describe('caching behavior', () => {

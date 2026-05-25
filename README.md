@@ -10,7 +10,7 @@ The backend provides two main services:
 
 ### 1. RPC Proxy (`POST /api/qrl-rpc/:network`)
 - Routes JSON-RPC calls to QRL blockchain nodes
-- Supports testnet, mainnet, and custom RPC endpoints
+- Supports testnet and mainnet RPC endpoints
 - Response caching via node-cache
 - CORS handling for browser requests
 
@@ -63,7 +63,7 @@ npm test        # Run tests
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet, custom) |
+| POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet) |
 | POST | `/api/tx-history` | Get transaction history for address |
 | GET | `/health` | Health check |
 
