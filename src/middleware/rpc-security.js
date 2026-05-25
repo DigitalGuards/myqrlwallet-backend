@@ -281,11 +281,13 @@ export const rpcParamsValidator = (req, res, next) => {
         // the genesis check above still covers the worst case.
       }
 
-      // Address filter: reject 0x-prefixed addresses outright. Per QRL v2
-      // protocol rules addresses are Q-prefixed; a 0x-prefixed value here
-      // is either malformed or an attempt to slip Ethereum-style input
-      // through the proxy. Also cap array length so a single request
-      // can't fan out into N parallel address lookups on the node.
+      // Address filter: require the canonical QRL v2 form (Q + 40 hex
+      // chars). Previously we only rejected 0x-prefixed inputs, which let
+      // arbitrary malformed strings (truncated addresses, wrong-prefix
+      // strings, whitespace) through to the node — same validation as
+      // qrl_getCode / qrl_getBalance elsewhere in this middleware. Also
+      // cap array length so a single request can't fan out into N
+      // parallel address lookups on the node.
       if (filter.address !== undefined && filter.address !== null) {
         const addrs = Array.isArray(filter.address) ? filter.address : [filter.address];
         if (addrs.length > MAX_GETLOGS_ADDRESSES) {
@@ -298,13 +300,13 @@ export const rpcParamsValidator = (req, res, next) => {
           );
         }
         for (const a of addrs) {
-          if (typeof a === 'string' && a.startsWith('0x')) {
+          if (typeof a !== 'string' || !/^Q[a-fA-F0-9]{40}$/i.test(a)) {
             return sendRpcError(
               res,
               400,
               id,
               -32602,
-              'Invalid params: QRL addresses must be Q-prefixed'
+              'Invalid params: QRL addresses must match Q + 40 hex chars'
             );
           }
         }
