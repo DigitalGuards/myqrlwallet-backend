@@ -61,9 +61,7 @@ router.post(
       const { network } = req.params;
       const { method, params } = req.body;
 
-      let { customRpcUrl } = req.query;
-
-      const result = await rpcService.executeRPC(network, method, params, customRpcUrl);
+      const result = await rpcService.executeRPC(network, method, params);
       res.json(result);
     } catch (error) {
       next(error);
