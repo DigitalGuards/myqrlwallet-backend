@@ -40,7 +40,6 @@ class HealthMonitor {
   init() {
     if (this.initialised) return;
     for (const [network, endpoints] of Object.entries(CONFIG.RPC_ENDPOINTS)) {
-      if (network === 'custom') continue;
       if (!Array.isArray(endpoints) || endpoints.length === 0) continue;
       this.networks.set(network, endpoints.map(makeEndpointRecord));
     }
