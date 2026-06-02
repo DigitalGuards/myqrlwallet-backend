@@ -708,5 +708,23 @@ describe('Relay Server', function () {
       await disconnect(dapp);
       await disconnect(wallet);
     });
+
+    it('refuses to route messages on a terminated channel', async () => {
+      const wallet = await connect(relay.port);
+      const dapp = await connect(relay.port);
+      await joinChannel(wallet, 'closed-route', 'wallet');
+      await joinChannel(dapp, 'closed-route', 'dapp');
+      // The wallet explicitly closes (tombstones) the channel.
+      await new Promise((resolve) => {
+        wallet.emit('close_channel', { channelId: 'closed-route' }, () => resolve());
+      });
+      // A peer that never received or ignored the 'close' event must not be
+      // able to keep routing through the dead channel.
+      const ack = await sendMessage(dapp, 'closed-route', 'after-close', 'dapp');
+      expect(ack.success).to.be.false;
+      expect(ack.error).to.equal('Channel terminated');
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
   });
 });
