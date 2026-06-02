@@ -62,6 +62,21 @@ class ChannelManager {
   join(channelId, socketId, clientType, publicKeyBase64) {
     let channel = this.channels.get(channelId);
 
+    // Re-join to an explicitly closed channel: report the tombstone so the
+    // (re)joining peer drops its stored session, but do NOT resurrect it or
+    // add a participant. Parking a socket in a dead channel would both skip
+    // the active-channel admission cap (getChannelInfo stays truthy) and let
+    // an attacker loop join->close to flood the tombstone FIFO.
+    if (channel && channel.terminated) {
+      return {
+        success: true,
+        bufferedMessages: [],
+        channelPublicKey: null,
+        participants: [],
+        terminated: true,
+      };
+    }
+
     if (!channel) {
       channel = {
         participants: new Map(),
@@ -192,6 +207,11 @@ class ChannelManager {
     // peer sees no participants anyway), and creating one would let an
     // attacker fill memory with tombstones that bypass the channel cap.
     if (!channel) return;
+    // Idempotent: a channel can only be tombstoned once. Without this a
+    // repeated close() (or a re-join->close loop on the same id) would push
+    // duplicate entries into terminatedOrder and the FIFO eviction would then
+    // flush out legitimate tombstones.
+    if (channel.terminated) return;
     channel.terminated = true;
     channel.terminatedAt = Date.now();
     channel.lastActivity = Date.now();

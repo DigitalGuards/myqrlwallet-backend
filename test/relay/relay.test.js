@@ -768,5 +768,25 @@ describe('Relay Server', function () {
         clearInterval(cm.cleanupTimer);
       }
     });
+
+    it('close() is idempotent and a tombstone re-join parks no participant', () => {
+      const cm = new ChannelManager();
+      try {
+        cm.join('dup-ch', 'sock-a', 'dapp');
+        cm.close('dup-ch');
+        expect(cm.terminatedOrder.length).to.equal(1);
+        // Idempotent: a second close (or a join->close loop on the same id)
+        // must not push a duplicate FIFO entry that would flush real tombstones.
+        cm.close('dup-ch');
+        expect(cm.terminatedOrder.length).to.equal(1);
+        // A re-join to the tombstone reports terminated and adds no participant.
+        const rejoin = cm.join('dup-ch', 'sock-b', 'dapp');
+        expect(rejoin.success).to.be.true;
+        expect(rejoin.terminated).to.be.true;
+        expect(cm.channels.get('dup-ch').participants.size).to.equal(0);
+      } finally {
+        clearInterval(cm.cleanupTimer);
+      }
+    });
   });
 });
