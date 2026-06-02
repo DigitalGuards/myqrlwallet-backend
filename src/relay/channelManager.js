@@ -177,21 +177,12 @@ class ChannelManager {
    * @param {string} channelId
    */
   close(channelId) {
-    let channel = this.channels.get(channelId);
-    if (!channel) {
-      // Peer already gone and channel GC'd: create a minimal tombstone so a
-      // later re-join still learns the session is dead.
-      channel = {
-        participants: new Map(),
-        lastActivity: Date.now(),
-        messageBuffer: [],
-        seqNumbers: new Map(),
-        publicKey: null,
-        terminated: false,
-        terminatedAt: 0,
-      };
-      this.channels.set(channelId, channel);
-    }
+    const channel = this.channels.get(channelId);
+    // Only mark an existing channel. Never fabricate a tombstone for an
+    // unknown channelId: a non-existent channel is already dead (a re-joining
+    // peer sees no participants anyway), and creating one would let an
+    // attacker fill memory with tombstones that bypass the channel cap.
+    if (!channel) return;
     channel.terminated = true;
     channel.terminatedAt = Date.now();
     channel.lastActivity = Date.now();
@@ -325,8 +316,11 @@ class ChannelManager {
 
       // Terminated tombstones live on their own (longer) TTL so a dApp that
       // re-joins within a day still learns the session was closed on purpose.
+      // Delete strictly on age regardless of participant count: a lingering
+      // participant (or a socket leak) must not pin a tombstone in memory
+      // forever.
       if (channel.terminated) {
-        if (channel.participants.size === 0 && now - channel.terminatedAt > TOMBSTONE_TTL_MS) {
+        if (now - channel.terminatedAt > TOMBSTONE_TTL_MS) {
           this.channels.delete(channelId);
         }
         continue;
