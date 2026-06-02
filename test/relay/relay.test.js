@@ -649,4 +649,64 @@ describe('Relay Server', function () {
       await disconnect(s);
     });
   });
+
+  // ── Participant roster + terminated tombstone ────────────────────────
+
+  describe('roster and tombstone', () => {
+    let relay;
+
+    before(async () => { relay = await startRelay(); });
+    after(() => relay.cleanup());
+
+    it('join ack reports an empty roster when the peer joins alone', async () => {
+      const dapp = await connect(relay.port);
+      const resp = await joinChannel(dapp, 'roster-alone', 'dapp');
+      expect(resp.success).to.be.true;
+      expect(resp.participants).to.deep.equal([]);
+      expect(resp.terminated).to.be.false;
+      await disconnect(dapp);
+    });
+
+    it('join ack reports the counterparty client type when present', async () => {
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      await joinChannel(dapp, 'roster-pair', 'dapp');
+      const walletAck = await joinChannel(wallet, 'roster-pair', 'wallet');
+      expect(walletAck.success).to.be.true;
+      // The wallet joined second, so it sees the dApp already in the channel.
+      expect(walletAck.participants).to.deep.equal(['dapp']);
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+
+    it('close_channel marks a tombstone surfaced on a later re-join', async () => {
+      const dapp = await connect(relay.port);
+      await joinChannel(dapp, 'tombstone-ch', 'dapp');
+      await new Promise((resolve) => {
+        dapp.emit('close_channel', { channelId: 'tombstone-ch' }, () => resolve());
+      });
+      await disconnect(dapp);
+
+      // A fresh dApp socket re-joining the same channel learns it was closed.
+      const dapp2 = await connect(relay.port);
+      const resp = await joinChannel(dapp2, 'tombstone-ch', 'dapp');
+      expect(resp.success).to.be.true;
+      expect(resp.terminated).to.be.true;
+      await disconnect(dapp2);
+    });
+
+    it('notifies a connected counterparty of an explicit close', async () => {
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      await joinChannel(dapp, 'close-notify', 'dapp');
+      await joinChannel(wallet, 'close-notify', 'wallet');
+      const evt = waitForEvent(dapp, 'participants_changed');
+      wallet.emit('close_channel', { channelId: 'close-notify' });
+      const data = await evt;
+      expect(data.event).to.equal('close');
+      expect(data.clientType).to.equal('wallet');
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+  });
 });

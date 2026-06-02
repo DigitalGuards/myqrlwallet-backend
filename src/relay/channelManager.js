@@ -8,6 +8,13 @@ const MAX_PARTICIPANTS = 2;
 const MAX_BUFFERED_MESSAGES = 50;
 const BUFFER_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Run cleanup every minute
+// How long an explicit "terminated" tombstone is retained after the channel
+// empties. A dApp that re-joins within this window learns the session was
+// torn down on purpose (so it drops its stored session immediately) instead
+// of sitting on a liveness timeout. Kept generous but bounded so tombstones
+// cannot grow without limit; a dApp re-joining after this simply finds no
+// wallet present and falls back to QR via the normal liveness path.
+const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
 // ML-KEM-768 public key is 1184 bytes → ~1580 chars base64. Cap at 2048
 // raw bytes (~2730 chars) so a future KEM doesn't require a protocol
 // change on the relay, but tightly enough that a malicious client can't
@@ -55,6 +62,10 @@ class ChannelManager {
         seqNumbers: new Map(),
         /** @type {string|null} dApp's base64-encoded KEM public key. */
         publicKey: null,
+        /** @type {boolean} Set when a participant explicitly closed the channel. */
+        terminated: false,
+        /** @type {number} When the channel was terminated (for tombstone TTL). */
+        terminatedAt: 0,
       };
       this.channels.set(channelId, channel);
     }
@@ -137,11 +148,53 @@ class ChannelManager {
     }
     channel.messageBuffer = newBuffer;
 
+    // Roster of the OTHER participants' client types, so a (re)joining peer
+    // can immediately tell whether its counterparty is present rather than
+    // waiting on a future participants_changed event that may never come
+    // (e.g. the wallet left while the dApp tab was closed). Computed after
+    // adding self, then filtered to exclude self.
+    const counterpartyTypes = [];
+    for (const [sid, p] of channel.participants) {
+      if (sid !== socketId) counterpartyTypes.push(p.clientType);
+    }
+
     return {
       success: true,
       bufferedMessages: buffered.map((msg) => msg.data),
       channelPublicKey: channel.publicKey,
+      participants: counterpartyTypes,
+      terminated: channel.terminated === true,
     };
+  }
+
+  /**
+   * Explicitly terminate a channel (wallet- or dApp-initiated disconnect /
+   * "forget"). Marks a durable tombstone so a peer re-joining later learns
+   * the session was torn down on purpose and drops its stored session,
+   * instead of sitting on a liveness timeout or re-pairing a dead channel.
+   * The tombstone is retained for TOMBSTONE_TTL_MS and is excluded from the
+   * active-channel admission count so it cannot block new channels.
+   * @param {string} channelId
+   */
+  close(channelId) {
+    let channel = this.channels.get(channelId);
+    if (!channel) {
+      // Peer already gone and channel GC'd: create a minimal tombstone so a
+      // later re-join still learns the session is dead.
+      channel = {
+        participants: new Map(),
+        lastActivity: Date.now(),
+        messageBuffer: [],
+        seqNumbers: new Map(),
+        publicKey: null,
+        terminated: false,
+        terminatedAt: 0,
+      };
+      this.channels.set(channelId, channel);
+    }
+    channel.terminated = true;
+    channel.terminatedAt = Date.now();
+    channel.lastActivity = Date.now();
   }
 
   /**
@@ -270,6 +323,15 @@ class ChannelManager {
         (msg) => now - msg.timestamp < BUFFER_TTL_MS
       );
 
+      // Terminated tombstones live on their own (longer) TTL so a dApp that
+      // re-joins within a day still learns the session was closed on purpose.
+      if (channel.terminated) {
+        if (channel.participants.size === 0 && now - channel.terminatedAt > TOMBSTONE_TTL_MS) {
+          this.channels.delete(channelId);
+        }
+        continue;
+      }
+
       // Remove channels inactive beyond TTL with no participants
       if (channel.participants.size === 0 && now - channel.lastActivity > CHANNEL_TTL_MS) {
         this.channels.delete(channelId);
@@ -297,11 +359,17 @@ class ChannelManager {
   }
 
   /**
-   * Get current number of tracked channels in O(1).
-   * Useful for admission control before creating new channels.
+   * Get the number of live (non-terminated) channels, used for admission
+   * control before creating new channels. Terminated tombstones are excluded
+   * so a burst of closes cannot exhaust the active-channel budget. Bounded by
+   * the channel cap, so the linear scan is cheap.
    */
   getActiveChannelCount() {
-    return this.channels.size;
+    let count = 0;
+    for (const channel of this.channels.values()) {
+      if (!channel.terminated) count += 1;
+    }
+    return count;
   }
 
   /**
