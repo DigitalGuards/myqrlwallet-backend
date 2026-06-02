@@ -224,6 +224,13 @@ class ChannelManager {
       return { buffered: false, error: 'Channel not found' };
     }
 
+    // A terminated channel (explicit close / tombstone) is dead. Refuse to
+    // route so a peer that never received or ignored the 'close' event cannot
+    // keep using it until the 24h tombstone TTL expires.
+    if (channel.terminated) {
+      return { buffered: false, error: 'Channel terminated' };
+    }
+
     channel.lastActivity = Date.now();
 
     const sender = channel.participants.get(senderSocketId);
