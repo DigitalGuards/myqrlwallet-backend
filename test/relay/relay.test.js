@@ -10,6 +10,7 @@ import { createServer } from 'http';
 import { io as ioc } from 'socket.io-client';
 import { CONFIG } from '../../src/config/index.js';
 import { createRelayServer } from '../../src/relay/relayServer.js';
+import { ChannelManager } from '../../src/relay/channelManager.js';
 
 const { expect } = chai;
 
@@ -647,6 +648,145 @@ describe('Relay Server', function () {
       expect(resp.type).to.equal('pong');
       expect(resp.timestamp).to.be.a('number');
       await disconnect(s);
+    });
+  });
+
+  // ── Participant roster + terminated tombstone ────────────────────────
+
+  describe('roster and tombstone', () => {
+    let relay;
+
+    before(async () => { relay = await startRelay(); });
+    after(() => relay.cleanup());
+
+    it('join ack reports an empty roster when the peer joins alone', async () => {
+      const dapp = await connect(relay.port);
+      const resp = await joinChannel(dapp, 'roster-alone', 'dapp');
+      expect(resp.success).to.be.true;
+      expect(resp.participants).to.deep.equal([]);
+      expect(resp.terminated).to.be.false;
+      await disconnect(dapp);
+    });
+
+    it('join ack reports the counterparty client type when present', async () => {
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      await joinChannel(dapp, 'roster-pair', 'dapp');
+      const walletAck = await joinChannel(wallet, 'roster-pair', 'wallet');
+      expect(walletAck.success).to.be.true;
+      // The wallet joined second, so it sees the dApp already in the channel.
+      expect(walletAck.participants).to.deep.equal(['dapp']);
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+
+    it('close_channel marks a tombstone surfaced on a later re-join', async () => {
+      const dapp = await connect(relay.port);
+      await joinChannel(dapp, 'tombstone-ch', 'dapp');
+      await new Promise((resolve) => {
+        dapp.emit('close_channel', { channelId: 'tombstone-ch' }, () => resolve());
+      });
+      await disconnect(dapp);
+
+      // A fresh dApp socket re-joining the same channel learns it was closed.
+      const dapp2 = await connect(relay.port);
+      const resp = await joinChannel(dapp2, 'tombstone-ch', 'dapp');
+      expect(resp.success).to.be.true;
+      expect(resp.terminated).to.be.true;
+      await disconnect(dapp2);
+    });
+
+    it('notifies a connected counterparty of an explicit close', async () => {
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      await joinChannel(dapp, 'close-notify', 'dapp');
+      await joinChannel(wallet, 'close-notify', 'wallet');
+      const evt = waitForEvent(dapp, 'participants_changed');
+      wallet.emit('close_channel', { channelId: 'close-notify' });
+      const data = await evt;
+      expect(data.event).to.equal('close');
+      expect(data.clientType).to.equal('wallet');
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+
+    it('refuses to route messages on a terminated channel', async () => {
+      const wallet = await connect(relay.port);
+      const dapp = await connect(relay.port);
+      await joinChannel(wallet, 'closed-route', 'wallet');
+      await joinChannel(dapp, 'closed-route', 'dapp');
+      // The wallet explicitly closes (tombstones) the channel.
+      await new Promise((resolve) => {
+        wallet.emit('close_channel', { channelId: 'closed-route' }, () => resolve());
+      });
+      // A peer that never received or ignored the 'close' event must not be
+      // able to keep routing through the dead channel.
+      const ack = await sendMessage(dapp, 'closed-route', 'after-close', 'dapp');
+      expect(ack.success).to.be.false;
+      expect(ack.error).to.equal('Channel terminated');
+      await disconnect(dapp);
+      await disconnect(wallet);
+    });
+  });
+
+  // ── ChannelManager unit: tombstone memory hygiene ────────────────────
+
+  describe('ChannelManager tombstones', () => {
+    it('close() clears heavy channel state but keeps the tombstone flag', () => {
+      const cm = new ChannelManager();
+      try {
+        // dApp joins (binding a PK) with no counterparty yet, so a routed
+        // message has nowhere to go and is buffered.
+        cm.join('unit-close', 'sock-d', 'dapp', 'YQ==');
+        const routed = cm.routeMessage('unit-close', 'sock-d', {
+          id: 'unit-close',
+          message: 'x',
+          seq: 0,
+        });
+        expect(routed.buffered).to.be.true;
+        const before = cm.channels.get('unit-close');
+        expect(before.messageBuffer.length).to.equal(1);
+        expect(before.participants.size).to.equal(1);
+        expect(before.seqNumbers.size).to.equal(1);
+        expect(before.publicKey).to.equal('YQ==');
+
+        cm.close('unit-close');
+
+        const after = cm.channels.get('unit-close');
+        expect(after.terminated).to.be.true;
+        expect(after.participants.size).to.equal(0);
+        expect(after.seqNumbers.size).to.equal(0);
+        expect(after.messageBuffer.length).to.equal(0);
+        expect(after.publicKey).to.equal(null);
+        // Tombstone is excluded from the active-channel admission count.
+        expect(cm.getActiveChannelCount()).to.equal(0);
+        // ... and routing through it is refused.
+        expect(
+          cm.routeMessage('unit-close', 'sock-d', { id: 'unit-close', message: 'y', seq: 1 }).error
+        ).to.equal('Channel terminated');
+      } finally {
+        clearInterval(cm.cleanupTimer);
+      }
+    });
+
+    it('close() is idempotent and a tombstone re-join parks no participant', () => {
+      const cm = new ChannelManager();
+      try {
+        cm.join('dup-ch', 'sock-a', 'dapp');
+        cm.close('dup-ch');
+        expect(cm.terminatedOrder.length).to.equal(1);
+        // Idempotent: a second close (or a join->close loop on the same id)
+        // must not push a duplicate FIFO entry that would flush real tombstones.
+        cm.close('dup-ch');
+        expect(cm.terminatedOrder.length).to.equal(1);
+        // A re-join to the tombstone reports terminated and adds no participant.
+        const rejoin = cm.join('dup-ch', 'sock-b', 'dapp');
+        expect(rejoin.success).to.be.true;
+        expect(rejoin.terminated).to.be.true;
+        expect(cm.channels.get('dup-ch').participants.size).to.equal(0);
+      } finally {
+        clearInterval(cm.cleanupTimer);
+      }
     });
   });
 });

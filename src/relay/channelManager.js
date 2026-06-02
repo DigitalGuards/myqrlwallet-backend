@@ -8,6 +8,20 @@ const MAX_PARTICIPANTS = 2;
 const MAX_BUFFERED_MESSAGES = 50;
 const BUFFER_TTL_MS = 5 * 60 * 1000; // 5 minutes
 const CLEANUP_INTERVAL_MS = 60 * 1000; // Run cleanup every minute
+// How long an explicit "terminated" tombstone is retained after the channel
+// empties. A dApp that re-joins within this window learns the session was
+// torn down on purpose (so it drops its stored session immediately) instead
+// of sitting on a liveness timeout. Kept generous but bounded so tombstones
+// cannot grow without limit; a dApp re-joining after this simply finds no
+// wallet present and falls back to QR via the normal liveness path.
+const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Hard cap on retained tombstones. Terminated channels are excluded from the
+// active-channel admission count, so without this an attacker could create +
+// immediately close channels in a loop and accumulate unbounded tombstones
+// (each held for TOMBSTONE_TTL_MS) until the relay exhausts memory. When the
+// cap is exceeded the oldest tombstone is evicted; a dApp re-joining an evicted
+// channel simply finds no wallet and falls back to QR via the liveness path.
+const MAX_TOMBSTONES = 20000;
 // ML-KEM-768 public key is 1184 bytes → ~1580 chars base64. Cap at 2048
 // raw bytes (~2730 chars) so a future KEM doesn't require a protocol
 // change on the relay, but tightly enough that a malicious client can't
@@ -18,6 +32,8 @@ class ChannelManager {
   constructor(options = {}) {
     /** @type {Map<string, Channel>} */
     this.channels = new Map();
+    /** @type {string[]} FIFO of terminated channelIds, for tombstone eviction. */
+    this.terminatedOrder = [];
     this.isSocketActive = options.isSocketActive || (() => false);
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
   }
@@ -46,6 +62,21 @@ class ChannelManager {
   join(channelId, socketId, clientType, publicKeyBase64) {
     let channel = this.channels.get(channelId);
 
+    // Re-join to an explicitly closed channel: report the tombstone so the
+    // (re)joining peer drops its stored session, but do NOT resurrect it or
+    // add a participant. Parking a socket in a dead channel would both skip
+    // the active-channel admission cap (getChannelInfo stays truthy) and let
+    // an attacker loop join->close to flood the tombstone FIFO.
+    if (channel && channel.terminated) {
+      return {
+        success: true,
+        bufferedMessages: [],
+        channelPublicKey: null,
+        participants: [],
+        terminated: true,
+      };
+    }
+
     if (!channel) {
       channel = {
         participants: new Map(),
@@ -55,6 +86,10 @@ class ChannelManager {
         seqNumbers: new Map(),
         /** @type {string|null} dApp's base64-encoded KEM public key. */
         publicKey: null,
+        /** @type {boolean} Set when a participant explicitly closed the channel. */
+        terminated: false,
+        /** @type {number} When the channel was terminated (for tombstone TTL). */
+        terminatedAt: 0,
       };
       this.channels.set(channelId, channel);
     }
@@ -137,11 +172,67 @@ class ChannelManager {
     }
     channel.messageBuffer = newBuffer;
 
+    // Roster of the OTHER participants' client types, so a (re)joining peer
+    // can immediately tell whether its counterparty is present rather than
+    // waiting on a future participants_changed event that may never come
+    // (e.g. the wallet left while the dApp tab was closed). Computed after
+    // adding self, then filtered to exclude self.
+    const counterpartyTypes = [];
+    for (const [sid, p] of channel.participants) {
+      if (sid !== socketId) counterpartyTypes.push(p.clientType);
+    }
+
     return {
       success: true,
       bufferedMessages: buffered.map((msg) => msg.data),
       channelPublicKey: channel.publicKey,
+      participants: counterpartyTypes,
+      terminated: channel.terminated === true,
     };
+  }
+
+  /**
+   * Explicitly terminate a channel (wallet- or dApp-initiated disconnect /
+   * "forget"). Marks a durable tombstone so a peer re-joining later learns
+   * the session was torn down on purpose and drops its stored session,
+   * instead of sitting on a liveness timeout or re-pairing a dead channel.
+   * The tombstone is retained for TOMBSTONE_TTL_MS and is excluded from the
+   * active-channel admission count so it cannot block new channels.
+   * @param {string} channelId
+   */
+  close(channelId) {
+    const channel = this.channels.get(channelId);
+    // Only mark an existing channel. Never fabricate a tombstone for an
+    // unknown channelId: a non-existent channel is already dead (a re-joining
+    // peer sees no participants anyway), and creating one would let an
+    // attacker fill memory with tombstones that bypass the channel cap.
+    if (!channel) return;
+    // Idempotent: a channel can only be tombstoned once. Without this a
+    // repeated close() (or a re-join->close loop on the same id) would push
+    // duplicate entries into terminatedOrder and the FIFO eviction would then
+    // flush out legitimate tombstones.
+    if (channel.terminated) return;
+    channel.terminated = true;
+    channel.terminatedAt = Date.now();
+    channel.lastActivity = Date.now();
+    // A terminated channel routes nothing, so drop its heavy state now rather
+    // than holding it for TOMBSTONE_TTL_MS. The tombstone keeps only the
+    // terminated flag + timestamps.
+    channel.messageBuffer = [];
+    channel.participants.clear();
+    channel.seqNumbers.clear();
+    channel.publicKey = null;
+    // Bound the number of retained tombstones (see MAX_TOMBSTONES). Evict the
+    // oldest when over budget; entries already removed by the TTL cleanup are
+    // skipped.
+    this.terminatedOrder.push(channelId);
+    while (this.terminatedOrder.length > MAX_TOMBSTONES) {
+      const oldest = this.terminatedOrder.shift();
+      const stale = this.channels.get(oldest);
+      if (stale && stale.terminated) {
+        this.channels.delete(oldest);
+      }
+    }
   }
 
   /**
@@ -178,6 +269,13 @@ class ChannelManager {
     const channel = this.channels.get(channelId);
     if (!channel) {
       return { buffered: false, error: 'Channel not found' };
+    }
+
+    // A terminated channel (explicit close / tombstone) is dead. Refuse to
+    // route so a peer that never received or ignored the 'close' event cannot
+    // keep using it until the 24h tombstone TTL expires.
+    if (channel.terminated) {
+      return { buffered: false, error: 'Channel terminated' };
     }
 
     channel.lastActivity = Date.now();
@@ -270,10 +368,28 @@ class ChannelManager {
         (msg) => now - msg.timestamp < BUFFER_TTL_MS
       );
 
+      // Terminated tombstones live on their own (longer) TTL so a dApp that
+      // re-joins within a day still learns the session was closed on purpose.
+      // Delete strictly on age regardless of participant count: a lingering
+      // participant (or a socket leak) must not pin a tombstone in memory
+      // forever.
+      if (channel.terminated) {
+        if (now - channel.terminatedAt > TOMBSTONE_TTL_MS) {
+          this.channels.delete(channelId);
+        }
+        continue;
+      }
+
       // Remove channels inactive beyond TTL with no participants
       if (channel.participants.size === 0 && now - channel.lastActivity > CHANNEL_TTL_MS) {
         this.channels.delete(channelId);
       }
+    }
+
+    // Keep the tombstone FIFO in sync with the TTL deletions above so it does
+    // not retain references to channels that no longer exist.
+    if (this.terminatedOrder.length > 0) {
+      this.terminatedOrder = this.terminatedOrder.filter((id) => this.channels.has(id));
     }
   }
 
@@ -297,11 +413,17 @@ class ChannelManager {
   }
 
   /**
-   * Get current number of tracked channels in O(1).
-   * Useful for admission control before creating new channels.
+   * Get the number of live (non-terminated) channels, used for admission
+   * control before creating new channels. Terminated tombstones are excluded
+   * so a burst of closes cannot exhaust the active-channel budget. Bounded by
+   * the channel cap, so the linear scan is cheap.
    */
   getActiveChannelCount() {
-    return this.channels.size;
+    let count = 0;
+    for (const channel of this.channels.values()) {
+      if (!channel.terminated) count += 1;
+    }
+    return count;
   }
 
   /**

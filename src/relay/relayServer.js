@@ -272,6 +272,11 @@ export function createRelayServer(httpServer) {
         success: true,
         bufferedMessages: result.bufferedMessages || [],
         channelPublicKey: result.channelPublicKey || null,
+        // Counterparty roster so a (re)joining peer can detect an absent
+        // wallet immediately; `terminated` flags a channel that was closed
+        // on purpose so the peer drops its stored session instead of waiting.
+        participants: result.participants || [],
+        terminated: result.terminated || false,
       });
     });
 
@@ -331,6 +336,44 @@ export function createRelayServer(httpServer) {
 
         if (currentChannelId === channelId) {
           currentChannelId = null;
+        }
+      }
+
+      callback?.({ success: true });
+    });
+
+    /**
+     * close_channel - Explicitly terminate a channel (an intentional
+     * disconnect / "forget", as opposed to a transient socket drop on
+     * backgrounding). Marks a durable tombstone so the counterparty learns
+     * the session is dead even if it is absent now and re-joins later.
+     */
+    socket.on('close_channel', (payload, callback) => {
+      const channelId = payload?.channelId || currentChannelId;
+
+      if (isValidChannelId(channelId)) {
+        // Authorize: only an actual participant may terminate the channel.
+        // leave() returns the participant record (and null if this socket is
+        // not in the channel), so it doubles as the membership check. This
+        // blocks an attacker from closing arbitrary channels by guessing a
+        // channelId, and from creating tombstones for channels they were
+        // never part of (the close() below only marks an existing channel).
+        socket.leave(channelId);
+        const participant = channelManager.leave(socket.id, channelId);
+
+        if (participant) {
+          channelManager.close(channelId);
+
+          // Tell a currently-connected counterparty this was an explicit
+          // close, distinct from a transient 'disconnect'.
+          socket.to(channelId).emit('participants_changed', {
+            event: 'close',
+            clientType: participant.clientType,
+          });
+
+          if (currentChannelId === channelId) {
+            currentChannelId = null;
+          }
         }
       }
 
