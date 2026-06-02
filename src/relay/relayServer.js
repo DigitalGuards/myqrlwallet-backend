@@ -352,19 +352,28 @@ export function createRelayServer(httpServer) {
       const channelId = payload?.channelId || currentChannelId;
 
       if (isValidChannelId(channelId)) {
-        channelManager.close(channelId);
+        // Authorize: only an actual participant may terminate the channel.
+        // leave() returns the participant record (and null if this socket is
+        // not in the channel), so it doubles as the membership check. This
+        // blocks an attacker from closing arbitrary channels by guessing a
+        // channelId, and from creating tombstones for channels they were
+        // never part of (the close() below only marks an existing channel).
         socket.leave(channelId);
         const participant = channelManager.leave(socket.id, channelId);
 
-        // Tell a currently-connected counterparty this was an explicit close,
-        // distinct from a transient 'disconnect'.
-        socket.to(channelId).emit('participants_changed', {
-          event: 'close',
-          clientType: participant?.clientType || null,
-        });
+        if (participant) {
+          channelManager.close(channelId);
 
-        if (currentChannelId === channelId) {
-          currentChannelId = null;
+          // Tell a currently-connected counterparty this was an explicit
+          // close, distinct from a transient 'disconnect'.
+          socket.to(channelId).emit('participants_changed', {
+            event: 'close',
+            clientType: participant.clientType,
+          });
+
+          if (currentChannelId === channelId) {
+            currentChannelId = null;
+          }
         }
       }
 
