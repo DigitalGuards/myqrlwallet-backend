@@ -15,6 +15,13 @@ const CLEANUP_INTERVAL_MS = 60 * 1000; // Run cleanup every minute
 // cannot grow without limit; a dApp re-joining after this simply finds no
 // wallet present and falls back to QR via the normal liveness path.
 const TOMBSTONE_TTL_MS = 24 * 60 * 60 * 1000; // 24 hours
+// Hard cap on retained tombstones. Terminated channels are excluded from the
+// active-channel admission count, so without this an attacker could create +
+// immediately close channels in a loop and accumulate unbounded tombstones
+// (each held for TOMBSTONE_TTL_MS) until the relay exhausts memory. When the
+// cap is exceeded the oldest tombstone is evicted; a dApp re-joining an evicted
+// channel simply finds no wallet and falls back to QR via the liveness path.
+const MAX_TOMBSTONES = 20000;
 // ML-KEM-768 public key is 1184 bytes → ~1580 chars base64. Cap at 2048
 // raw bytes (~2730 chars) so a future KEM doesn't require a protocol
 // change on the relay, but tightly enough that a malicious client can't
@@ -25,6 +32,8 @@ class ChannelManager {
   constructor(options = {}) {
     /** @type {Map<string, Channel>} */
     this.channels = new Map();
+    /** @type {string[]} FIFO of terminated channelIds, for tombstone eviction. */
+    this.terminatedOrder = [];
     this.isSocketActive = options.isSocketActive || (() => false);
     this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
   }
@@ -186,6 +195,24 @@ class ChannelManager {
     channel.terminated = true;
     channel.terminatedAt = Date.now();
     channel.lastActivity = Date.now();
+    // A terminated channel routes nothing, so drop its heavy state now rather
+    // than holding it for TOMBSTONE_TTL_MS. The tombstone keeps only the
+    // terminated flag + timestamps.
+    channel.messageBuffer = [];
+    channel.participants.clear();
+    channel.seqNumbers.clear();
+    channel.publicKey = null;
+    // Bound the number of retained tombstones (see MAX_TOMBSTONES). Evict the
+    // oldest when over budget; entries already removed by the TTL cleanup are
+    // skipped.
+    this.terminatedOrder.push(channelId);
+    while (this.terminatedOrder.length > MAX_TOMBSTONES) {
+      const oldest = this.terminatedOrder.shift();
+      const stale = this.channels.get(oldest);
+      if (stale && stale.terminated) {
+        this.channels.delete(oldest);
+      }
+    }
   }
 
   /**
@@ -337,6 +364,12 @@ class ChannelManager {
       if (channel.participants.size === 0 && now - channel.lastActivity > CHANNEL_TTL_MS) {
         this.channels.delete(channelId);
       }
+    }
+
+    // Keep the tombstone FIFO in sync with the TTL deletions above so it does
+    // not retain references to channels that no longer exist.
+    if (this.terminatedOrder.length > 0) {
+      this.terminatedOrder = this.terminatedOrder.filter((id) => this.channels.has(id));
     }
   }
 
