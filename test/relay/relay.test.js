@@ -10,6 +10,7 @@ import { createServer } from 'http';
 import { io as ioc } from 'socket.io-client';
 import { CONFIG } from '../../src/config/index.js';
 import { createRelayServer } from '../../src/relay/relayServer.js';
+import { ChannelManager } from '../../src/relay/channelManager.js';
 
 const { expect } = chai;
 
@@ -725,6 +726,47 @@ describe('Relay Server', function () {
       expect(ack.error).to.equal('Channel terminated');
       await disconnect(dapp);
       await disconnect(wallet);
+    });
+  });
+
+  // ── ChannelManager unit: tombstone memory hygiene ────────────────────
+
+  describe('ChannelManager tombstones', () => {
+    it('close() clears heavy channel state but keeps the tombstone flag', () => {
+      const cm = new ChannelManager();
+      try {
+        // dApp joins (binding a PK) with no counterparty yet, so a routed
+        // message has nowhere to go and is buffered.
+        cm.join('unit-close', 'sock-d', 'dapp', 'YQ==');
+        const routed = cm.routeMessage('unit-close', 'sock-d', {
+          id: 'unit-close',
+          message: 'x',
+          seq: 0,
+        });
+        expect(routed.buffered).to.be.true;
+        const before = cm.channels.get('unit-close');
+        expect(before.messageBuffer.length).to.equal(1);
+        expect(before.participants.size).to.equal(1);
+        expect(before.seqNumbers.size).to.equal(1);
+        expect(before.publicKey).to.equal('YQ==');
+
+        cm.close('unit-close');
+
+        const after = cm.channels.get('unit-close');
+        expect(after.terminated).to.be.true;
+        expect(after.participants.size).to.equal(0);
+        expect(after.seqNumbers.size).to.equal(0);
+        expect(after.messageBuffer.length).to.equal(0);
+        expect(after.publicKey).to.equal(null);
+        // Tombstone is excluded from the active-channel admission count.
+        expect(cm.getActiveChannelCount()).to.equal(0);
+        // ... and routing through it is refused.
+        expect(
+          cm.routeMessage('unit-close', 'sock-d', { id: 'unit-close', message: 'y', seq: 1 }).error
+        ).to.equal('Channel terminated');
+      } finally {
+        clearInterval(cm.cleanupTimer);
+      }
     });
   });
 });
