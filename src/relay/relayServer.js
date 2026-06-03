@@ -257,6 +257,22 @@ export function createRelayServer(httpServer) {
         return callback?.({ success: false, error: result.error });
       }
 
+      // Re-join to an explicitly closed (tombstoned) channel: report the
+      // tombstone so the peer drops its stored session, but do NOT park the
+      // socket in the dead room, point currentChannelId at it, or emit a
+      // phantom 'join'. channelManager.join() added no participant for a
+      // terminated channel and routing is refused there, so joining the room
+      // would only leak a spurious presence event to other re-joiners.
+      if (result.terminated) {
+        return callback?.({
+          success: true,
+          terminated: true,
+          participants: [],
+          channelPublicKey: null,
+          bufferedMessages: [],
+        });
+      }
+
       socket.join(channelId);
       metrics.channelJoins.inc({ status: 'success' });
       metrics.activeChannels.set(channelManager.getActiveChannelCount());
@@ -328,11 +344,15 @@ export function createRelayServer(httpServer) {
         socket.leave(channelId);
         const participant = channelManager.leave(socket.id, channelId);
 
-        // Notify other participant
-        socket.to(channelId).emit('participants_changed', {
-          event: 'leave',
-          clientType: participant?.clientType || null,
-        });
+        // Only notify when this socket was actually a participant; a leave for
+        // a channel we never joined (or a tombstone) must not emit a phantom
+        // presence event with clientType:null.
+        if (participant) {
+          socket.to(channelId).emit('participants_changed', {
+            event: 'leave',
+            clientType: participant.clientType,
+          });
+        }
 
         if (currentChannelId === channelId) {
           currentChannelId = null;
@@ -396,11 +416,15 @@ export function createRelayServer(httpServer) {
       if (currentChannelId) {
         const participant = channelManager.leave(socket.id, currentChannelId);
 
-        // Notify remaining participant
-        socket.to(currentChannelId).emit('participants_changed', {
-          event: 'disconnect',
-          clientType: participant?.clientType || null,
-        });
+        // Only notify when this socket was actually a participant (a transient
+        // socket that never fully joined, or one parked on a tombstone, has no
+        // record); avoids a phantom disconnect event with clientType:null.
+        if (participant) {
+          socket.to(currentChannelId).emit('participants_changed', {
+            event: 'disconnect',
+            clientType: participant.clientType,
+          });
+        }
       }
     });
   });

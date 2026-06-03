@@ -727,6 +727,37 @@ describe('Relay Server', function () {
       await disconnect(dapp);
       await disconnect(wallet);
     });
+
+    it('does not park a socket or emit a phantom join when re-joining a tombstone', async () => {
+      const dapp = await connect(relay.port);
+      await joinChannel(dapp, 'tombstone-quiet', 'dapp');
+      await new Promise((resolve) => {
+        dapp.emit('close_channel', { channelId: 'tombstone-quiet' }, () => resolve());
+      });
+      await disconnect(dapp);
+
+      // First re-joiner lands on the tombstone. It must NOT be placed in the
+      // Socket.IO room, so it cannot hear a later re-joiner "arrive".
+      const a = await connect(relay.port);
+      const respA = await joinChannel(a, 'tombstone-quiet', 'dapp');
+      expect(respA.terminated).to.be.true;
+
+      let phantom = null;
+      a.on('participants_changed', (data) => { phantom = data; });
+
+      // Second re-joiner. Pre-fix, both sockets sat in the dead room and `a`
+      // would receive a spurious { event: 'join' }.
+      const b = await connect(relay.port);
+      const respB = await joinChannel(b, 'tombstone-quiet', 'wallet');
+      expect(respB.terminated).to.be.true;
+
+      // Give any (incorrect) emit a chance to land before asserting silence.
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      expect(phantom, 'tombstone re-join must not emit a presence event').to.equal(null);
+
+      await disconnect(a);
+      await disconnect(b);
+    });
   });
 
   // ── ChannelManager unit: tombstone memory hygiene ────────────────────
