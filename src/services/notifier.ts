@@ -1,6 +1,16 @@
 import { logger } from '../utils/logger.js';
 
-const SEVERITY_TO_PINO = {
+export type NotifySeverity = 'info' | 'warn' | 'error' | 'critical';
+
+export interface HealthEvent {
+  severity?: NotifySeverity;
+  network?: string;
+  endpoint?: string;
+  event: string;
+  detail?: unknown;
+}
+
+const SEVERITY_TO_PINO: Record<NotifySeverity, 'info' | 'warn' | 'error'> = {
   info: 'info',
   warn: 'warn',
   error: 'error',
@@ -17,8 +27,8 @@ const SEVERITY_TO_PINO = {
  * routing is logger-only today. When alerting is added, behaviour changes once
  * here, not everywhere.
  */
-export function notify({ severity = 'info', network, endpoint, event, detail }) {
-  const level = SEVERITY_TO_PINO[severity] || 'info';
+export function notify({ severity = 'info', network, endpoint, event, detail }: HealthEvent): void {
+  const level = SEVERITY_TO_PINO[severity];
   logger[level](
     {
       kind: 'rpc-health',
@@ -28,6 +38,6 @@ export function notify({ severity = 'info', network, endpoint, event, detail }) 
       event,
       detail,
     },
-    `[rpc-health] ${event} ${endpoint || ''} (${network || 'n/a'})`.trim()
+    `[rpc-health] ${event} ${endpoint ?? ''} (${network ?? 'n/a'})`.trim()
   );
 }

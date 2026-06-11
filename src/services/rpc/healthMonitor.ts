@@ -1,16 +1,49 @@
-import fetch from 'node-fetch';
 import { CONFIG } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
+import { isRecord, toError } from '../../utils/guards.js';
 import { notify } from '../notifier.js';
 
-const STATE_UP = 'up';
-const STATE_DOWN = 'down';
-const STATE_STALLED = 'stalled';
-const STATE_UNKNOWN = 'unknown';
+export type EndpointState = 'up' | 'down' | 'stalled' | 'unknown';
 
-const STATE_ORDER = { [STATE_UP]: 0, [STATE_UNKNOWN]: 1, [STATE_STALLED]: 2, [STATE_DOWN]: 3 };
+const STATE_UP: EndpointState = 'up';
+const STATE_DOWN: EndpointState = 'down';
+const STATE_STALLED: EndpointState = 'stalled';
+const STATE_UNKNOWN: EndpointState = 'unknown';
 
-function makeEndpointRecord(url) {
+const STATE_ORDER: Record<EndpointState, number> = {
+  [STATE_UP]: 0,
+  [STATE_UNKNOWN]: 1,
+  [STATE_STALLED]: 2,
+  [STATE_DOWN]: 3,
+};
+
+export interface EndpointRecord {
+  url: string;
+  state: EndpointState;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+  lastHeight: number | null;
+  lastHeightChangeAt: number;
+  lastLatencyMs: number | null;
+  lastError: Error | null;
+  lastPollAt: number | null;
+}
+
+export interface EndpointSnapshot {
+  url: string;
+  state: EndpointState;
+  lastHeight: number | null;
+  lastHeightChangeAt: number;
+  lastLatencyMs: number | null;
+  lastError: string | null;
+  lastPollAt: number | null;
+  consecutiveFailures: number;
+  consecutiveSuccesses: number;
+}
+
+export type HealthSnapshot = Record<string, EndpointSnapshot[]>;
+
+function makeEndpointRecord(url: string): EndpointRecord {
   return {
     url,
     state: STATE_UNKNOWN,
@@ -24,20 +57,19 @@ function makeEndpointRecord(url) {
   };
 }
 
-function parseHexHeight(hex) {
+function parseHexHeight(hex: unknown): number | null {
   if (typeof hex !== 'string' || !hex.startsWith('0x')) return null;
   const n = Number.parseInt(hex.slice(2), 16);
   return Number.isFinite(n) ? n : null;
 }
 
 class HealthMonitor {
-  constructor() {
-    this.networks = new Map();
-    this.pollerTimer = null;
-    this.initialised = false;
-  }
+  networks = new Map<string, EndpointRecord[]>();
+  private pollerTimer: NodeJS.Timeout | null = null;
+  private initialised = false;
+  private polling = false;
 
-  init() {
+  init(): void {
     if (this.initialised) return;
     for (const [network, endpoints] of Object.entries(CONFIG.RPC_ENDPOINTS)) {
       if (!Array.isArray(endpoints) || endpoints.length === 0) continue;
@@ -46,7 +78,7 @@ class HealthMonitor {
     this.initialised = true;
   }
 
-  start() {
+  start(): void {
     this.init();
     if (this.pollerTimer) return;
     if (this.networks.size === 0) {
@@ -62,22 +94,26 @@ class HealthMonitor {
       if (this.polling) return;
       this.polling = true;
       this.pollAll()
-        .catch((err) => logger.error({ err }, '[healthMonitor] poll loop error'))
+        .catch((err: unknown) => {
+          logger.error({ err }, '[healthMonitor] poll loop error');
+        })
         .finally(() => {
           this.polling = false;
         });
     }, CONFIG.RPC_HEALTH.POLL_INTERVAL_MS);
-    if (this.pollerTimer.unref) this.pollerTimer.unref();
+    this.pollerTimer.unref();
     // Kick off an immediate poll so /health is meaningful before the first interval.
     this.polling = true;
     this.pollAll()
-      .catch((err) => logger.error({ err }, '[healthMonitor] initial poll error'))
+      .catch((err: unknown) => {
+        logger.error({ err }, '[healthMonitor] initial poll error');
+      })
       .finally(() => {
         this.polling = false;
       });
   }
 
-  stop() {
+  stop(): void {
     if (this.pollerTimer) {
       clearInterval(this.pollerTimer);
       this.pollerTimer = null;
@@ -89,13 +125,13 @@ class HealthMonitor {
    * up → unknown → stalled → down. Within a state group, lower latency first.
    * Callers iterate this list and stop on first success.
    */
-  orderEndpointsForAttempt(network) {
+  orderEndpointsForAttempt(network: string): string[] {
     this.init();
     const endpoints = this.networks.get(network);
     if (!endpoints || endpoints.length === 0) return [];
     const ranked = [...endpoints].sort((a, b) => {
-      const sa = STATE_ORDER[a.state] ?? 99;
-      const sb = STATE_ORDER[b.state] ?? 99;
+      const sa = STATE_ORDER[a.state];
+      const sb = STATE_ORDER[b.state];
       if (sa !== sb) return sa - sb;
       const la = a.lastLatencyMs ?? Number.POSITIVE_INFINITY;
       const lb = b.lastLatencyMs ?? Number.POSITIVE_INFINITY;
@@ -104,22 +140,22 @@ class HealthMonitor {
     return ranked.map((e) => e.url);
   }
 
-  pickEndpoint(network) {
+  pickEndpoint(network: string): string | null {
     const ordered = this.orderEndpointsForAttempt(network);
-    return ordered[0] || null;
+    return ordered[0] ?? null;
   }
 
-  hasHealthyForNetwork(network) {
+  hasHealthyForNetwork(network: string): boolean {
     this.init();
     const endpoints = this.networks.get(network);
     if (!endpoints) return false;
     // Stalled endpoints still route requests (with stale data), so /health
-    // mirrors that — 503 only when every endpoint is fully `down`. The
+    // mirrors that: 503 only when every endpoint is fully `down`. The
     // per-endpoint `state` in the response surfaces stalled vs up.
     return endpoints.some((e) => e.state !== STATE_DOWN);
   }
 
-  recordRequestResult(network, url, ok, error) {
+  recordRequestResult(network: string, url: string, ok: boolean, error?: unknown): void {
     this.init();
     const endpoints = this.networks.get(network);
     if (!endpoints) return;
@@ -132,9 +168,9 @@ class HealthMonitor {
     }
   }
 
-  getSnapshot() {
+  getSnapshot(): HealthSnapshot {
     this.init();
-    const out = {};
+    const out: HealthSnapshot = {};
     for (const [network, endpoints] of this.networks.entries()) {
       out[network] = endpoints.map((e) => ({
         url: e.url,
@@ -142,7 +178,7 @@ class HealthMonitor {
         lastHeight: e.lastHeight,
         lastHeightChangeAt: e.lastHeightChangeAt,
         lastLatencyMs: e.lastLatencyMs,
-        lastError: e.lastError ? String(e.lastError.message || e.lastError) : null,
+        lastError: e.lastError ? e.lastError.message || String(e.lastError) : null,
         lastPollAt: e.lastPollAt,
         consecutiveFailures: e.consecutiveFailures,
         consecutiveSuccesses: e.consecutiveSuccesses,
@@ -151,9 +187,9 @@ class HealthMonitor {
     return out;
   }
 
-  async pollAll() {
+  async pollAll(): Promise<void> {
     if (this.networks.size === 0) return;
-    const polls = [];
+    const polls: Promise<void>[] = [];
     for (const [network, endpoints] of this.networks.entries()) {
       for (const ep of endpoints) {
         polls.push(this.pollOne(network, ep));
@@ -162,10 +198,12 @@ class HealthMonitor {
     await Promise.allSettled(polls);
   }
 
-  async pollOne(network, ep) {
+  async pollOne(network: string, ep: EndpointRecord): Promise<void> {
     const start = Date.now();
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), CONFIG.RPC_HEALTH.POLL_TIMEOUT_MS);
+    const timer = setTimeout(() => {
+      controller.abort();
+    }, CONFIG.RPC_HEALTH.POLL_TIMEOUT_MS);
     try {
       const response = await fetch(ep.url, {
         method: 'POST',
@@ -184,8 +222,8 @@ class HealthMonitor {
         this.applyFailure(network, ep, new Error(`HTTP ${response.status}`));
         return;
       }
-      const json = await response.json();
-      const height = parseHexHeight(json?.result);
+      const json: unknown = await response.json();
+      const height = parseHexHeight(isRecord(json) ? json.result : undefined);
       if (height === null) {
         this.applyFailure(network, ep, new Error('Unparseable qrl_blockNumber result'));
         return;
@@ -200,16 +238,16 @@ class HealthMonitor {
     }
   }
 
-  applyPollSuccess(network, ep, height) {
+  applyPollSuccess(network: string, ep: EndpointRecord, height: number): void {
     // Only treat strictly increasing height as forward progress. A regression
     // (chain reorg, bad node serving an older head) must NOT reset the stall
-    // timer — a node going backwards is sick, not "advancing".
+    // timer; a node going backwards is sick, not "advancing".
     const advanced = ep.lastHeight === null || height > ep.lastHeight;
     if (advanced) {
       ep.lastHeight = height;
       ep.lastHeightChangeAt = Date.now();
-    } else if (height < ep.lastHeight) {
-      // Height regression — log via notifier so operators see it; keep
+    } else if (ep.lastHeight !== null && height < ep.lastHeight) {
+      // Height regression: log via notifier so operators see it; keep
       // tracking the regressed height so a subsequent climb back up registers
       // as forward progress, but leave lastHeightChangeAt alone (we want stall
       // detection to fire if the node stays stuck on the lower head).
@@ -276,7 +314,7 @@ class HealthMonitor {
     }
   }
 
-  applyRequestSuccess(network, ep) {
+  applyRequestSuccess(network: string, ep: EndpointRecord): void {
     ep.consecutiveFailures = 0;
     ep.consecutiveSuccesses += 1;
     ep.lastError = null;
@@ -288,7 +326,7 @@ class HealthMonitor {
     ) {
       newState = STATE_UP;
     } else if (previousState === STATE_UNKNOWN) {
-      // A real request succeeded — flip out of unknown immediately rather
+      // A real request succeeded: flip out of unknown immediately rather
       // than waiting for the next background poll. Otherwise the selector
       // keeps ranking this endpoint behind any sibling already at `up`.
       newState = STATE_UP;
@@ -305,11 +343,12 @@ class HealthMonitor {
     }
   }
 
-  applyFailure(network, ep, error) {
+  applyFailure(network: string, ep: EndpointRecord, error: unknown): void {
     const previousState = ep.state;
+    const err = toError(error);
     ep.consecutiveFailures += 1;
     ep.consecutiveSuccesses = 0;
-    ep.lastError = error;
+    ep.lastError = err;
     if (
       ep.consecutiveFailures >= CONFIG.RPC_HEALTH.DOWN_AFTER_FAILURES &&
       previousState !== STATE_DOWN
@@ -320,28 +359,28 @@ class HealthMonitor {
         network,
         endpoint: ep.url,
         event: 'down',
-        detail: { error: error?.message || String(error), previousState },
+        detail: { error: err.message, previousState },
       });
     }
   }
 
   /**
-   * Test-only — replaces the in-memory endpoint table for a network.
+   * Test-only: replaces the in-memory endpoint table for a network.
    * Skip the env-driven init() once this is called.
    */
-  __setEndpointsForTesting(network, urls) {
+  __setEndpointsForTesting(network: string, urls: string[]): void {
     this.networks.set(network, urls.map(makeEndpointRecord));
     this.initialised = true;
   }
 
-  __forceStateForTesting(network, url, state) {
+  __forceStateForTesting(network: string, url: string, state: EndpointState): void {
     const endpoints = this.networks.get(network);
     if (!endpoints) return;
     const ep = endpoints.find((e) => e.url === url);
     if (ep) ep.state = state;
   }
 
-  __resetForTesting() {
+  __resetForTesting(): void {
     this.stop();
     this.networks = new Map();
     this.initialised = false;

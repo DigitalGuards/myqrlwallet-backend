@@ -23,7 +23,7 @@ describe('RPC Service', () => {
     }
   });
 
-  it('should throw an error for a failed RPC call', async function() {
+  it('should throw an error for a failed RPC call', async function () {
     this.timeout(5000);
 
     // Stub the makeRPCCall method directly to simulate a failed response
@@ -120,6 +120,48 @@ describe('RPC Service', () => {
 
       expect(stub.callCount).to.equal(1);
     });
+
+    it('rebuilds cached responses with the caller own id (no id replay)', async () => {
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.resolves({ jsonrpc: '2.0', id: 'first-caller', result: '0x1' });
+
+      const first = await rpcService.executeRPC('testnet', 'qrl_chainId', [], 'first-caller');
+      const second = await rpcService.executeRPC('testnet', 'qrl_chainId', [], 'second-caller');
+
+      expect(stub.callCount).to.equal(1);
+      expect(first.id).to.equal('first-caller');
+      // The cache stores only the result value; the envelope (and id) is
+      // rebuilt per request instead of replaying the first caller's id.
+      expect(second).to.deep.equal({ jsonrpc: '2.0', id: 'second-caller', result: '0x1' });
+    });
+
+    it('does NOT cache upstream JSON-RPC error envelopes', async () => {
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub
+        .onFirstCall()
+        .resolves({ jsonrpc: '2.0', id: 1, error: { code: -32000, message: 'node hiccup' } });
+      stub.onSecondCall().resolves({ jsonrpc: '2.0', id: 2, result: '0x1' });
+
+      const first = await rpcService.executeRPC('testnet', 'qrl_chainId', []);
+      const second = await rpcService.executeRPC('testnet', 'qrl_chainId', []);
+
+      // A transient error envelope must not be pinned into the cache for
+      // the TTL; the second call goes upstream again and succeeds.
+      expect(stub.callCount).to.equal(2);
+      expect(first.error.message).to.equal('node hiccup');
+      expect(second.result).to.equal('0x1');
+    });
+  });
+
+  describe('JSON-RPC id passthrough', () => {
+    it('forwards the client id upstream', async () => {
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.resolves({ jsonrpc: '2.0', id: 'client-id-9', result: '0x100' });
+
+      await rpcService.executeRPC('testnet', 'qrl_blockNumber', [], 'client-id-9');
+
+      expect(stub.firstCall.args[3]).to.equal('client-id-9');
+    });
   });
 
   describe('failover behavior', () => {
@@ -129,9 +171,7 @@ describe('RPC Service', () => {
         'http://secondary.test:8545',
       ]);
       const stub = sinon.stub(rpcService, 'makeRPCCall');
-      stub
-        .withArgs('http://primary.test:8545')
-        .rejects(new Error('primary down'));
+      stub.withArgs('http://primary.test:8545').rejects(new Error('primary down'));
       stub
         .withArgs('http://secondary.test:8545')
         .resolves({ jsonrpc: '2.0', id: 1, result: '0xff' });

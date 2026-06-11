@@ -1,4 +1,7 @@
+import type { NextFunction, Request, Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import { normalizeRpcId, type RpcId } from '../services/rpc.service.js';
+import { isArray, isRecord } from '../utils/guards.js';
 import { logger } from '../utils/logger.js';
 
 const log = logger.child({ module: 'rpc-security' });
@@ -45,9 +48,28 @@ const MAX_GETLOGS_BLOCK_RANGE = 5000; // ~16-17 hours of QRL Zond blocks
 const MAX_GETLOGS_ADDRESSES = 10;
 
 /**
+ * The request body as parsed by express.json(): typed `any` by Express, so
+ * every consumer goes through this single seam that re-types it as unknown
+ * and extracts the JSON-RPC fields via runtime checks.
+ */
+interface RpcRequestBody {
+  method: unknown;
+  params: unknown;
+  id: RpcId;
+}
+
+function readRpcBody(req: Request): RpcRequestBody {
+  const body: unknown = req.body;
+  if (!isRecord(body)) {
+    return { method: undefined, params: undefined, id: null };
+  }
+  return { method: body.method, params: body.params, id: normalizeRpcId(body.id) };
+}
+
+/**
  * Parse a hex block tag to a Number, or null for named tags / invalid input.
  */
-const parseBlockTag = (v) => {
+const parseBlockTag = (v: unknown): number | null => {
   if (typeof v !== 'string') return null;
   if (v === 'latest' || v === 'pending' || v === 'earliest') return null;
   if (!v.startsWith('0x')) return null;
@@ -58,10 +80,16 @@ const parseBlockTag = (v) => {
 /**
  * Helper function to send JSON-RPC error responses
  */
-const sendRpcError = (res, statusCode, id, errorCode, message) => {
-  return res.status(statusCode).json({
+const sendRpcError = (
+  res: Response,
+  statusCode: number,
+  id: RpcId,
+  errorCode: number,
+  message: string
+): void => {
+  res.status(statusCode).json({
     jsonrpc: '2.0',
-    id: id || null,
+    id,
     error: { code: errorCode, message },
   });
 };
@@ -70,15 +98,10 @@ const sendRpcError = (res, statusCode, id, errorCode, message) => {
  * Middleware to reject batch requests
  * Must be applied before other validation middleware
  */
-export const rpcBatchReject = (req, res, next) => {
+export const rpcBatchReject = (req: Request, res: Response, next: NextFunction): void => {
   if (Array.isArray(req.body)) {
-    return sendRpcError(
-      res,
-      400,
-      null,
-      -32600,
-      'Batch requests are not supported on this endpoint.'
-    );
+    sendRpcError(res, 400, null, -32600, 'Batch requests are not supported on this endpoint.');
+    return;
   }
   next();
 };
@@ -86,18 +109,20 @@ export const rpcBatchReject = (req, res, next) => {
 /**
  * Middleware to validate and whitelist RPC methods
  */
-export const rpcMethodWhitelist = (req, res, next) => {
-  const { method, id } = req.body;
+export const rpcMethodWhitelist = (req: Request, res: Response, next: NextFunction): void => {
+  const { method, id } = readRpcBody(req);
 
   // Validate method exists
   if (!method || typeof method !== 'string') {
-    return sendRpcError(res, 400, id, -32600, 'Invalid Request: missing or invalid method');
+    sendRpcError(res, 400, id, -32600, 'Invalid Request: missing or invalid method');
+    return;
   }
 
   // Check if method is allowed
   if (!ALLOWED_RPC_METHODS.has(method)) {
     log.warn({ method, ip: req.ip }, 'Blocked RPC method');
-    return sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
+    sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
+    return;
   }
 
   // Tag the request type for rate limiting
@@ -107,8 +132,8 @@ export const rpcMethodWhitelist = (req, res, next) => {
 };
 
 /**
- * Rate limiter for general RPC requests (read operations)
- * More lenient - 300 requests per minute per IP
+ * Rate limiter for general RPC requests (read operations).
+ * More lenient: 1000 requests per minute per IP.
  */
 export const rpcRateLimitGeneral = rateLimit({
   windowMs: 60 * 1000, // 1 minute
@@ -117,11 +142,17 @@ export const rpcRateLimitGeneral = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => {
     // Use IP + network as key for more granular limiting
-    return `${req.ip}-${req.params.network || 'unknown'}`;
+    return `${req.ip ?? 'unknown'}-${req.params.network ?? 'unknown'}`;
   },
   skip: (req) => req.rpcMethodType === 'write', // Skip for write methods (they have their own limiter)
   handler: (req, res) => {
-    sendRpcError(res, 429, req.body?.id, -32005, 'Rate limit exceeded. Please try again later.');
+    sendRpcError(
+      res,
+      429,
+      readRpcBody(req).id,
+      -32005,
+      'Rate limit exceeded. Please try again later.'
+    );
   },
 });
 
@@ -135,14 +166,14 @@ export const rpcRateLimitWrite = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    return `${req.ip}-write-${req.params.network || 'unknown'}`;
+    return `${req.ip ?? 'unknown'}-write-${req.params.network ?? 'unknown'}`;
   },
   skip: (req) => req.rpcMethodType !== 'write', // Only apply to write methods
   handler: (req, res) => {
     sendRpcError(
       res,
       429,
-      req.body?.id,
+      readRpcBody(req).id,
       -32005,
       'Transaction rate limit exceeded. Please wait before sending more transactions.'
     );
@@ -153,12 +184,13 @@ export const rpcRateLimitWrite = rateLimit({
  * Request size limiter - prevent oversized payloads
  * Max 50KB should be more than enough for any legitimate RPC call
  */
-export const rpcRequestSizeLimit = (req, res, next) => {
-  const contentLength = parseInt(req.headers['content-length'] || '0', 10);
+export const rpcRequestSizeLimit = (req: Request, res: Response, next: NextFunction): void => {
+  const contentLength = parseInt(req.headers['content-length'] ?? '0', 10);
   const MAX_SIZE = 50 * 1024; // 50KB
 
   if (contentLength > MAX_SIZE) {
-    return sendRpcError(res, 413, req.body?.id, -32600, 'Request payload too large');
+    sendRpcError(res, 413, readRpcBody(req).id, -32600, 'Request payload too large');
+    return;
   }
 
   next();
@@ -167,80 +199,84 @@ export const rpcRequestSizeLimit = (req, res, next) => {
 /**
  * Validate params structure for known methods
  */
-export const rpcParamsValidator = (req, res, next) => {
-  const { method, params, id } = req.body;
+export const rpcParamsValidator = (req: Request, res: Response, next: NextFunction): void => {
+  const { method, params, id } = readRpcBody(req);
 
   // Params should be an array or undefined/null
-  if (params !== undefined && params !== null && !Array.isArray(params)) {
-    return sendRpcError(res, 400, id, -32602, 'Invalid params: must be an array');
+  if (params !== undefined && params !== null && !isArray(params)) {
+    sendRpcError(res, 400, id, -32602, 'Invalid params: must be an array');
+    return;
   }
 
   // Basic validation for specific methods
   switch (method) {
     case 'qrl_getBalance':
     case 'qrl_getTransactionCount':
-    case 'qrl_getCode':
+    case 'qrl_getCode': {
       // These require at least an address
-      if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
+      const address = params?.[0];
+      if (typeof address !== 'string') {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
+        return;
       }
       // Validate address format (Q + 40 hex chars)
-      if (!/^Q[a-fA-F0-9]{40}$/i.test(params[0])) {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
+      if (!/^Q[a-fA-F0-9]{40}$/i.test(address)) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
+        return;
       }
       break;
+    }
 
-    case 'qrl_sendRawTransaction':
+    case 'qrl_sendRawTransaction': {
       // Requires a hex-encoded signed transaction
-      if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: signed transaction required');
+      const rawTx = params?.[0];
+      if (typeof rawTx !== 'string') {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: signed transaction required');
+        return;
       }
       // Validate it starts with 0x
-      if (!params[0].startsWith('0x')) {
-        return sendRpcError(
-          res,
-          400,
-          id,
-          -32602,
-          'Invalid params: transaction must be hex-encoded'
-        );
+      if (!rawTx.startsWith('0x')) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
+        return;
       }
       break;
+    }
 
-    case 'qrl_getTransactionReceipt':
+    case 'qrl_getTransactionReceipt': {
       // Requires a transaction hash
-      if (!params || params.length < 1 || typeof params[0] !== 'string') {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction hash required');
+      const txHash = params?.[0];
+      if (typeof txHash !== 'string') {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: transaction hash required');
+        return;
       }
       // Validate tx hash format (0x + 64 hex chars)
-      if (!/^0x[a-fA-F0-9]{64}$/.test(params[0])) {
-        return sendRpcError(
-          res,
-          400,
-          id,
-          -32602,
-          'Invalid params: invalid transaction hash format'
-        );
+      if (!/^0x[a-fA-F0-9]{64}$/.test(txHash)) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: invalid transaction hash format');
+        return;
       }
       break;
+    }
 
     case 'qrl_call':
     case 'qrl_estimateGas':
-    case 'qrl_sendTransaction':
+    case 'qrl_sendTransaction': {
       // These require a transaction object
       if (!params || params.length < 1 || typeof params[0] !== 'object') {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
+        sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
+        return;
       }
       break;
+    }
 
     case 'qrl_getLogs': {
-      // Bound the request before proxying — otherwise a caller can ask the
+      // Bound the request before proxying; otherwise a caller can ask the
       // node to scan from genesis to tip, blocking the RPC for everyone
       // else for seconds. blockHash form (single-block) is always fine.
-      if (!params || params.length < 1 || typeof params[0] !== 'object' || params[0] === null) {
-        return sendRpcError(res, 400, id, -32602, 'Invalid params: filter object required');
+      const filter = params?.[0];
+      if (!isRecord(filter)) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: filter object required');
+        return;
       }
-      const filter = params[0];
 
       if (typeof filter.blockHash !== 'string') {
         const from = parseBlockTag(filter.fromBlock);
@@ -248,66 +284,66 @@ export const rpcParamsValidator = (req, res, next) => {
 
         // Open-ended scans from genesis are never legitimate. Compare on
         // the parsed numeric value so all hex variations of zero
-        // ("0x0", "0x00", "0x000", …) are caught — a literal-string
+        // ("0x0", "0x00", "0x000", ...) are caught; a literal-string
         // check would be trivially bypassable.
         if (filter.fromBlock === 'earliest' || from === 0) {
-          return sendRpcError(
+          sendRpcError(
             res,
             400,
             id,
             -32602,
             'Invalid params: qrl_getLogs from genesis is not allowed; supply a recent fromBlock'
           );
+          return;
         }
 
         // Both sides numeric → enforce the range cap directly.
         if (from !== null && to !== null) {
           const range = to - from;
           if (range < 0 || range > MAX_GETLOGS_BLOCK_RANGE) {
-            return sendRpcError(
+            sendRpcError(
               res,
               400,
               id,
               -32602,
               `Invalid params: qrl_getLogs block range exceeds ${MAX_GETLOGS_BLOCK_RANGE}`
             );
+            return;
           }
         }
         // Known gap: when `to` is "latest"/"pending" and `from` is a
         // small-but-nonzero number, the range check is bypassed.
         // Closing that requires querying current chain height from
         // here (currently the middleware has no access to
-        // healthMonitor's lastHeight). Tracked for the next sprint —
+        // healthMonitor's lastHeight). Tracked for the next sprint;
         // the genesis check above still covers the worst case.
       }
 
       // Address filter: require the canonical QRL v2 form (Q + 40 hex
-      // chars). Previously we only rejected 0x-prefixed inputs, which let
-      // arbitrary malformed strings (truncated addresses, wrong-prefix
-      // strings, whitespace) through to the node — same validation as
-      // qrl_getCode / qrl_getBalance elsewhere in this middleware. Also
-      // cap array length so a single request can't fan out into N
-      // parallel address lookups on the node.
+      // chars). Also cap array length so a single request can't fan out
+      // into N parallel address lookups on the node.
       if (filter.address !== undefined && filter.address !== null) {
-        const addrs = Array.isArray(filter.address) ? filter.address : [filter.address];
+        const addrs = isArray(filter.address) ? filter.address : [filter.address];
         if (addrs.length > MAX_GETLOGS_ADDRESSES) {
-          return sendRpcError(
+          sendRpcError(
             res,
             400,
             id,
             -32602,
             `Invalid params: too many addresses (max ${MAX_GETLOGS_ADDRESSES})`
           );
+          return;
         }
         for (const a of addrs) {
           if (typeof a !== 'string' || !/^Q[a-fA-F0-9]{40}$/i.test(a)) {
-            return sendRpcError(
+            sendRpcError(
               res,
               400,
               id,
               -32602,
               'Invalid params: QRL addresses must match Q + 40 hex chars'
             );
+            return;
           }
         }
       }
@@ -321,8 +357,8 @@ export const rpcParamsValidator = (req, res, next) => {
 /**
  * Log suspicious activity
  */
-export const rpcSecurityLogger = (req, res, next) => {
-  const { method } = req.body;
+export const rpcSecurityLogger = (req: Request, res: Response, next: NextFunction): void => {
+  const { method } = readRpcBody(req);
   const startTime = Date.now();
 
   // Log the request
@@ -347,4 +383,4 @@ export const rpcSecurityLogger = (req, res, next) => {
 };
 
 // Export the allowed methods for testing/documentation
-export const getAllowedMethods = () => Array.from(ALLOWED_RPC_METHODS);
+export const getAllowedMethods = (): string[] => Array.from(ALLOWED_RPC_METHODS);
