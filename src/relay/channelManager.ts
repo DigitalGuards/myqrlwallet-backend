@@ -28,14 +28,80 @@ const MAX_TOMBSTONES = 20000;
 // bloat channel state.
 const MAX_PUBLIC_KEY_BYTES = 2048;
 
+export type ClientType = 'dapp' | 'wallet';
+
+export function isClientType(value: unknown): value is ClientType {
+  return value === 'dapp' || value === 'wallet';
+}
+
+export interface Participant {
+  clientType: ClientType;
+  joinedAt: number;
+}
+
+interface BufferedMessage {
+  data: unknown;
+  targetClientType: ClientType;
+  timestamp: number;
+}
+
+interface Channel {
+  participants: Map<string, Participant>;
+  lastActivity: number;
+  messageBuffer: BufferedMessage[];
+  /** Monotonic sequence numbers per sender socketId */
+  seqNumbers: Map<string, number>;
+  /** dApp's base64-encoded KEM public key. */
+  publicKey: string | null;
+  /** Set when a participant explicitly closed the channel. */
+  terminated: boolean;
+  /** When the channel was terminated (for tombstone TTL). */
+  terminatedAt: number;
+}
+
+export interface JoinSuccess {
+  success: true;
+  bufferedMessages: unknown[];
+  channelPublicKey: string | null;
+  participants: ClientType[];
+  terminated: boolean;
+}
+
+export interface JoinFailure {
+  success: false;
+  error: string;
+}
+
+export type JoinResult = JoinSuccess | JoinFailure;
+
+export interface RouteResult {
+  targetSocketId?: string;
+  buffered: boolean;
+  error?: string;
+}
+
+export interface ChannelStats {
+  activeChannels: number;
+  totalParticipants: number;
+  totalBufferedMessages: number;
+}
+
+export interface ChannelManagerOptions {
+  isSocketActive?: (socketId: string) => boolean;
+}
+
 class ChannelManager {
-  constructor(options = {}) {
-    /** @type {Map<string, Channel>} */
-    this.channels = new Map();
-    /** @type {string[]} FIFO of terminated channelIds, for tombstone eviction. */
-    this.terminatedOrder = [];
-    this.isSocketActive = options.isSocketActive || (() => false);
-    this.cleanupTimer = setInterval(() => this.cleanup(), CLEANUP_INTERVAL_MS);
+  channels = new Map<string, Channel>();
+  /** FIFO of terminated channelIds, for tombstone eviction. */
+  terminatedOrder: string[] = [];
+  isSocketActive: (socketId: string) => boolean;
+  private cleanupTimer: NodeJS.Timeout | null;
+
+  constructor(options: ChannelManagerOptions = {}) {
+    this.isSocketActive = options.isSocketActive ?? (() => false);
+    this.cleanupTimer = setInterval(() => {
+      this.cleanup();
+    }, CLEANUP_INTERVAL_MS);
   }
 
   /**
@@ -48,18 +114,18 @@ class ChannelManager {
    * so the wallet can verify the served PK against that out-of-band
    * commitment. That means:
    *  - An attacker can't substitute the PK via the relay (fp mismatch).
-   *  - The PK is no longer carried in the QR (24× smaller URI).
+   *  - The PK is no longer carried in the QR (24x smaller URI).
    *
-   * @param {string} channelId
-   * @param {string} socketId
-   * @param {string} clientType - 'dapp' or 'wallet'
-   * @param {string} [publicKeyBase64] - dApp-only; base64-encoded KEM PK.
-   *   Ignored for wallet joins. First dApp sets it; later dApp joins must
-   *   match the stored value (protects against impersonation attempts on
-   *   stale channels).
-   * @returns {{ success: boolean, error?: string, bufferedMessages?: Array, channelPublicKey?: string }}
+   * `publicKeyBase64` is dApp-only and ignored for wallet joins. First dApp
+   * sets it; later dApp joins must match the stored value (protects against
+   * impersonation attempts on stale channels).
    */
-  join(channelId, socketId, clientType, publicKeyBase64) {
+  join(
+    channelId: string,
+    socketId: string,
+    clientType: ClientType,
+    publicKeyBase64?: string
+  ): JoinResult {
     let channel = this.channels.get(channelId);
 
     // Re-join to an explicitly closed channel: report the tombstone so the
@@ -67,7 +133,7 @@ class ChannelManager {
     // add a participant. Parking a socket in a dead channel would both skip
     // the active-channel admission cap (getChannelInfo stays truthy) and let
     // an attacker loop join->close to flood the tombstone FIFO.
-    if (channel && channel.terminated) {
+    if (channel?.terminated) {
       return {
         success: true,
         bufferedMessages: [],
@@ -79,16 +145,12 @@ class ChannelManager {
 
     if (!channel) {
       channel = {
-        participants: new Map(),
+        participants: new Map<string, Participant>(),
         lastActivity: Date.now(),
         messageBuffer: [],
-        /** @type {Map<string, number>} Monotonic sequence numbers per sender socketId */
-        seqNumbers: new Map(),
-        /** @type {string|null} dApp's base64-encoded KEM public key. */
+        seqNumbers: new Map<string, number>(),
         publicKey: null,
-        /** @type {boolean} Set when a participant explicitly closed the channel. */
         terminated: false,
-        /** @type {number} When the channel was terminated (for tombstone TTL). */
         terminatedAt: 0,
       };
       this.channels.set(channelId, channel);
@@ -127,7 +189,7 @@ class ChannelManager {
       // silently drops non-base64 characters instead of throwing, so we
       // reject anything that doesn't match the canonical alphabet first.
       // Re-encoding the decoded buffer and comparing to the input also
-      // canonicalises it — a dApp re-joining with equivalent-but-not-
+      // canonicalises it; a dApp re-joining with equivalent-but-not-
       // identical padding will still match the stored value byte-wise.
       if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKeyBase64)) {
         return { success: false, error: 'Public key is not valid base64' };
@@ -150,7 +212,7 @@ class ChannelManager {
       }
     }
 
-    // Note: a wallet may legitimately join a channel with no PK bound —
+    // Note: a wallet may legitimately join a channel with no PK bound;
     // either the dApp hasn't arrived yet (fresh scan race), or the relay
     // restarted and forgot the binding (wallet has a persisted session
     // and doesn't need to re-verify). The wallet's join ack carries
@@ -161,8 +223,8 @@ class ChannelManager {
     channel.lastActivity = Date.now();
 
     // Deliver buffered messages for this client type
-    const buffered = [];
-    const newBuffer = [];
+    const buffered: BufferedMessage[] = [];
+    const newBuffer: BufferedMessage[] = [];
     for (const msg of channel.messageBuffer) {
       if (msg.targetClientType === clientType) {
         buffered.push(msg);
@@ -177,7 +239,7 @@ class ChannelManager {
     // waiting on a future participants_changed event that may never come
     // (e.g. the wallet left while the dApp tab was closed). Computed after
     // adding self, then filtered to exclude self.
-    const counterpartyTypes = [];
+    const counterpartyTypes: ClientType[] = [];
     for (const [sid, p] of channel.participants) {
       if (sid !== socketId) counterpartyTypes.push(p.clientType);
     }
@@ -187,7 +249,7 @@ class ChannelManager {
       bufferedMessages: buffered.map((msg) => msg.data),
       channelPublicKey: channel.publicKey,
       participants: counterpartyTypes,
-      terminated: channel.terminated === true,
+      terminated: channel.terminated,
     };
   }
 
@@ -198,9 +260,8 @@ class ChannelManager {
    * instead of sitting on a liveness timeout or re-pairing a dead channel.
    * The tombstone is retained for TOMBSTONE_TTL_MS and is excluded from the
    * active-channel admission count so it cannot block new channels.
-   * @param {string} channelId
    */
-  close(channelId) {
+  close(channelId: string): void {
     const channel = this.channels.get(channelId);
     // Only mark an existing channel. Never fabricate a tombstone for an
     // unknown channelId: a non-existent channel is already dead (a re-joining
@@ -228,20 +289,19 @@ class ChannelManager {
     this.terminatedOrder.push(channelId);
     while (this.terminatedOrder.length > MAX_TOMBSTONES) {
       const oldest = this.terminatedOrder.shift();
+      if (oldest === undefined) break;
       const stale = this.channels.get(oldest);
-      if (stale && stale.terminated) {
+      if (stale?.terminated) {
         this.channels.delete(oldest);
       }
     }
   }
 
   /**
-   * Remove a participant from their channel.
-   * @param {string} socketId
-   * @param {string} channelId
-   * @returns {{ clientType: string, joinedAt: number }|null}
+   * Remove a participant from their channel. Returns the removed participant
+   * record, or null if this socket was not in the channel.
    */
-  leave(socketId, channelId) {
+  leave(socketId: string, channelId: string): Participant | null {
     const channel = this.channels.get(channelId);
     if (!channel) return null;
 
@@ -260,12 +320,8 @@ class ChannelManager {
   /**
    * Route a message to the counterparty in the channel.
    * If counterparty is disconnected, buffer the message.
-   * @param {string} channelId
-   * @param {string} senderSocketId
-   * @param {object} data - The encrypted message data
-   * @returns {{ targetSocketId?: string, buffered: boolean, error?: string }}
    */
-  routeMessage(channelId, senderSocketId, data) {
+  routeMessage(channelId: string, senderSocketId: string, data: unknown): RouteResult {
     const channel = this.channels.get(channelId);
     if (!channel) {
       return { buffered: false, error: 'Channel not found' };
@@ -287,16 +343,19 @@ class ChannelManager {
 
     // Replay protection: enforce monotonic sequence numbers per sender.
     // If the message includes a seq number, reject duplicates and out-of-order.
-    if (typeof data?.seq === 'number') {
-      const lastSeq = channel.seqNumbers.get(senderSocketId) ?? -1;
-      if (data.seq <= lastSeq) {
-        return { buffered: false, error: 'Duplicate or out-of-order message (replay rejected)' };
+    if (typeof data === 'object' && data !== null && 'seq' in data) {
+      const seq = data.seq;
+      if (typeof seq === 'number') {
+        const lastSeq = channel.seqNumbers.get(senderSocketId) ?? -1;
+        if (seq <= lastSeq) {
+          return { buffered: false, error: 'Duplicate or out-of-order message (replay rejected)' };
+        }
+        channel.seqNumbers.set(senderSocketId, seq);
       }
-      channel.seqNumbers.set(senderSocketId, data.seq);
     }
 
     // Find counterparty (the other participant)
-    let targetSocketId = null;
+    let targetSocketId: string | null = null;
 
     for (const [sid] of channel.participants) {
       if (sid !== senderSocketId) {
@@ -310,7 +369,7 @@ class ChannelManager {
     }
 
     // Counterparty not connected - buffer the message
-    const otherClientType = sender.clientType === 'dapp' ? 'wallet' : 'dapp';
+    const otherClientType: ClientType = sender.clientType === 'dapp' ? 'wallet' : 'dapp';
 
     if (channel.messageBuffer.length >= MAX_BUFFERED_MESSAGES) {
       // Drop oldest message
@@ -328,9 +387,13 @@ class ChannelManager {
 
   /**
    * Get channel info for debugging/monitoring.
-   * @param {string} channelId
    */
-  getChannelInfo(channelId) {
+  getChannelInfo(channelId: string): {
+    participantCount: number;
+    bufferedMessages: number;
+    lastActivity: number;
+    age: number;
+  } | null {
     const channel = this.channels.get(channelId);
     if (!channel) return null;
 
@@ -344,10 +407,8 @@ class ChannelManager {
 
   /**
    * Find which channel a socket belongs to.
-   * @param {string} socketId
-   * @returns {string|null} channelId
    */
-  findChannelBySocket(socketId) {
+  findChannelBySocket(socketId: string): string | null {
     for (const [channelId, channel] of this.channels) {
       if (channel.participants.has(socketId)) {
         return channelId;
@@ -359,7 +420,7 @@ class ChannelManager {
   /**
    * Cleanup stale channels and expired buffered messages.
    */
-  cleanup() {
+  cleanup(): void {
     const now = Date.now();
 
     for (const [channelId, channel] of this.channels) {
@@ -396,7 +457,7 @@ class ChannelManager {
   /**
    * Get stats for health check / monitoring.
    */
-  getStats() {
+  getStats(): ChannelStats {
     let totalParticipants = 0;
     let totalBuffered = 0;
 
@@ -418,7 +479,7 @@ class ChannelManager {
    * so a burst of closes cannot exhaust the active-channel budget. Bounded by
    * the channel cap, so the linear scan is cheap.
    */
-  getActiveChannelCount() {
+  getActiveChannelCount(): number {
     let count = 0;
     for (const channel of this.channels.values()) {
       if (!channel.terminated) count += 1;
@@ -429,7 +490,7 @@ class ChannelManager {
   /**
    * Shutdown cleanup timer.
    */
-  destroy() {
+  destroy(): void {
     if (this.cleanupTimer) {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;

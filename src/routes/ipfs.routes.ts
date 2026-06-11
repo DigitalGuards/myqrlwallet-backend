@@ -1,10 +1,13 @@
-import { Router } from 'express';
+import { Router, type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
+import { parsePositiveInt } from '../config/index.js';
+import { asyncHandler } from '../utils/async-handler.js';
+import { isRecord } from '../utils/guards.js';
 import { logger } from '../utils/logger.js';
 
-// Use Node 22's built-in fetch via globalThis so tests can stub it without
-// the ESM-default-export-immutability gymnastics that `node-fetch` requires.
-const fetchImpl = (...args) => globalThis.fetch(...args);
+// Use Node's built-in fetch via globalThis so tests can stub it without
+// the ESM-default-export-immutability gymnastics that `node-fetch` required.
+const fetchImpl: typeof fetch = (...args) => globalThis.fetch(...args);
 
 const log = logger.child({ module: 'ipfs-routes' });
 
@@ -13,9 +16,9 @@ const log = logger.child({ module: 'ipfs-routes' });
  * Overridable for self-hosted gateways or staging; defaults to ipfs.io
  * which is widely available + Cloudflare-fronted.
  */
-const IPFS_GATEWAY = (process.env.IPFS_GATEWAY || 'https://ipfs.io/ipfs/').replace(/\/?$/, '/');
-const FETCH_TIMEOUT_MS = parseInt(process.env.IPFS_FETCH_TIMEOUT_MS || '8000', 10);
-const MAX_SIZE = parseInt(process.env.IPFS_MAX_SIZE_BYTES || String(10 * 1024 * 1024), 10); // 10 MB
+const IPFS_GATEWAY = (process.env.IPFS_GATEWAY ?? 'https://ipfs.io/ipfs/').replace(/\/?$/, '/');
+const FETCH_TIMEOUT_MS = parsePositiveInt(process.env.IPFS_FETCH_TIMEOUT_MS, 8000);
+const MAX_SIZE = parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024); // 10 MB
 
 // CIDv0: starts with Qm + 44 base58 chars (no 0, O, I, l)
 const CIDV0_RE = /^Qm[1-9A-HJ-NP-Za-km-z]{44}$/;
@@ -29,17 +32,17 @@ const PATH_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
 
 const ipfsRateLimit = rateLimit({
   windowMs: 60 * 1000,
-  max: 60, // 60 requests/min/IP — well above expected normal NFT browsing
+  max: 60, // 60 requests/min/IP - well above expected normal NFT browsing
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'rate-limited' },
 });
 
-function isValidCid(cid) {
+function isValidCid(cid: string): boolean {
   return CIDV0_RE.test(cid) || CIDV1_RE.test(cid);
 }
 
-function isSafePath(rest) {
+function isSafePath(rest: string): boolean {
   if (!rest) return true;
   if (rest.includes('..')) return false;
   const segments = rest.split('/').filter(Boolean);
@@ -58,76 +61,92 @@ ipfsRouter.use(ipfsRateLimit);
  * without allowlisting every public gateway, and so JSON metadata
  * fetches don't depend on the gateway's (often missing) CORS headers.
  *
- * The route does NOT accept arbitrary URLs (no `?url=` style proxying)
- * — that would be a giant SSRF surface. Only well-formed IPFS CIDs are
+ * The route does NOT accept arbitrary URLs (no `?url=` style proxying);
+ * that would be a giant SSRF surface. Only well-formed IPFS CIDs are
  * dereferenced through the configured `IPFS_GATEWAY`.
  *
  * Two route patterns share a handler because Express 4's path-to-regexp
- * won't match `/:cid` against `/:cid/*?` — the optional star modifier still
+ * won't match `/:cid` against `/:cid/*?`: the optional star modifier still
  * requires a `/` separator that isn't present when only the CID is supplied.
  */
-async function ipfsHandler(req, res) {
-  const { cid } = req.params;
-  const rest = req.params[0] || '';
+async function ipfsHandler(req: Request, res: Response): Promise<void> {
+  const cid = req.params.cid ?? '';
+  const rest = req.params['0'] ?? '';
 
   if (!isValidCid(cid)) {
-    return res.status(400).json({ error: 'invalid CID' });
+    res.status(400).json({ error: 'invalid CID' });
+    return;
   }
   if (!isSafePath(rest)) {
-    return res.status(400).json({ error: 'invalid path' });
+    res.status(400).json({ error: 'invalid path' });
+    return;
   }
 
   const url = `${IPFS_GATEWAY}${cid}${rest ? '/' + rest : ''}`;
   const controller = new AbortController();
-  const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
+  const timeout = setTimeout(() => {
+    controller.abort();
+  }, FETCH_TIMEOUT_MS);
 
   try {
     const response = await fetchImpl(url, { signal: controller.signal, redirect: 'follow' });
     if (!response.ok) {
       log.warn({ cid, status: response.status }, 'IPFS gateway returned non-2xx');
-      return res
+      res
         .status(response.status === 404 ? 404 : 502)
         .json({ error: 'gateway error', status: response.status });
+      return;
     }
 
     // Reject oversize responses up front if the gateway is honest about
     // Content-Length. A malicious or buggy gateway can still under-declare
     // (or omit) the header and stream arbitrarily many bytes, so we ALSO
-    // enforce the cap incrementally as we read the body — never let an
+    // enforce the cap incrementally as we read the body; never let an
     // attacker buffer >MAX_SIZE into our heap.
-    const declaredSize = parseInt(response.headers.get('content-length') || '0', 10);
+    const declaredSize = parseInt(response.headers.get('content-length') ?? '0', 10);
     if (declaredSize > MAX_SIZE) {
-      return res.status(413).json({ error: 'too large', size: declaredSize, max: MAX_SIZE });
+      res.status(413).json({ error: 'too large', size: declaredSize, max: MAX_SIZE });
+      return;
     }
 
-    const contentType = response.headers.get('content-type') || 'application/octet-stream';
+    const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
 
     // Fetch API allows response.body to be null (e.g. 204 No Content). Without
     // an explicit check, the .getReader() call below would throw a TypeError
-    // that we'd report as "gateway unreachable" — misleading.
+    // that we'd report as "gateway unreachable"; misleading.
     if (!response.body) {
       log.warn({ cid, status: response.status }, 'IPFS gateway returned empty body');
-      return res.status(502).json({ error: 'gateway error' });
+      res.status(502).json({ error: 'gateway error' });
+      return;
     }
 
-    const reader = response.body.getReader();
-    const chunks = [];
+    // undici types the body as ReadableStream<any>; declare the chunk type
+    // here and verify it at runtime (instanceof below) instead of trusting it.
+    const stream: ReadableStream<unknown> = response.body;
+    const reader = stream.getReader();
+    const chunks: Uint8Array[] = [];
     let received = 0;
     try {
       for (;;) {
         const { done, value } = await reader.read();
         if (done) break;
+        if (!(value instanceof Uint8Array)) {
+          log.error({ url }, 'IPFS gateway stream yielded a non-binary chunk');
+          res.status(502).json({ error: 'gateway stream error' });
+          return;
+        }
         received += value.byteLength;
         if (received > MAX_SIZE) {
           // Stop pulling bytes off the gateway socket before we ever
           // commit them to our heap. cancel() may reject if the stream
-          // is already closed — swallow that.
+          // is already closed; swallow that.
           try {
             await reader.cancel();
           } catch {
             /* noop */
           }
-          return res.status(413).json({ error: 'too large', size: received, max: MAX_SIZE });
+          res.status(413).json({ error: 'too large', size: received, max: MAX_SIZE });
+          return;
         }
         chunks.push(value);
       }
@@ -135,9 +154,10 @@ async function ipfsHandler(req, res) {
       // An AbortError mid-stream is the FETCH_TIMEOUT_MS controller firing,
       // not a stream-specific failure. Re-throw so the outer catch maps it
       // to 504 like the pre-streaming code did. Anything else stays a 502.
-      if (streamErr.name === 'AbortError') throw streamErr;
+      if (isRecord(streamErr) && streamErr.name === 'AbortError') throw streamErr;
       log.error({ err: streamErr, url }, 'IPFS proxy stream read failed');
-      return res.status(502).json({ error: 'gateway stream error' });
+      res.status(502).json({ error: 'gateway stream error' });
+      return;
     }
     // Buffer.concat accepts Uint8Array chunks directly; the previous
     // .map(Buffer.from) was wasted work in a hot path.
@@ -147,25 +167,26 @@ async function ipfsHandler(req, res) {
       'Content-Type': contentType,
       // IPFS content is content-addressed, so caching for an hour is safe.
       'Cache-Control': 'public, max-age=3600, immutable',
-      // Sane defaults — never let user-supplied content advertise itself
+      // Sane defaults; never let user-supplied content advertise itself
       // as the wallet's own scripts.
       'X-Content-Type-Options': 'nosniff',
       'Content-Security-Policy': "default-src 'none'; img-src 'self' data: blob:; sandbox",
     });
     res.send(buf);
   } catch (err) {
-    if (err.name === 'AbortError') {
+    if (isRecord(err) && err.name === 'AbortError') {
       log.warn({ cid, rest }, 'IPFS proxy timeout');
-      return res.status(504).json({ error: 'gateway timeout' });
+      res.status(504).json({ error: 'gateway timeout' });
+      return;
     }
-    log.error({ err: err.message, url }, 'IPFS proxy failed');
-    return res.status(502).json({ error: 'gateway unreachable' });
+    log.error({ err: err instanceof Error ? err.message : err, url }, 'IPFS proxy failed');
+    res.status(502).json({ error: 'gateway unreachable' });
   } finally {
     clearTimeout(timeout);
   }
 }
 
-ipfsRouter.get('/:cid', ipfsHandler);
-ipfsRouter.get('/:cid/*', ipfsHandler);
+ipfsRouter.get('/:cid', asyncHandler(ipfsHandler));
+ipfsRouter.get('/:cid/*', asyncHandler(ipfsHandler));
 
 export { ipfsRouter };
