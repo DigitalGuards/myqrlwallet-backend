@@ -65,8 +65,8 @@ export function createRelayServer(httpServer) {
     // device diagnostics showed connections dying at aliveMs ~5.2-5.4s
     // like clockwork. A pingInterval below the reap threshold keeps the
     // socket alive at the cost of a 2-byte frame per interval.
-    pingInterval: parseInt(process.env.RELAY_PING_INTERVAL_MS || '25000', 10),
-    pingTimeout: parseInt(process.env.RELAY_PING_TIMEOUT_MS || '20000', 10),
+    pingInterval: CONFIG.RELAY_PING_INTERVAL_MS,
+    pingTimeout: CONFIG.RELAY_PING_TIMEOUT_MS,
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
