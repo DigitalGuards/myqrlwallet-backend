@@ -59,8 +59,14 @@ export function createRelayServer(httpServer) {
     },
     path: '/relay',
     transports: ['websocket', 'polling'],
-    pingInterval: 25000,
-    pingTimeout: 20000,
+    // Tunable keepalive cadence. Some client network paths (observed:
+    // mobile WebView traffic, likely via iCloud Private Relay or an
+    // idle-reaping middlebox) kill websockets after ~5s without traffic;
+    // device diagnostics showed connections dying at aliveMs ~5.2-5.4s
+    // like clockwork. A pingInterval below the reap threshold keeps the
+    // socket alive at the cost of a 2-byte frame per interval.
+    pingInterval: parseInt(process.env.RELAY_PING_INTERVAL_MS || '25000', 10),
+    pingTimeout: parseInt(process.env.RELAY_PING_TIMEOUT_MS || '20000', 10),
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
