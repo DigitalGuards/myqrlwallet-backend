@@ -23,6 +23,16 @@ function parseEndpointList(networkKey, fallback = []) {
   return fallback;
 }
 
+/**
+ * Parse a positive-integer env var, falling back when unset, non-numeric,
+ * zero, or negative. Keepalive intervals fed to Socket.IO must never be
+ * NaN or <= 0 (unexpected drops / crashes).
+ */
+function parsePositiveInt(value, fallback) {
+  const n = parseInt(value ?? '', 10);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
 export const CONFIG = {
   PORT: process.env.PORT || 3000,
   NODE_ENV: process.env.NODE_ENV || 'development',
@@ -32,6 +42,8 @@ export const CONFIG = {
   RELAY_MAX_ACTIVE_SOCKETS: parseInt(process.env.RELAY_MAX_ACTIVE_SOCKETS || '5000', 10),
   RELAY_MAX_SOCKETS_PER_IP: parseInt(process.env.RELAY_MAX_SOCKETS_PER_IP || '25', 10),
   RELAY_MAX_ACTIVE_CHANNELS: parseInt(process.env.RELAY_MAX_ACTIVE_CHANNELS || '20000', 10),
+  RELAY_PING_INTERVAL_MS: parsePositiveInt(process.env.RELAY_PING_INTERVAL_MS, 25000),
+  RELAY_PING_TIMEOUT_MS: parsePositiveInt(process.env.RELAY_PING_TIMEOUT_MS, 20000),
 
   ALLOWED_ORIGINS: (process.env.ALLOWED_ORIGINS || '')
     .split(',')
