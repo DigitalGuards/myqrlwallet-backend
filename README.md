@@ -54,9 +54,12 @@ CORS_ORIGINS=http://localhost:5173,https://qrlwallet.com
 ### Development
 
 ```bash
-npm run dev     # Start with nodemon (auto-reload)
-npm start       # Start production server
-npm test        # Run tests
+npm run dev        # Start with tsx watch (auto-reload, runs TS directly)
+npm run build      # Compile src/ (TypeScript) to dist/
+npm start          # Start production server (requires a prior build)
+npm test           # Run tests
+npm run typecheck  # tsc --noEmit
+npm run lint       # eslint (strict-type-checked)
 ```
 
 ## API Endpoints
@@ -164,9 +167,10 @@ The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
 
 | Category | Technology |
 |----------|------------|
-| Runtime | Node.js 20 |
+| Runtime | Node.js 22 |
+| Language | TypeScript (strict, compiled to `dist/`) |
 | Framework | Express.js |
-| HTTP Client | Axios |
+| HTTP Client | Native fetch / Axios |
 | Caching | node-cache |
 | Rate Limiting | express-rate-limit |
 | Container | Node.js Alpine |
@@ -174,21 +178,27 @@ The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
 ## Project Structure
 
 ```
+server.js               # Entry shim -> dist/server.js (build output)
 src/
-├── app.js              # Express app setup
-├── config/             # Configuration
+├── server.ts           # Process entry (HTTP + relay + metrics)
+├── app.ts              # Express app setup
+├── config/             # Configuration (env parsing, NaN-guarded)
+├── crypto/
+│   └── primitives.ts   # Crypto boundary (only file importing node:crypto)
 ├── middleware/
-│   ├── cors.js         # CORS configuration
-│   └── error-handler.js
+│   ├── cors.ts         # CORS configuration
+│   ├── error-handler.ts
+│   └── rpc-security.ts # Whitelist, validation, rate limits
+├── relay/              # Socket.IO dApp Connect relay
 ├── routes/
-│   ├── index.js        # Route aggregator
-│   ├── app.routes.js   # tx-history route
-│   ├── rpc.routes.js   # RPC proxy routes
-│   └── health.routes.js
+│   ├── index.ts        # Route aggregator
+│   ├── app.routes.ts   # tx-history route
+│   ├── rpc.routes.ts   # RPC proxy routes
+│   ├── ipfs.routes.ts  # IPFS gateway shim
+│   └── health.routes.ts
 ├── services/
-│   └── rpc.service.js  # RPC proxy with caching
-└── utils/
-    └── cache.js        # Cache configuration
+│   └── rpc.service.ts  # RPC proxy with caching + failover
+└── utils/              # cache, logger, guards, asyncHandler
 ```
 
 ## Related Projects

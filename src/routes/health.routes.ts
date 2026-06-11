@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { healthMonitor } from '../services/rpc/healthMonitor.js';
+import { healthMonitor, type HealthSnapshot } from '../services/rpc/healthMonitor.js';
 
 const router = Router();
 
@@ -10,8 +10,8 @@ const router = Router();
  * Index-by-position is preserved so the order still corresponds to the
  * configured RPC_ENDPOINTS_<NETWORK> list.
  */
-const redactSnapshot = (snapshot) => {
-  const out = {};
+const redactSnapshot = (snapshot: HealthSnapshot) => {
+  const out: Record<string, object[]> = {};
   for (const [network, endpoints] of Object.entries(snapshot)) {
     out[network] = endpoints.map(({ url: _url, ...rest }, index) => ({
       index,
@@ -21,7 +21,7 @@ const redactSnapshot = (snapshot) => {
   return out;
 };
 
-router.get('/', (req, res) => {
+router.get('/', (_req, res) => {
   const endpoints = redactSnapshot(healthMonitor.getSnapshot());
   const networks = Object.keys(endpoints);
   const anyHealthy =
