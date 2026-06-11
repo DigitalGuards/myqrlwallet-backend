@@ -1,6 +1,6 @@
-import * as chai from "chai";
+import * as chai from 'chai';
 
-import {default as chaiHttp, request} from "chai-http";
+import { default as chaiHttp, request } from 'chai-http';
 chai.use(chaiHttp);
 
 import { app } from '../../src/app.js';
@@ -32,7 +32,11 @@ describe('Health Routes', () => {
 
   it('should return 503 degraded when every configured endpoint is down or stalled', async () => {
     healthMonitor.__setEndpointsForTesting('testnet', ['http://down.test:8545']);
-    healthMonitor.__forceStateForTesting('testnet', 'http://down.test:8545', HEALTH_STATES.STATE_DOWN);
+    healthMonitor.__forceStateForTesting(
+      'testnet',
+      'http://down.test:8545',
+      HEALTH_STATES.STATE_DOWN
+    );
 
     const res = await request.execute(app).get('/health');
     expect(res).to.have.status(503);
