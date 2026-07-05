@@ -3,12 +3,15 @@
  * the QRL Connect dApp-to-wallet protocol.
  *
  * Stateless message routing between channel rooms.
- * All messages are E2E encrypted (ECIES) - relay sees only ciphertext.
+ * All messages are E2E encrypted (ML-KEM-768 + AES-256-GCM, QRL Connect v2);
+ * the relay sees only ciphertext.
  */
 
+import type { Server as HttpServer } from 'node:http';
 import { Server } from 'socket.io';
-import { ChannelManager } from './channelManager.js';
+import { ChannelManager, isClientType, type ClientType } from './channelManager.js';
 import { CONFIG } from '../config/index.js';
+import { isArray, isRecord } from '../utils/guards.js';
 import * as metrics from './metrics.js';
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
@@ -19,12 +22,57 @@ const MAX_CHANNEL_ID_LENGTH = 128;
 const CHANNEL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_MESSAGE_BYTES = 256 * 1024;
 
+interface ParticipantsChange {
+  event: 'join' | 'leave' | 'close' | 'disconnect';
+  clientType: ClientType;
+}
+
+/**
+ * Wire events. Payloads and ack callbacks arrive from untrusted clients, so
+ * both are typed unknown and narrowed at runtime; emits are fully typed.
+ */
+interface ClientToServerEvents {
+  join_channel: (payload: unknown, callback: unknown) => void;
+  message: (payload: unknown, callback: unknown) => void;
+  leave_channel: (payload: unknown, callback: unknown) => void;
+  close_channel: (payload: unknown, callback: unknown) => void;
+  ping: (callback: unknown) => void;
+}
+
+interface ServerToClientEvents {
+  message: (payload: unknown) => void;
+  participants_changed: (change: ParticipantsChange) => void;
+}
+
+export type RelayServer = Server<ClientToServerEvents, ServerToClientEvents>;
+
+export interface RelayHandle {
+  io: RelayServer;
+  channelManager: ChannelManager;
+  destroy: () => void;
+}
+
+type Ack = (response: Record<string, unknown>) => void;
+
+/**
+ * Narrow a client-supplied ack slot to a callable, or undefined. Socket.IO
+ * only synthesizes a function here when the client actually requested an
+ * ack; a malicious client can instead place an arbitrary value in the last
+ * argument position. Calling that value blindly (the old `callback?.(...)`)
+ * threw a TypeError inside the handler, which escapes Socket.IO's dispatch
+ * and crashes the process: a one-line remote DoS.
+ */
+function toAck(value: unknown): Ack | undefined {
+  if (typeof value !== 'function') return undefined;
+  return (response) => {
+    Reflect.apply(value, undefined, [response]);
+  };
+}
+
 /**
  * Validate channel identifiers to avoid unbounded relay state growth.
- * @param {unknown} channelId
- * @returns {boolean}
  */
-function isValidChannelId(channelId) {
+function isValidChannelId(channelId: unknown): channelId is string {
   return (
     typeof channelId === 'string' &&
     channelId.length > 0 &&
@@ -35,24 +83,11 @@ function isValidChannelId(channelId) {
 
 /**
  * Attach Socket.IO relay to an HTTP server.
- * @param {import('http').Server} httpServer
- * @returns {Server} Socket.IO server instance
  */
-export function createRelayServer(httpServer) {
-  /** @type {Server|undefined} */
-  let io;
-  const channelManager = new ChannelManager({
-    isSocketActive: (socketId) => io?.sockets?.sockets?.has(socketId) ?? false,
-  });
-
-  /** @type {Map<string, { counts: Record<string, number>, resetAt: number }>} */
-  const rateLimits = new Map();
-  /** @type {Map<string, number>} */
-  const activeSocketsByIp = new Map();
-
-  io = new Server(httpServer, {
+export function createRelayServer(httpServer: HttpServer): RelayHandle {
+  const io: RelayServer = new Server(httpServer, {
     cors: {
-      // Relay allows all origins — it only routes E2E encrypted ciphertext
+      // Relay allows all origins: it only routes E2E encrypted ciphertext
       // and any dApp in the world should be able to connect.
       origin: true,
       methods: ['GET', 'POST'],
@@ -70,14 +105,25 @@ export function createRelayServer(httpServer) {
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
+  const channelManager = new ChannelManager({
+    isSocketActive: (socketId) => io.sockets.sockets.has(socketId),
+  });
+
+  interface RateLimitEntry {
+    counts: { connect: number; message: number; join: number };
+    resetAt: number;
+  }
+  const rateLimits = new Map<string, RateLimitEntry>();
+  const activeSocketsByIp = new Map<string, number>();
+
   /**
-   * Check a named rate limit bucket for an IP address.
-   * @param {string} ip
-   * @param {'connect'|'message'|'join'} bucket
-   * @param {number} limit
-   * @returns {boolean} true if allowed
+   * Check a named rate limit bucket for an IP address. Returns true if allowed.
    */
-  function checkRateLimit(ip, bucket, limit) {
+  function checkRateLimit(
+    ip: string,
+    bucket: keyof RateLimitEntry['counts'],
+    limit: number
+  ): boolean {
     const now = Date.now();
     let entry = rateLimits.get(ip);
 
@@ -86,16 +132,14 @@ export function createRelayServer(httpServer) {
       rateLimits.set(ip, entry);
     }
 
-    entry.counts[bucket] = (entry.counts[bucket] || 0) + 1;
+    entry.counts[bucket] += 1;
     return entry.counts[bucket] <= limit;
   }
 
   /**
    * Approximate message payload size for memory-DoS protection.
-   * @param {unknown} message
-   * @returns {number}
    */
-  function getMessageSizeBytes(message) {
+  function getMessageSizeBytes(message: unknown): number {
     try {
       if (typeof message === 'string') {
         return Buffer.byteLength(message, 'utf8');
@@ -111,10 +155,8 @@ export function createRelayServer(httpServer) {
 
   /**
    * Normalize a client IP string from proxy/socket metadata.
-   * @param {unknown} rawIp
-   * @returns {string}
    */
-  function normalizeClientIp(rawIp) {
+  function normalizeClientIp(rawIp: unknown): string {
     if (typeof rawIp !== 'string') return '';
     const trimmed = rawIp.trim();
     if (!trimmed) return '';
@@ -126,22 +168,22 @@ export function createRelayServer(httpServer) {
 
   /**
    * Resolve client IP for rate limiting across direct and proxied setups.
-   * @param {import('socket.io').Socket} socket
-   * @returns {string}
    */
-  function getClientIp(socket) {
-    const headers = socket.handshake.headers || {};
+  function getClientIp(socket: {
+    handshake: { headers: Record<string, unknown>; address: string };
+    conn: { remoteAddress: string };
+  }): string {
+    const headers = socket.handshake.headers;
     const xff = headers['x-forwarded-for'];
-    const forwardedFor =
-      typeof xff === 'string' ? xff.split(',')[0] : Array.isArray(xff) ? xff[0] : '';
+    const forwardedFor = typeof xff === 'string' ? xff.split(',')[0] : isArray(xff) ? xff[0] : '';
 
-    const candidates = [
+    const candidates: unknown[] = [
       headers['cf-connecting-ip'],
       headers['true-client-ip'],
       headers['x-real-ip'],
       forwardedFor,
       socket.handshake.address,
-      socket.conn?.remoteAddress,
+      socket.conn.remoteAddress,
     ];
 
     for (const candidate of candidates) {
@@ -173,7 +215,7 @@ export function createRelayServer(httpServer) {
       return;
     }
 
-    const activeForIp = (activeSocketsByIp.get(clientIp) || 0) + 1;
+    const activeForIp = (activeSocketsByIp.get(clientIp) ?? 0) + 1;
     activeSocketsByIp.set(clientIp, activeForIp);
     if (activeForIp > CONFIG.RELAY_MAX_SOCKETS_PER_IP) {
       activeSocketsByIp.set(clientIp, activeForIp - 1);
@@ -185,7 +227,7 @@ export function createRelayServer(httpServer) {
       return;
     }
     if (io.engine.clientsCount > CONFIG.RELAY_MAX_ACTIVE_SOCKETS) {
-      const updatedCount = (activeSocketsByIp.get(clientIp) || 1) - 1;
+      const updatedCount = (activeSocketsByIp.get(clientIp) ?? 1) - 1;
       if (updatedCount > 0) {
         activeSocketsByIp.set(clientIp, updatedCount);
       } else {
@@ -198,15 +240,15 @@ export function createRelayServer(httpServer) {
 
     metrics.connectionsTotal.inc();
     metrics.activeSockets.inc();
-    let currentChannelId = null;
+    let currentChannelId: string | null = null;
     let releasedSocketCounter = false;
 
-    const releaseSocketCounter = () => {
+    const releaseSocketCounter = (): void => {
       if (releasedSocketCounter) {
         return;
       }
       releasedSocketCounter = true;
-      const count = activeSocketsByIp.get(clientIp) || 0;
+      const count = activeSocketsByIp.get(clientIp) ?? 0;
       if (count <= 1) {
         activeSocketsByIp.delete(clientIp);
       } else {
@@ -222,45 +264,55 @@ export function createRelayServer(httpServer) {
      * The relay binds it to the channel and echoes it back to the wallet
      * on its join so the wallet can verify the fingerprint from the QR.
      */
-    socket.on('join_channel', (payload, callback) => {
+    socket.on('join_channel', (payload, rawCallback) => {
+      const callback = toAck(rawCallback);
       if (!checkRateLimit(clientIp, 'join', RATE_LIMIT_MAX_JOINS)) {
         metrics.rateLimitHits.inc({ bucket: 'join' });
-        return callback?.({ success: false, error: 'Join rate limit exceeded' });
+        callback?.({ success: false, error: 'Join rate limit exceeded' });
+        return;
       }
 
-      const { channelId, clientType, publicKey } = payload || {};
+      const data = isRecord(payload) ? payload : {};
+      const channelId = data.channelId;
+      const clientType = data.clientType;
+      const publicKey = data.publicKey;
 
       if (!isValidChannelId(channelId)) {
-        return callback?.({ success: false, error: 'Invalid channelId' });
+        callback?.({ success: false, error: 'Invalid channelId' });
+        return;
       }
       if (
         !channelManager.getChannelInfo(channelId) &&
         channelManager.getActiveChannelCount() >= CONFIG.RELAY_MAX_ACTIVE_CHANNELS
       ) {
-        return callback?.({ success: false, error: 'Relay channel capacity reached' });
+        callback?.({ success: false, error: 'Relay channel capacity reached' });
+        return;
       }
 
-      if (clientType !== 'dapp' && clientType !== 'wallet') {
-        return callback?.({
+      if (!isClientType(clientType)) {
+        callback?.({
           success: false,
           error: 'clientType must be "dapp" or "wallet"',
         });
+        return;
       }
 
       if (publicKey !== undefined && typeof publicKey !== 'string') {
-        return callback?.({ success: false, error: 'publicKey must be a base64 string' });
+        callback?.({ success: false, error: 'publicKey must be a base64 string' });
+        return;
       }
 
       // Leave previous channel if any
       if (currentChannelId && currentChannelId !== channelId) {
-        socket.leave(currentChannelId);
+        void socket.leave(currentChannelId);
         channelManager.leave(socket.id, currentChannelId);
       }
 
       const result = channelManager.join(channelId, socket.id, clientType, publicKey);
 
       if (!result.success) {
-        return callback?.({ success: false, error: result.error });
+        callback?.({ success: false, error: result.error });
+        return;
       }
 
       // Re-join to an explicitly closed (tombstoned) channel: report the
@@ -270,16 +322,17 @@ export function createRelayServer(httpServer) {
       // terminated channel and routing is refused there, so joining the room
       // would only leak a spurious presence event to other re-joiners.
       if (result.terminated) {
-        return callback?.({
+        callback?.({
           success: true,
           terminated: true,
           participants: [],
           channelPublicKey: null,
           bufferedMessages: [],
         });
+        return;
       }
 
-      socket.join(channelId);
+      void socket.join(channelId);
       metrics.channelJoins.inc({ status: 'success' });
       metrics.activeChannels.set(channelManager.getActiveChannelCount());
       currentChannelId = channelId;
@@ -292,13 +345,13 @@ export function createRelayServer(httpServer) {
 
       callback?.({
         success: true,
-        bufferedMessages: result.bufferedMessages || [],
-        channelPublicKey: result.channelPublicKey || null,
+        bufferedMessages: result.bufferedMessages,
+        channelPublicKey: result.channelPublicKey,
         // Counterparty roster so a (re)joining peer can detect an absent
         // wallet immediately; `terminated` flags a channel that was closed
         // on purpose so the peer drops its stored session instead of waiting.
-        participants: result.participants || [],
-        terminated: result.terminated || false,
+        participants: result.participants,
+        terminated: result.terminated,
       });
     });
 
@@ -306,28 +359,35 @@ export function createRelayServer(httpServer) {
      * message - Route an encrypted message to the counterparty.
      * Payload: { id: channelId, message: encryptedData, clientType: string }
      */
-    socket.on('message', (payload, callback) => {
+    socket.on('message', (payload, rawCallback) => {
+      const callback = toAck(rawCallback);
       if (!checkRateLimit(clientIp, 'message', RATE_LIMIT_MAX_MESSAGES)) {
         metrics.rateLimitHits.inc({ bucket: 'message' });
-        return callback?.({ success: false, error: 'Rate limit exceeded' });
+        callback?.({ success: false, error: 'Rate limit exceeded' });
+        return;
       }
 
-      const { id: channelId, message } = payload || {};
+      const data = isRecord(payload) ? payload : {};
+      const channelId = data.id;
+      const message = data.message;
 
       if (!isValidChannelId(channelId) || !message) {
-        return callback?.({ success: false, error: 'Invalid channelId or missing message' });
+        callback?.({ success: false, error: 'Invalid channelId or missing message' });
+        return;
       }
       if (getMessageSizeBytes(message) > MAX_MESSAGE_BYTES) {
-        return callback?.({ success: false, error: 'Message payload too large' });
+        callback?.({ success: false, error: 'Message payload too large' });
+        return;
       }
 
       const result = channelManager.routeMessage(channelId, socket.id, payload);
 
-      if (result.error) {
-        return callback?.({ success: false, error: result.error });
+      if (result.error !== undefined) {
+        callback?.({ success: false, error: result.error });
+        return;
       }
 
-      if (result.targetSocketId) {
+      if (result.targetSocketId !== undefined) {
         // Deliver directly to counterparty
         io.to(result.targetSocketId).emit('message', payload);
         metrics.messagesRouted.inc({ status: 'delivered' });
@@ -343,11 +403,13 @@ export function createRelayServer(httpServer) {
     /**
      * leave_channel - Explicitly leave a channel.
      */
-    socket.on('leave_channel', (payload, callback) => {
-      const channelId = payload?.channelId || currentChannelId;
+    socket.on('leave_channel', (payload, rawCallback) => {
+      const callback = toAck(rawCallback);
+      const requested = isRecord(payload) ? payload.channelId : undefined;
+      const channelId = typeof requested === 'string' && requested ? requested : currentChannelId;
 
       if (channelId) {
-        socket.leave(channelId);
+        void socket.leave(channelId);
         const participant = channelManager.leave(socket.id, channelId);
 
         // Only notify when this socket was actually a participant; a leave for
@@ -374,8 +436,10 @@ export function createRelayServer(httpServer) {
      * backgrounding). Marks a durable tombstone so the counterparty learns
      * the session is dead even if it is absent now and re-joins later.
      */
-    socket.on('close_channel', (payload, callback) => {
-      const channelId = payload?.channelId || currentChannelId;
+    socket.on('close_channel', (payload, rawCallback) => {
+      const callback = toAck(rawCallback);
+      const requested = isRecord(payload) ? payload.channelId : undefined;
+      const channelId = typeof requested === 'string' && requested ? requested : currentChannelId;
 
       if (isValidChannelId(channelId)) {
         // Authorize: only an actual participant may terminate the channel.
@@ -384,7 +448,7 @@ export function createRelayServer(httpServer) {
         // blocks an attacker from closing arbitrary channels by guessing a
         // channelId, and from creating tombstones for channels they were
         // never part of (the close() below only marks an existing channel).
-        socket.leave(channelId);
+        void socket.leave(channelId);
         const participant = channelManager.leave(socket.id, channelId);
 
         if (participant) {
@@ -409,7 +473,8 @@ export function createRelayServer(httpServer) {
     /**
      * ping - Simple connectivity check.
      */
-    socket.on('ping', (callback) => {
+    socket.on('ping', (rawCallback) => {
+      const callback = toAck(rawCallback);
       callback?.({ type: 'pong', timestamp: Date.now() });
     });
 
@@ -435,17 +500,13 @@ export function createRelayServer(httpServer) {
     });
   });
 
-  // Expose stats endpoint for health checks
-  io.channelManager = channelManager;
-  io.destroy = () => {
-    if (rateLimitCleanupTimer) {
-      clearInterval(rateLimitCleanupTimer);
-    }
+  const destroy = (): void => {
+    clearInterval(rateLimitCleanupTimer);
     activeSocketsByIp.clear();
     rateLimits.clear();
     channelManager.destroy();
     io.removeAllListeners();
   };
 
-  return io;
+  return { io, channelManager, destroy };
 }

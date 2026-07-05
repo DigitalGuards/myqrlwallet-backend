@@ -20,23 +20,28 @@ If rules conflict, follow the highest item.
 
 ## High-signal map
 
+The backend is hardened TypeScript (strict tsconfig + typescript-eslint strict-type-checked; type assertions are banned, wire input enters through runtime guards in `src/utils/guards.ts`). Source lives in `src/**/*.ts`, compiled by `npm run build` to `dist/`; the root `server.js` is a two-line shim importing `dist/server.js` so pm2/Docker/deploy paths stay stable. Tests remain plain-JS mocha, executed against the TS sources via the `tsx` loader.
+
 | Path | Role |
 |---|---|
-| `server.js` | Process entry: HTTP server + Socket.IO relay + healthMonitor lifecycle + Prometheus `/metrics` endpoint (token-protected). |
-| `src/app.js` | Express app wiring (CORS, JSON, routes, error handler). Imported by `server.js` and tests. |
-| `src/config/index.js` | dotenv-loaded config singleton. **Endpoint resolution** (`RPC_ENDPOINTS_<NETWORK>` comma-list, back-compat to `RPC_ENDPOINT_<NETWORK>`) lives here. Add tunables to `RPC_HEALTH.*`. |
-| `src/services/rpc.service.js` | RPC proxy: cache for invariant methods, primary-only routing for `txpool_*` / `debug_*` / `admin_*`, `AbortController`-bounded fetch. |
-| `src/services/rpc/healthMonitor.js` | Per-endpoint state machine (`up` / `down` / `stalled` / `unknown`). Background poller (default 10 s) issues `qrl_blockNumber` against each endpoint. Passive signals come from real request results. |
-| `src/services/notifier.js` | Single integration seam for ops alerting. Currently emits structured logs only — add Discord/Telegram/Sentry here, not at call sites. |
-| `src/middleware/rpc-security.js` | Method whitelist, batch reject, request-size limit, two-tier rate limit (read vs write). Source of truth for what's exposed via the proxy. |
-| `src/relay/relayServer.js` | Socket.IO relay for the dApp Connect protocol. PQ-encrypted (ML-KEM + AES-GCM) handshake; backend never sees plaintext payloads. |
-| `src/relay/channelManager.js` | Per-channel state: participant slots, message buffer, PK binding, capacity caps. |
-| `src/relay/metrics.js` | `prom-client` registry. Surfaces relay metrics; `/metrics` endpoint is token-gated by `RELAY_STATS_TOKEN`. |
-| `src/routes/health.routes.js` | `/health` — per-endpoint snapshot from `healthMonitor`. 200 if any endpoint is non-`down`; 503 only when every endpoint is `down`. |
-| `src/routes/rpc.routes.js` | `/api/qrl-rpc/<network>` — applies the security middleware chain, then delegates to `rpcService.executeRPC`. |
-| `src/routes/app.routes.js` | Misc endpoints (currently the tx-history proxy → `zondscan.com`). |
-| `src/utils/cache.js` | `node-cache` instance used only for invariant RPC results (`qrl_chainId`, `net_version`). State-dependent methods MUST NOT be cached. |
-| `test/**/*.test.js` | Mocha + chai + sinon. Run via `npm test` (glob is quoted in `package.json`). |
+| `server.js` | Entry shim only: imports `dist/server.js` (build output). Real entry is `src/server.ts`. |
+| `src/server.ts` | Process entry: HTTP server + Socket.IO relay + healthMonitor lifecycle + Prometheus `/metrics` endpoint (token-protected). |
+| `src/app.ts` | Express app wiring (CORS, JSON, routes, error handler). Imported by `server.ts` and tests. |
+| `src/config/index.ts` | dotenv-loaded config singleton. **Endpoint resolution** (`RPC_ENDPOINTS_<NETWORK>` comma-list, back-compat to `RPC_ENDPOINT_<NETWORK>`) lives here. Add tunables to `RPC_HEALTH.*`. All numeric env vars are NaN-guarded (`parsePositiveInt`). |
+| `src/crypto/primitives.ts` | The crypto boundary: the only file allowed to import `node:crypto` (ESLint-fenced). Currently just the timing-safe token compare; the relay itself does no crypto (routes E2E ciphertext). |
+| `src/utils/guards.ts` | Runtime type guards (`isRecord`, `isArray`, `toError`, `HttpError`). All untrusted input is narrowed here, never type-asserted. |
+| `src/services/rpc.service.ts` | RPC proxy: cache for invariant methods (result value only, per-request envelope rebuild), client JSON-RPC id passthrough, primary-only routing for `txpool_*` / `debug_*` / `admin_*`, `AbortController`-bounded native fetch. |
+| `src/services/rpc/healthMonitor.ts` | Per-endpoint state machine (`up` / `down` / `stalled` / `unknown`). Background poller (default 10 s) issues `qrl_blockNumber` against each endpoint. Passive signals come from real request results. |
+| `src/services/notifier.ts` | Single integration seam for ops alerting. Currently emits structured logs only; add Discord/Telegram/Sentry here, not at call sites. |
+| `src/middleware/rpc-security.ts` | Method whitelist, batch reject, request-size limit, two-tier rate limit (read vs write). Source of truth for what's exposed via the proxy. |
+| `src/relay/relayServer.ts` | Socket.IO relay for the dApp Connect protocol. PQ-encrypted (ML-KEM + AES-GCM) handshake; backend never sees plaintext payloads. Returns `{ io, channelManager, destroy }`. Ack callbacks from the wire are narrowed via `toAck()`; never call them blindly. |
+| `src/relay/channelManager.ts` | Per-channel state: participant slots, message buffer, PK binding, capacity caps. |
+| `src/relay/metrics.ts` | `prom-client` registry. Surfaces relay metrics; `/metrics` endpoint is token-gated by `RELAY_STATS_TOKEN`. Point-in-time gauges are refreshed at scrape time in `server.ts`. |
+| `src/routes/health.routes.ts` | `/health` (per-endpoint snapshot from `healthMonitor`, URLs redacted). 200 if any endpoint is non-`down`; 503 only when every endpoint is `down`. |
+| `src/routes/rpc.routes.ts` | `/api/qrl-rpc/<network>`: applies the security middleware chain, then delegates to `rpcService.executeRPC`. |
+| `src/routes/app.routes.ts` | Misc endpoints (currently the tx-history proxy → `zondscan.com`). |
+| `src/utils/cache.ts` | `node-cache` instance used only for invariant RPC results (`qrl_chainId`, `net_version`). State-dependent methods MUST NOT be cached. |
+| `test/**/*.test.js` | Mocha + chai + sinon (plain JS, runs TS sources through `tsx`). Run via `npm test` (glob is quoted in `package.json`). |
 
 ## Execution Contract
 
@@ -48,9 +53,15 @@ If rules conflict, follow the highest item.
 ```bash
 npm run format:check    # CI fails on formatting drift
 npm run lint
+npm run typecheck
 npm test
+npm run build           # tsc -> dist/; the deploy scripts and Docker run this
 ```
-There is no `typecheck` (this is plain JS) and no `build`. State exactly what you ran and what failed if anything did not run.
+State exactly what you ran and what failed if anything did not run.
+
+### Hardening rules (mandate, mirrors myqrlwallet-connect PR #15)
+- No type laundering: `consistent-type-assertions: never`, `no-explicit-any`, `no-non-null-assertion`, `ban-ts-comment`. Untrusted input (HTTP bodies, Socket.IO payloads, upstream RPC JSON, env vars) enters the typed world only through runtime guards.
+- Crypto fence: only `src/crypto/` may import `node:crypto` (or any crypto lib). The relay must never grow inline crypto; it routes E2E ciphertext only.
 
 ### Review requests
 When asked for a "review", output findings first, ordered by severity, each with `path:line` references. Bugs/regressions/risks before summaries. If no findings, say so explicitly and list residual risks/testing gaps.
@@ -64,7 +75,7 @@ Auto-deploy via the workspace `myqrlwallet-cicd` GitHub-webhook listener on `ops
 | `main` | prod (`qrlwallet.com`) | `deploy-backend-prod.sh` | `myqrlwallet-backend` | `3000` |
 | `dev`  | dev (`dev.qrlwallet.com`) | `deploy-backend-dev.sh` | `myqrlwallet-backend-dev` | `3002` |
 
-Both run `git pull && pm2 restart` (no `--update-env`). After **env-var** changes you must restart manually:
+Both run `git pull && npm install && npm run build && pm2 restart` (no `--update-env`). The build step is required: pm2 boots the `server.js` shim, which imports `dist/server.js`. After **env-var** changes you must restart manually:
 
 ```bash
 ssh ops@49.13.162.117 \
@@ -111,9 +122,10 @@ The relay protocol contract — handshake idempotency, channel rotation, partici
 
 ```bash
 # Quick dev loop
-npm run dev                    # nodemon
+npm run dev                    # tsx watch src/server.ts
 npm test
 npm run lint:fix && npm run format
+npm run typecheck
 
 # Tail prod logs (cicd + backend)
 ssh ops@49.13.162.117 'tail -f ~/.pm2/logs/myqrlwallet-backend-out.log'

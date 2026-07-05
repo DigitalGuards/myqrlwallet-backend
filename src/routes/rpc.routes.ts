@@ -1,5 +1,7 @@
 import { Router } from 'express';
-import { rpcService } from '../services/rpc.service.js';
+import { normalizeRpcId, rpcService } from '../services/rpc.service.js';
+import { asyncHandler } from '../utils/async-handler.js';
+import { isRecord } from '../utils/guards.js';
 import {
   rpcBatchReject,
   rpcMethodWhitelist,
@@ -56,17 +58,19 @@ router.post(
   rpcParamsValidator,
   rpcRateLimitGeneral,
   rpcRateLimitWrite,
-  async (req, res, next) => {
-    try {
-      const { network } = req.params;
-      const { method, params } = req.body;
+  asyncHandler(async (req, res) => {
+    const network = req.params.network ?? '';
+    const body: unknown = req.body;
+    const method = isRecord(body) && typeof body.method === 'string' ? body.method : '';
+    const params = isRecord(body) ? body.params : undefined;
+    // Forward the client's own JSON-RPC id so the response envelope echoes
+    // it back, as the spec requires (the middleware chain already validated
+    // method and params).
+    const id = normalizeRpcId(isRecord(body) ? body.id : null);
 
-      const result = await rpcService.executeRPC(network, method, params);
-      res.json(result);
-    } catch (error) {
-      next(error);
-    }
-  }
+    const result = await rpcService.executeRPC(network, method, params, id);
+    res.json(result);
+  })
 );
 
 export const rpcRoutes = router;

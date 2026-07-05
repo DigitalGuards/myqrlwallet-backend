@@ -1,5 +1,5 @@
 import * as chai from 'chai';
-import {default as chaiHttp, request} from "chai-http";
+import { default as chaiHttp, request } from 'chai-http';
 import sinon from 'sinon';
 import { app } from '../../src/app.js';
 import { rpcService } from '../../src/services/rpc.service.js';
@@ -22,7 +22,8 @@ describe('RPC Routes', () => {
     const mockResult = { jsonrpc: '2.0', id: 1, result: '0x1234' };
     rpcServiceStub.resolves(mockResult);
 
-    const res = await request.execute(app)
+    const res = await request
+      .execute(app)
       .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_blockNumber', params: [] });
 
@@ -30,10 +31,33 @@ describe('RPC Routes', () => {
     expect(res.body).to.deep.equal(mockResult);
   });
 
+  it('forwards the client JSON-RPC id to the service', async () => {
+    rpcServiceStub.resolves({ jsonrpc: '2.0', id: 'abc-1', result: '0x1' });
+
+    await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({ jsonrpc: '2.0', method: 'qrl_blockNumber', params: [], id: 'abc-1' });
+
+    expect(rpcServiceStub.firstCall.args[3]).to.equal('abc-1');
+  });
+
+  it('degrades an invalid (non string/number) id to null', async () => {
+    rpcServiceStub.resolves({ jsonrpc: '2.0', id: null, result: '0x1' });
+
+    await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({ jsonrpc: '2.0', method: 'qrl_blockNumber', params: [], id: { weird: true } });
+
+    expect(rpcServiceStub.firstCall.args[3]).to.equal(null);
+  });
+
   it('should handle errors from RPC service', async () => {
     rpcServiceStub.rejects(new Error('RPC Error'));
 
-    const res = await request.execute(app)
+    const res = await request
+      .execute(app)
       .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_blockNumber', params: [] });
 
@@ -42,7 +66,8 @@ describe('RPC Routes', () => {
   });
 
   it('should reject disallowed RPC methods', async () => {
-    const res = await request.execute(app)
+    const res = await request
+      .execute(app)
       .post('/api/qrl-rpc/dev')
       .send({ method: 'debug_traceTransaction', params: [] });
 
@@ -52,11 +77,12 @@ describe('RPC Routes', () => {
   });
 
   it('should reject batch requests', async () => {
-    const res = await request.execute(app)
+    const res = await request
+      .execute(app)
       .post('/api/qrl-rpc/dev')
       .send([
         { method: 'qrl_blockNumber', params: [] },
-        { method: 'qrl_gasPrice', params: [] }
+        { method: 'qrl_gasPrice', params: [] },
       ]);
 
     expect(res).to.have.status(400);
@@ -64,7 +90,8 @@ describe('RPC Routes', () => {
   });
 
   it('should validate address format', async () => {
-    const res = await request.execute(app)
+    const res = await request
+      .execute(app)
       .post('/api/qrl-rpc/dev')
       .send({ method: 'qrl_getBalance', params: ['invalid-address', 'latest'] });
 
