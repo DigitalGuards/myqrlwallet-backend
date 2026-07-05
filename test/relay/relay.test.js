@@ -28,7 +28,7 @@ function startRelay(configOverrides = {}) {
   }
 
   const httpServer = createServer();
-  const io = createRelayServer(httpServer);
+  const { io, destroy } = createRelayServer(httpServer);
 
   return new Promise((resolve) => {
     httpServer.listen(0, () => {
@@ -38,7 +38,7 @@ function startRelay(configOverrides = {}) {
         httpServer,
         port,
         cleanup: () => {
-          io.destroy();
+          destroy();
           httpServer.close();
           // Restore CONFIG
           for (const [key, value] of Object.entries(originals)) {
@@ -107,7 +107,10 @@ function waitForEvent(socket, event, timeoutMs = 2000) {
 /** Disconnect a socket and wait for it to fully close. */
 function disconnect(socket) {
   return new Promise((resolve) => {
-    if (!socket.connected) { resolve(); return; }
+    if (!socket.connected) {
+      resolve();
+      return;
+    }
     socket.on('disconnect', () => resolve());
     socket.disconnect();
   });
@@ -125,7 +128,9 @@ describe('Relay Server', function () {
   describe('core operations', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should allow dapp and wallet to join the same channel', async () => {
@@ -266,12 +271,7 @@ describe('Relay Server', function () {
       // otherwise a wallet scanning the original QR would be routed to
       // the attacker's key without the fp check ever firing.
       const dapp2 = await connect(relay.port);
-      const resp = await joinChannel(
-        dapp2,
-        'ch-pk-conflict',
-        'dapp',
-        'c29tZS1vdGhlci1rZXk='
-      );
+      const resp = await joinChannel(dapp2, 'ch-pk-conflict', 'dapp', 'c29tZS1vdGhlci1rZXk=');
       expect(resp.success).to.be.false;
       expect(resp.error).to.match(/bound|already/i);
 
@@ -462,7 +462,9 @@ describe('Relay Server', function () {
   describe('reconnect and rejoin', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should deliver buffered messages after wallet reconnects', async () => {
@@ -526,7 +528,9 @@ describe('Relay Server', function () {
   describe('leave channel', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should notify counterparty on explicit leave', async () => {
@@ -571,7 +575,9 @@ describe('Relay Server', function () {
   describe('rate limiting', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should reject messages after rate limit is exceeded', async () => {
@@ -599,7 +605,9 @@ describe('Relay Server', function () {
   describe('channel ID validation', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should reject empty channelId', async () => {
@@ -637,7 +645,9 @@ describe('Relay Server', function () {
   describe('ping', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('should respond with pong', async () => {
@@ -651,12 +661,47 @@ describe('Relay Server', function () {
     });
   });
 
+  // ── Malformed ack arguments ──────────────────────────────────────────
+  // A client can emit with arbitrary data in the position where Socket.IO
+  // would synthesize an ack callback. Calling that value blindly used to
+  // throw a TypeError inside the handler and crash the process (remote DoS).
+
+  describe('malformed ack arguments', () => {
+    let relay;
+
+    before(async () => {
+      relay = await startRelay();
+    });
+    after(() => relay.cleanup());
+
+    it('survives non-function ack slots on every wire event', async () => {
+      const s = await connect(relay.port);
+
+      // None of these request an ack; the junk value lands in the callback
+      // parameter position server-side. Pre-fix, each one crashed the relay.
+      s.emit('ping', 'junk');
+      s.emit('join_channel', { channelId: 'ack-junk', clientType: 'dapp' }, 'junk');
+      s.emit('message', { id: 'ack-junk', message: 'x' }, 42);
+      s.emit('leave_channel', { channelId: 'ack-junk' }, { not: 'a function' });
+      s.emit('close_channel', { channelId: 'ack-junk' }, null);
+
+      // The relay must still be alive and serving acks afterwards.
+      const resp = await new Promise((resolve) => {
+        s.emit('ping', (data) => resolve(data));
+      });
+      expect(resp.type).to.equal('pong');
+      await disconnect(s);
+    });
+  });
+
   // ── Participant roster + terminated tombstone ────────────────────────
 
   describe('roster and tombstone', () => {
     let relay;
 
-    before(async () => { relay = await startRelay(); });
+    before(async () => {
+      relay = await startRelay();
+    });
     after(() => relay.cleanup());
 
     it('join ack reports an empty roster when the peer joins alone', async () => {
@@ -743,7 +788,9 @@ describe('Relay Server', function () {
       expect(respA.terminated).to.be.true;
 
       let phantom = null;
-      a.on('participants_changed', (data) => { phantom = data; });
+      a.on('participants_changed', (data) => {
+        phantom = data;
+      });
 
       // Second re-joiner. Pre-fix, both sockets sat in the dead room and `a`
       // would receive a spurious { event: 'join' }.

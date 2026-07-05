@@ -80,7 +80,7 @@ describe('IPFS Routes', () => {
 
   it('proxies a valid CIDv0 image through the configured gateway', async () => {
     fetchStub.resolves(
-      buildFetchResponse({ contentType: 'image/png', chunks: [Buffer.from('PNGDATA')] }),
+      buildFetchResponse({ contentType: 'image/png', chunks: [Buffer.from('PNGDATA')] })
     );
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
@@ -100,7 +100,7 @@ describe('IPFS Routes', () => {
       buildFetchResponse({
         contentType: 'application/json',
         chunks: [Buffer.from('{"name":"x"}')],
-      }),
+      })
     );
 
     const cid = 'bafybeib2gp4f5suijuyxbcfhi7lvjzvskyciye5n4ihfrn5pcwhrcq45ru';
@@ -108,14 +108,12 @@ describe('IPFS Routes', () => {
 
     expect(res).to.have.status(200);
     expect(res).to.have.header('content-type', /^application\/json/);
-    expect(fetchStub.firstCall.args[0]).to.match(
-      new RegExp(`/ipfs/${cid}/metadata\\.json$`),
-    );
+    expect(fetchStub.firstCall.args[0]).to.match(new RegExp(`/ipfs/${cid}/metadata\\.json$`));
   });
 
   it('rejects oversize responses up front via declared Content-Length', async () => {
     fetchStub.resolves(
-      buildFetchResponse({ contentLength: 20 * 1024 * 1024, chunks: [Buffer.alloc(8)] }),
+      buildFetchResponse({ contentLength: 20 * 1024 * 1024, chunks: [Buffer.alloc(8)] })
     );
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
@@ -134,7 +132,7 @@ describe('IPFS Routes', () => {
       buildFetchResponse({
         contentLength: 10,
         chunks: Array(12).fill(oneMb),
-      }),
+      })
     );
 
     const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
