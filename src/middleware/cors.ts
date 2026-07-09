@@ -14,7 +14,9 @@ export const corsMiddleware = cors({
     if (
       !origin ||
       CONFIG.ALLOWED_ORIGINS.includes(origin) ||
-      EXTENSION_SCHEMES.some((scheme) => origin.startsWith(scheme))
+      // Schemes are case-insensitive (RFC 6454); browsers normalize the
+      // Origin header to lowercase, but custom clients may not.
+      EXTENSION_SCHEMES.some((scheme) => origin.toLowerCase().startsWith(scheme))
     ) {
       callback(null, true);
     } else {
