@@ -24,11 +24,16 @@ function decide(origin) {
 }
 
 describe('corsMiddleware origin policy', () => {
-  it('allows an allowlisted web origin', async function () {
-    // CONFIG reads env at import; the test env may run with an empty list.
-    const allowlisted = CONFIG.ALLOWED_ORIGINS[0];
-    if (!allowlisted) this.skip();
-    expect(await decide(allowlisted)).to.equal(null);
+  it('allows an allowlisted web origin', async () => {
+    // CONFIG reads env at import and may be empty in the test env; inject a
+    // known entry so the allowlist branch is always exercised.
+    const testOrigin = 'https://allowed.example';
+    CONFIG.ALLOWED_ORIGINS.push(testOrigin);
+    try {
+      expect(await decide(testOrigin)).to.equal(null);
+    } finally {
+      CONFIG.ALLOWED_ORIGINS.splice(CONFIG.ALLOWED_ORIGINS.indexOf(testOrigin), 1);
+    }
   });
 
   it('allows a chrome-extension origin without allowlisting', async () => {
@@ -37,6 +42,10 @@ describe('corsMiddleware origin policy', () => {
 
   it('allows a moz-extension origin', async () => {
     expect(await decide('moz-extension://uuid-here')).to.equal(null);
+  });
+
+  it('allows extension origins with uppercase schemes (case-insensitive)', async () => {
+    expect(await decide('CHROME-EXTENSION://abcdefghijklmnop')).to.equal(null);
   });
 
   it('allows an absent Origin header (curl, native clients)', async () => {
