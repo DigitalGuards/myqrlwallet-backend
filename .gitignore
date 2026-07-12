@@ -43,3 +43,6 @@ extension/
 webapp/package-lock.json
 **/CLAUDE.md
 !/CLAUDE.md
+
+# Local operating notes; never tracked (private infrastructure detail)
+CLAUDE.md
