@@ -11,13 +11,48 @@ function statusOf(err: unknown): number {
   return 500;
 }
 
-export const errorHandler = (err: unknown, _req: Request, res: Response, _next: NextFunction) => {
-  logger.error({ err }, 'Unhandled error');
-  const message = err instanceof Error && err.message ? err.message : 'Internal Server Error';
-  res.status(statusOf(err)).json({
+export const errorHandler = (err: unknown, _req: Request, res: Response, next: NextFunction) => {
+  if (res.headersSent) {
+    next(err);
+    return;
+  }
+
+  const status = statusOf(err);
+  const errorName = err instanceof Error ? err.name : typeof err;
+  const errorMessage = err instanceof Error && err.message ? err.message : 'Unknown error';
+  const isRequestParserError =
+    status < 500 &&
+    isRecord(err) &&
+    (typeof err.type === 'string' || (err instanceof SyntaxError && 'body' in err));
+  const safeErrorMessage = isRequestParserError
+    ? status === 413
+      ? 'Request body too large'
+      : 'Invalid request body'
+    : errorMessage;
+
+  // Do not pass the original object to the logger. body-parser errors carry
+  // the raw request in `err.body`, which can contain signed transactions or
+  // other wallet data when malformed JSON reaches this handler.
+  const logContext = {
+    status,
+    error: {
+      name: errorName,
+      message: safeErrorMessage,
+      ...(CONFIG.NODE_ENV === 'development' &&
+        !isRequestParserError &&
+        err instanceof Error && { stack: err.stack }),
+    },
+  };
+  if (status >= 500) logger.error(logContext, 'Unhandled server error');
+  else logger.warn(logContext, 'Rejected request');
+
+  const message = status >= 500 ? 'Internal Server Error' : safeErrorMessage;
+  res.status(status).json({
     error: {
       message,
-      ...(CONFIG.NODE_ENV === 'development' && err instanceof Error && { stack: err.stack }),
+      ...(CONFIG.NODE_ENV === 'development' &&
+        !isRequestParserError &&
+        err instanceof Error && { stack: err.stack }),
     },
   });
 };

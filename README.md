@@ -22,7 +22,7 @@ The backend provides two main services:
 
 ### Prerequisites
 
-- Node.js 18.x or later
+- Node.js 22.x
 - npm 9.x or later
 
 ### Installation
@@ -42,13 +42,14 @@ cp .env.example .env
 Edit `.env` with your settings:
 ```env
 PORT=3000
+LISTEN_HOST=127.0.0.1
 
 # RPC Endpoints
-RPC_URL_TESTNET=https://qrlwallet.com/api/qrl-rpc/testnet
-RPC_URL_MAINNET=https://qrlwallet.com/api/qrl-rpc/mainnet
+RPC_ENDPOINT_TESTNET=http://localhost:8545
+RPC_ENDPOINT_MAINNET=http://localhost:8545
 
 # CORS Origins
-CORS_ORIGINS=http://localhost:5173,https://qrlwallet.com
+ALLOWED_ORIGINS=http://localhost:5173,https://qrlwallet.com
 ```
 
 ### Development
@@ -68,7 +69,8 @@ npm run lint       # eslint (strict-type-checked)
 |--------|----------|-------------|
 | POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet) |
 | POST | `/api/tx-history` | Get transaction history for address |
-| GET | `/health` | Health check |
+| GET | `/health` | RPC readiness check |
+| GET | `/health/live` | Process liveness check |
 
 ### RPC Proxy Example
 
@@ -77,6 +79,18 @@ curl -X POST https://qrlwallet.com/api/qrl-rpc/testnet \
   -H "Content-Type: application/json" \
   -d '{"method": "qrl_blockNumber", "params": []}'
 ```
+
+Every RPC POST, including malformed JSON, rejected methods, and batches, consumes
+the general per-IP admission quota. Signed transaction submissions also use a
+stricter write quota. Upstream responses are streamed into a bounded parser:
+`RPC_MAX_RESPONSE_BYTES` caps one response, while `RPC_MAX_CONCURRENT` and
+`RPC_MAX_INFLIGHT_BYTES` cap process-wide admission. Saturation returns 503;
+oversized, invalid, or failed upstream responses return 502.
+
+Relay payloads use the same byte budgets for offline buffering and live
+transport delivery. A slow counterparty cannot grow Socket.IO's internal
+egress queue without bound; accepted buffered payloads are delivered on its
+next reconnect. Custom relay control events also share a per-IP rate limit.
 
 ### Transaction History Example
 
@@ -97,13 +111,21 @@ docker build -t myqrlwallet-backend:latest .
 ### Run Container
 
 ```bash
-docker run -d -p 3000:3000 myqrlwallet-backend:latest
+docker run -d \
+  -e LISTEN_HOST=0.0.0.0 \
+  -p 127.0.0.1:3000:3000 \
+  myqrlwallet-backend:latest
 ```
 
+The application binds to `127.0.0.1` by default. Containers must explicitly
+set `LISTEN_HOST=0.0.0.0`; publish the port only on host loopback or place it
+behind an isolated reverse proxy/ClusterIP. Configure `TRUSTED_PROXY_CIDRS`
+with the proxy peer CIDRs before accepting `X-Forwarded-For`.
+
 The container:
-- Uses Node.js 20 Alpine with non-root user (UID 1000)
+- Uses Node.js 22 Alpine with non-root user (UID 1000)
 - Serves on port 3000
-- Includes health check at `/health`
+- Includes process health check at `/health/live`
 - Has read-only root filesystem (security hardened)
 
 ## Kubernetes Deployment
@@ -143,6 +165,11 @@ kubectl apply -f k8s/hpa.yaml
 - Read-only root filesystem
 - `/tmp` mounted as emptyDir for temp files
 - No privilege escalation allowed
+
+The example ConfigMap deliberately targets an in-cluster `qrl-node` Service
+and disables mainnet. Replace that Service name with the actual trusted node
+topology before rollout. An RPC endpoint must never point back to the public
+wallet proxy because that creates a recursive request loop.
 
 ## CI/CD
 

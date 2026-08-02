@@ -1,5 +1,6 @@
 import type { NextFunction, Request, Response } from 'express';
-import rateLimit from 'express-rate-limit';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { CONFIG, isNetworkName } from '../config/index.js';
 import { normalizeRpcId, type RpcId } from '../services/rpc.service.js';
 import { isArray, isRecord } from '../utils/guards.js';
 import { logger } from '../utils/logger.js';
@@ -20,7 +21,6 @@ const ALLOWED_RPC_METHODS = new Set([
   'qrl_gasPrice',
   'qrl_estimateGas',
   'qrl_sendRawTransaction',
-  'qrl_sendTransaction',
   'qrl_getTransactionReceipt',
 
   // Contract Operations
@@ -38,7 +38,7 @@ const ALLOWED_RPC_METHODS = new Set([
 /**
  * Methods that modify state or are expensive - apply stricter rate limits
  */
-const WRITE_METHODS = new Set(['qrl_sendRawTransaction', 'qrl_sendTransaction']);
+const WRITE_METHODS = new Set(['qrl_sendRawTransaction']);
 
 /**
  * qrl_getLogs bounds. Without these a single request can ask the node to
@@ -67,15 +67,18 @@ function readRpcBody(req: Request): RpcRequestBody {
 }
 
 /**
- * Parse a hex block tag to a Number, or null for named tags / invalid input.
+ * Parse a canonical hex block tag without losing precision. Named tags and
+ * invalid values return null.
  */
-const parseBlockTag = (v: unknown): number | null => {
+const parseBlockTag = (v: unknown): bigint | null => {
   if (typeof v !== 'string') return null;
   if (v === 'latest' || v === 'pending' || v === 'earliest') return null;
-  if (!v.startsWith('0x')) return null;
-  const n = parseInt(v, 16);
-  return Number.isFinite(n) ? n : null;
+  if (!/^0x[0-9a-f]{1,64}$/i.test(v)) return null;
+  return BigInt(v);
 };
+
+const isNamedBlockTag = (v: unknown): boolean =>
+  v === 'latest' || v === 'pending' || v === 'earliest';
 
 /**
  * Helper function to send JSON-RPC error responses
@@ -120,8 +123,7 @@ export const rpcMethodWhitelist = (req: Request, res: Response, next: NextFuncti
 
   // Check if method is allowed
   if (!ALLOWED_RPC_METHODS.has(method)) {
-    log.warn({ method, ip: req.ip }, 'Blocked RPC method');
-    sendRpcError(res, 403, id, -32601, `Method not allowed: ${method}`);
+    sendRpcError(res, 403, id, -32601, 'Method not allowed');
     return;
   }
 
@@ -132,19 +134,24 @@ export const rpcMethodWhitelist = (req: Request, res: Response, next: NextFuncti
 };
 
 /**
- * Rate limiter for general RPC requests (read operations).
- * More lenient: 1000 requests per minute per IP.
+ * Admission limiter for every RPC request, including malformed, batched,
+ * disallowed, and write requests. This must run before request validation so
+ * rejected traffic cannot bypass admission accounting.
  */
 export const rpcRateLimitGeneral = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 1000, // 1000 requests per minute per IP
+  limit: () => CONFIG.RPC_RATE_LIMIT_PER_MINUTE,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    // Use IP + network as key for more granular limiting
-    return `${req.ip ?? 'unknown'}-${req.params.network ?? 'unknown'}`;
+    // Collapse arbitrary path values into one bucket. Valid configured
+    // networks retain separate quotas without letting attackers rotate an
+    // unbounded `:network` string to bypass admission or grow the store.
+    const requestedNetwork = req.params.network ?? '';
+    const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
+    return `${ipKeyGenerator(req.ip ?? 'unknown')}-${network}`;
   },
-  skip: (req) => req.rpcMethodType === 'write', // Skip for write methods (they have their own limiter)
+  skip: (req) => req.method !== 'POST',
   handler: (req, res) => {
     sendRpcError(
       res,
@@ -158,15 +165,17 @@ export const rpcRateLimitGeneral = rateLimit({
 
 /**
  * Stricter rate limiter for write operations (sending transactions)
- * 10 transactions per minute per IP
+ * The configured limit is applied per IP and network.
  */
 export const rpcRateLimitWrite = rateLimit({
   windowMs: 60 * 1000, // 1 minute
-  max: 10, // 10 write operations per minute per IP
+  limit: () => CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    return `${req.ip ?? 'unknown'}-write-${req.params.network ?? 'unknown'}`;
+    const requestedNetwork = req.params.network ?? '';
+    const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
+    return `${ipKeyGenerator(req.ip ?? 'unknown')}-write-${network}`;
   },
   skip: (req) => req.rpcMethodType !== 'write', // Only apply to write methods
   handler: (req, res) => {
@@ -179,22 +188,6 @@ export const rpcRateLimitWrite = rateLimit({
     );
   },
 });
-
-/**
- * Request size limiter - prevent oversized payloads
- * Max 50KB should be more than enough for any legitimate RPC call
- */
-export const rpcRequestSizeLimit = (req: Request, res: Response, next: NextFunction): void => {
-  const contentLength = parseInt(req.headers['content-length'] ?? '0', 10);
-  const MAX_SIZE = 50 * 1024; // 50KB
-
-  if (contentLength > MAX_SIZE) {
-    sendRpcError(res, 413, readRpcBody(req).id, -32600, 'Request payload too large');
-    return;
-  }
-
-  next();
-};
 
 /**
  * Validate params structure for known methods
@@ -234,8 +227,9 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
         sendRpcError(res, 400, id, -32602, 'Invalid params: signed transaction required');
         return;
       }
-      // Validate it starts with 0x
-      if (!rawTx.startsWith('0x')) {
+      // Require canonical, byte-aligned hex rather than forwarding arbitrary
+      // text that happens to carry a 0x prefix.
+      if (!/^0x(?:[a-fA-F0-9]{2})+$/.test(rawTx)) {
         sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
         return;
       }
@@ -258,10 +252,9 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
     }
 
     case 'qrl_call':
-    case 'qrl_estimateGas':
-    case 'qrl_sendTransaction': {
+    case 'qrl_estimateGas': {
       // These require a transaction object
-      if (!params || params.length < 1 || typeof params[0] !== 'object') {
+      if (!params || params.length < 1 || !isRecord(params[0])) {
         sendRpcError(res, 400, id, -32602, 'Invalid params: transaction object required');
         return;
       }
@@ -278,15 +271,45 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
         return;
       }
 
-      if (typeof filter.blockHash !== 'string') {
+      if (filter.blockHash !== undefined && filter.blockHash !== null) {
+        if (
+          typeof filter.blockHash !== 'string' ||
+          !/^0x[a-fA-F0-9]{64}$/.test(filter.blockHash) ||
+          filter.fromBlock !== undefined ||
+          filter.toBlock !== undefined
+        ) {
+          sendRpcError(
+            res,
+            400,
+            id,
+            -32602,
+            'Invalid params: blockHash must be a 32-byte hash and cannot be combined with a range'
+          );
+          return;
+        }
+      } else {
         const from = parseBlockTag(filter.fromBlock);
         const to = parseBlockTag(filter.toBlock);
+
+        if (
+          (filter.fromBlock !== undefined &&
+            filter.fromBlock !== null &&
+            from === null &&
+            !isNamedBlockTag(filter.fromBlock)) ||
+          (filter.toBlock !== undefined &&
+            filter.toBlock !== null &&
+            to === null &&
+            !isNamedBlockTag(filter.toBlock))
+        ) {
+          sendRpcError(res, 400, id, -32602, 'Invalid params: invalid block tag');
+          return;
+        }
 
         // Open-ended scans from genesis are never legitimate. Compare on
         // the parsed numeric value so all hex variations of zero
         // ("0x0", "0x00", "0x000", ...) are caught; a literal-string
         // check would be trivially bypassable.
-        if (filter.fromBlock === 'earliest' || from === 0) {
+        if (filter.fromBlock === 'earliest' || from === 0n) {
           sendRpcError(
             res,
             400,
@@ -300,7 +323,7 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
         // Both sides numeric → enforce the range cap directly.
         if (from !== null && to !== null) {
           const range = to - from;
-          if (range < 0 || range > MAX_GETLOGS_BLOCK_RANGE) {
+          if (range < 0n || range > BigInt(MAX_GETLOGS_BLOCK_RANGE)) {
             sendRpcError(
               res,
               400,
@@ -311,12 +334,24 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
             return;
           }
         }
-        // Known gap: when `to` is "latest"/"pending" and `from` is a
-        // small-but-nonzero number, the range check is bypassed.
-        // Closing that requires querying current chain height from
-        // here (currently the middleware has no access to
-        // healthMonitor's lastHeight). Tracked for the next sprint;
-        // the genesis check above still covers the worst case.
+
+        // A numeric start combined with a dynamic or omitted end can cover
+        // an unbounded range. Require a numeric end so the cap above is
+        // enforceable without an extra upstream height lookup.
+        const dynamicEnd =
+          filter.toBlock === undefined ||
+          filter.toBlock === null ||
+          isNamedBlockTag(filter.toBlock);
+        if (from !== null && dynamicEnd) {
+          sendRpcError(
+            res,
+            400,
+            id,
+            -32602,
+            'Invalid params: numeric fromBlock requires a numeric toBlock'
+          );
+          return;
+        }
       }
 
       // Address filter: require the canonical QRL v2 form (Q + 40 hex
@@ -359,6 +394,12 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
  */
 export const rpcSecurityLogger = (req: Request, res: Response, next: NextFunction): void => {
   const { method } = readRpcBody(req);
+  const loggedMethod =
+    typeof method === 'string'
+      ? method.length <= 128
+        ? method
+        : `${method.slice(0, 128)}...`
+      : undefined;
   const startTime = Date.now();
 
   // Log the request
@@ -368,7 +409,7 @@ export const rpcSecurityLogger = (req: Request, res: Response, next: NextFunctio
       timestamp: new Date().toISOString(),
       ip: req.ip,
       network: req.params.network,
-      method,
+      method: loggedMethod,
       statusCode: res.statusCode,
       duration: `${duration}ms`,
     };

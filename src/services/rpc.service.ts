@@ -1,6 +1,7 @@
 import { CONFIG, isNetworkName } from '../config/index.js';
 import { cache } from '../utils/cache.js';
-import { isRecord, toError } from '../utils/guards.js';
+import { HttpError, isRecord, toError } from '../utils/guards.js';
+import { BoundedJsonError, readBoundedJsonResponse } from '../utils/bounded-json.js';
 import { healthMonitor } from './rpc/healthMonitor.js';
 
 /**
@@ -42,6 +43,58 @@ export function normalizeRpcId(raw: unknown): RpcId {
   return null;
 }
 
+let activeRpcCalls = 0;
+let reservedRpcResponseBytes = 0;
+
+/**
+ * Reserve the full per-response allowance before starting an upstream call.
+ * This keeps worst-case concurrent response buffering within a deterministic
+ * process-wide budget even when every upstream omits Content-Length.
+ */
+function acquireRpcCallSlot(): (() => void) | null {
+  const reservation = CONFIG.RPC_MAX_RESPONSE_BYTES;
+  if (
+    activeRpcCalls >= CONFIG.RPC_MAX_CONCURRENT ||
+    reservedRpcResponseBytes + reservation > CONFIG.RPC_MAX_INFLIGHT_BYTES
+  ) {
+    return null;
+  }
+
+  activeRpcCalls += 1;
+  reservedRpcResponseBytes += reservation;
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    activeRpcCalls -= 1;
+    reservedRpcResponseBytes -= reservation;
+  };
+}
+
+async function readBoundedRpcJson(
+  response: Response,
+  controller: AbortController
+): Promise<unknown> {
+  try {
+    return await readBoundedJsonResponse(response, controller, CONFIG.RPC_MAX_RESPONSE_BYTES);
+  } catch (error) {
+    if (!(error instanceof BoundedJsonError)) throw error;
+    if (error.failure === 'too-large') {
+      throw new HttpError(502, 'RPC upstream response too large');
+    }
+    if (error.failure === 'empty') {
+      throw new HttpError(502, 'RPC upstream returned an empty response body');
+    }
+    if (error.failure === 'non-binary') {
+      throw new HttpError(502, 'RPC upstream returned a non-binary response chunk');
+    }
+    if (error.failure === 'invalid-json') {
+      throw new HttpError(502, 'RPC upstream returned invalid JSON');
+    }
+    throw new HttpError(502, 'RPC upstream returned an invalid response body');
+  }
+}
+
 class RPCService {
   async makeRPCCall(
     endpoint: string,
@@ -49,6 +102,11 @@ class RPCService {
     params: unknown,
     id: RpcId = null
   ): Promise<unknown> {
+    const releaseRpcCallSlot = acquireRpcCallSlot();
+    if (!releaseRpcCallSlot) {
+      throw new HttpError(503, 'RPC proxy busy');
+    }
+
     const controller = new AbortController();
     const timer = setTimeout(() => {
       controller.abort();
@@ -70,15 +128,24 @@ class RPCService {
           params,
         }),
         signal: controller.signal,
+        redirect: 'error',
       });
 
       if (!response.ok) {
-        throw new Error(`HTTP error! status: ${response.status}`);
+        controller.abort();
+        throw new HttpError(502, `RPC upstream HTTP ${response.status}`);
       }
 
-      return await response.json();
+      return await readBoundedRpcJson(response, controller);
+    } catch (err) {
+      if (err instanceof HttpError) throw err;
+      if (isRecord(err) && err.name === 'AbortError') {
+        throw new HttpError(502, 'RPC upstream timeout');
+      }
+      throw new HttpError(502, 'RPC upstream unavailable');
     } finally {
       clearTimeout(timer);
+      releaseRpcCallSlot();
     }
   }
 
@@ -127,10 +194,11 @@ class RPCService {
       try {
         result = await this.makeRPCCall(url, method, params, id);
         chosenUrl = url;
-        healthMonitor.recordRequestResult(network, url, true);
         break;
       } catch (err) {
-        healthMonitor.recordRequestResult(network, url, false, err);
+        // Admission is process-wide, so retrying another endpoint cannot help
+        // and would only add work while the proxy is saturated.
+        if (err instanceof HttpError && err.status === 503) throw err;
         lastError = toError(err);
       }
     }

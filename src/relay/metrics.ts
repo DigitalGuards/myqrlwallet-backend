@@ -29,6 +29,18 @@ export const bufferedMessages = new Gauge({
   registers: [register],
 });
 
+export const bufferedBytes = new Gauge({
+  name: 'relay_buffered_bytes',
+  help: 'Total buffered relay payload bytes across all channels',
+  registers: [register],
+});
+
+export const directInflightBytes = new Gauge({
+  name: 'relay_direct_inflight_bytes',
+  help: 'Relay payload bytes reserved until target transport drain',
+  registers: [register],
+});
+
 // --- Counters (cumulative) ---
 
 export const messagesRouted = new Counter({
