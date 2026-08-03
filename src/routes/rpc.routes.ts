@@ -1,13 +1,12 @@
 import { Router } from 'express';
+import { CONFIG } from '../config/index.js';
 import { normalizeRpcId, rpcService } from '../services/rpc.service.js';
 import { asyncHandler } from '../utils/async-handler.js';
 import { isRecord } from '../utils/guards.js';
 import {
   rpcBatchReject,
   rpcMethodWhitelist,
-  rpcRateLimitGeneral,
   rpcRateLimitWrite,
-  rpcRequestSizeLimit,
   rpcParamsValidator,
   rpcSecurityLogger,
   getAllowedMethods,
@@ -35,29 +34,24 @@ router.get('/:network', (req, res) => {
     },
     allowed_methods: methods,
     rate_limits: {
-      read: '1000 requests/min per IP',
-      write: '10 requests/min per IP (sendRawTransaction, sendTransaction)',
+      admission: `${CONFIG.RPC_RATE_LIMIT_PER_MINUTE} requests/min per IP for all RPC traffic`,
+      write: `${CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE} requests/min per IP (sendRawTransaction)`,
     },
     max_payload: '50KB',
   });
 });
 
 // Apply security middleware in order:
-// 1. Request size limit (reject oversized payloads early)
-// 2. Batch reject (block batch requests)
-// 3. Security logger (log all requests)
-// 4. Method whitelist (block disallowed methods)
-// 5. Params validator (validate input)
-// 6. Rate limiters (apply appropriate limits)
+// The application-level admission limiter runs before JSON parsing. The
+// application JSON parser then enforces the actual 50KB decoded-body limit.
+// Valid write methods pass through an additional stricter limiter here.
 router.post(
   '/:network',
-  rpcRequestSizeLimit,
-  rpcBatchReject,
   rpcSecurityLogger,
+  rpcBatchReject,
   rpcMethodWhitelist,
-  rpcParamsValidator,
-  rpcRateLimitGeneral,
   rpcRateLimitWrite,
+  rpcParamsValidator,
   asyncHandler(async (req, res) => {
     const network = req.params.network ?? '';
     const body: unknown = req.body;

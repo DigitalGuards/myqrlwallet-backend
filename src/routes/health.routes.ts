@@ -1,7 +1,15 @@
 import { Router } from 'express';
+import { CONFIG } from '../config/index.js';
 import { healthMonitor, type HealthSnapshot } from '../services/rpc/healthMonitor.js';
 
 const router = Router();
+
+// Process liveness is independent of external chain readiness. Container
+// supervisors use this endpoint so an RPC stall does not create restart loops
+// that erase relay state and health-monitor history.
+router.get('/live', (_req, res) => {
+  res.status(200).json({ status: 'alive' });
+});
 
 /**
  * Strip the `url` field from each endpoint entry. The internal healthMonitor
@@ -23,11 +31,11 @@ const redactSnapshot = (snapshot: HealthSnapshot) => {
 
 router.get('/', (_req, res) => {
   const endpoints = redactSnapshot(healthMonitor.getSnapshot());
-  const networks = Object.keys(endpoints);
-  const anyHealthy =
-    networks.length === 0 || networks.some((n) => healthMonitor.hasHealthyForNetwork(n));
-  const status = anyHealthy ? 'ok' : 'degraded';
-  const httpStatus = anyHealthy ? 200 : 503;
+  const allRequiredHealthy =
+    CONFIG.RPC_REQUIRED_NETWORKS.length > 0 &&
+    CONFIG.RPC_REQUIRED_NETWORKS.every((network) => healthMonitor.hasHealthyForNetwork(network));
+  const status = allRequiredHealthy ? 'ok' : 'degraded';
+  const httpStatus = allRequiredHealthy ? 200 : 503;
   res.status(httpStatus).json({ status, endpoints });
 });
 

@@ -32,7 +32,7 @@ spec:
                 name: myqrlwallet-backend-config
           livenessProbe:
             httpGet:
-              path: /health
+              path: /health/live
               port: http
             initialDelaySeconds: 10
             periodSeconds: 10

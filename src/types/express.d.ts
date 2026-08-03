@@ -1,6 +1,6 @@
 /**
  * Express request augmentation. `rpcMethodType` is stamped by the
- * rpcMethodWhitelist middleware and consumed by the tiered rate limiters.
+ * rpcMethodWhitelist middleware and consumed by the write rate limiter.
  */
 declare global {
   // eslint-disable-next-line @typescript-eslint/no-namespace

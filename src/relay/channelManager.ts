@@ -3,6 +3,8 @@
  * message buffering, and TTL cleanup for the QRL Connect protocol.
  */
 
+import { CONFIG } from '../config/index.js';
+
 const CHANNEL_TTL_MS = 30 * 60 * 1000; // 30 minutes inactivity
 const MAX_PARTICIPANTS = 2;
 const MAX_BUFFERED_MESSAGES = 50;
@@ -39,16 +41,28 @@ export interface Participant {
   joinedAt: number;
 }
 
+/** Exact message shape retained or relayed after wire validation. */
+export interface RelayPayload {
+  id: string;
+  clientType: ClientType;
+  message: unknown;
+  seq?: number;
+}
+
 interface BufferedMessage {
-  data: unknown;
+  data: RelayPayload;
   targetClientType: ClientType;
   timestamp: number;
+  sizeBytes: number;
+  sourceIp: string;
 }
 
 interface Channel {
   participants: Map<string, Participant>;
   lastActivity: number;
   messageBuffer: BufferedMessage[];
+  bufferedBytes: number;
+  directInflightBytes: number;
   /** Monotonic sequence numbers per sender socketId */
   seqNumbers: Map<string, number>;
   /** dApp's base64-encoded KEM public key. */
@@ -76,6 +90,7 @@ export type JoinResult = JoinSuccess | JoinFailure;
 
 export interface RouteResult {
   targetSocketId?: string;
+  backpressuredSocketId?: string;
   buffered: boolean;
   error?: string;
 }
@@ -84,10 +99,19 @@ export interface ChannelStats {
   activeChannels: number;
   totalParticipants: number;
   totalBufferedMessages: number;
+  totalBufferedBytes: number;
+  totalDirectInflightBytes: number;
 }
 
 export interface ChannelManagerOptions {
   isSocketActive?: (socketId: string) => boolean;
+  canSocketReceive?: (socketId: string) => boolean;
+}
+
+interface DirectDeliveryReservation {
+  channel: Channel;
+  sourceIp: string;
+  sizeBytes: number;
 }
 
 class ChannelManager {
@@ -95,10 +119,17 @@ class ChannelManager {
   /** FIFO of terminated channelIds, for tombstone eviction. */
   terminatedOrder: string[] = [];
   isSocketActive: (socketId: string) => boolean;
+  canSocketReceive: (socketId: string) => boolean;
+  totalBufferedBytes = 0;
+  totalDirectInflightBytes = 0;
+  directDeliveries = new Map<string, DirectDeliveryReservation>();
+  /** Combined buffered plus live-egress bytes retained on behalf of each IP. */
+  bufferedBytesByIp = new Map<string, number>();
   private cleanupTimer: NodeJS.Timeout | null;
 
   constructor(options: ChannelManagerOptions = {}) {
     this.isSocketActive = options.isSocketActive ?? (() => false);
+    this.canSocketReceive = options.canSocketReceive ?? (() => true);
     this.cleanupTimer = setInterval(() => {
       this.cleanup();
     }, CLEANUP_INTERVAL_MS);
@@ -126,6 +157,27 @@ class ChannelManager {
     clientType: ClientType,
     publicKeyBase64?: string
   ): JoinResult {
+    let canonicalPublicKey: string | undefined;
+    if (
+      clientType === 'dapp' &&
+      typeof publicKeyBase64 === 'string' &&
+      publicKeyBase64.length > 0
+    ) {
+      // Validate before allocating a channel. Otherwise invalid keys on fresh
+      // channel IDs leave empty channel records behind until the 30-minute TTL.
+      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKeyBase64)) {
+        return { success: false, error: 'Public key is not valid base64' };
+      }
+      const decoded = Buffer.from(publicKeyBase64, 'base64');
+      if (decoded.length === 0) {
+        return { success: false, error: 'Public key is empty' };
+      }
+      if (decoded.length > MAX_PUBLIC_KEY_BYTES) {
+        return { success: false, error: 'Public key exceeds size limit' };
+      }
+      canonicalPublicKey = decoded.toString('base64');
+    }
+
     let channel = this.channels.get(channelId);
 
     // Re-join to an explicitly closed channel: report the tombstone so the
@@ -148,12 +200,22 @@ class ChannelManager {
         participants: new Map<string, Participant>(),
         lastActivity: Date.now(),
         messageBuffer: [],
+        bufferedBytes: 0,
+        directInflightBytes: 0,
         seqNumbers: new Map<string, number>(),
         publicKey: null,
         terminated: false,
         terminatedAt: 0,
       };
       this.channels.set(channelId, channel);
+    }
+
+    const existingParticipant = channel.participants.get(socketId);
+    if (existingParticipant && existingParticipant.clientType !== clientType) {
+      return {
+        success: false,
+        error: 'A participant cannot change clientType while joined',
+      };
     }
 
     // Prevent active participant hijacking by requiring stale socket replacement only.
@@ -168,6 +230,7 @@ class ChannelManager {
         // Allow replacing stale/disconnected participant socket.
         channel.participants.delete(existingSocketId);
         channel.seqNumbers.delete(existingSocketId);
+        this.releaseDirectDelivery(existingSocketId);
         break;
       }
     }
@@ -180,31 +243,10 @@ class ChannelManager {
     // attempt (someone else trying to claim the same channelId with a
     // different PK) fails loudly instead of silently routing the wallet
     // to an attacker.
-    if (
-      clientType === 'dapp' &&
-      typeof publicKeyBase64 === 'string' &&
-      publicKeyBase64.length > 0
-    ) {
-      // Strict base64 validation up front. `Buffer.from(s, 'base64')`
-      // silently drops non-base64 characters instead of throwing, so we
-      // reject anything that doesn't match the canonical alphabet first.
-      // Re-encoding the decoded buffer and comparing to the input also
-      // canonicalises it; a dApp re-joining with equivalent-but-not-
-      // identical padding will still match the stored value byte-wise.
-      if (!/^[A-Za-z0-9+/]+={0,2}$/.test(publicKeyBase64)) {
-        return { success: false, error: 'Public key is not valid base64' };
-      }
-      const decoded = Buffer.from(publicKeyBase64, 'base64');
-      if (decoded.length === 0) {
-        return { success: false, error: 'Public key is empty' };
-      }
-      if (decoded.length > MAX_PUBLIC_KEY_BYTES) {
-        return { success: false, error: 'Public key exceeds size limit' };
-      }
-      const canonical = decoded.toString('base64');
+    if (canonicalPublicKey !== undefined) {
       if (channel.publicKey === null) {
-        channel.publicKey = canonical;
-      } else if (channel.publicKey !== canonical) {
+        channel.publicKey = canonicalPublicKey;
+      } else if (channel.publicKey !== canonicalPublicKey) {
         return {
           success: false,
           error: 'Channel is already bound to a different dApp public key',
@@ -228,6 +270,7 @@ class ChannelManager {
     for (const msg of channel.messageBuffer) {
       if (msg.targetClientType === clientType) {
         buffered.push(msg);
+        this.releaseBufferedBytes(channel, msg);
       } else {
         newBuffer.push(msg);
       }
@@ -279,6 +322,9 @@ class ChannelManager {
     // A terminated channel routes nothing, so drop its heavy state now rather
     // than holding it for TOMBSTONE_TTL_MS. The tombstone keeps only the
     // terminated flag + timestamps.
+    for (const message of channel.messageBuffer) {
+      this.releaseBufferedBytes(channel, message);
+    }
     channel.messageBuffer = [];
     channel.participants.clear();
     channel.seqNumbers.clear();
@@ -321,7 +367,12 @@ class ChannelManager {
    * Route a message to the counterparty in the channel.
    * If counterparty is disconnected, buffer the message.
    */
-  routeMessage(channelId: string, senderSocketId: string, data: unknown): RouteResult {
+  routeMessage(
+    channelId: string,
+    senderSocketId: string,
+    data: RelayPayload,
+    sourceIp = 'unknown'
+  ): RouteResult {
     const channel = this.channels.get(channelId);
     if (!channel) {
       return { buffered: false, error: 'Channel not found' };
@@ -334,24 +385,29 @@ class ChannelManager {
       return { buffered: false, error: 'Channel terminated' };
     }
 
-    channel.lastActivity = Date.now();
-
     const sender = channel.participants.get(senderSocketId);
     if (!sender) {
       return { buffered: false, error: 'Sender not in channel' };
     }
 
+    if (data.clientType !== sender.clientType) {
+      return { buffered: false, error: 'clientType does not match channel participant' };
+    }
+
+    channel.lastActivity = Date.now();
+
     // Replay protection: enforce monotonic sequence numbers per sender.
     // If the message includes a seq number, reject duplicates and out-of-order.
-    if (typeof data === 'object' && data !== null && 'seq' in data) {
-      const seq = data.seq;
-      if (typeof seq === 'number') {
-        const lastSeq = channel.seqNumbers.get(senderSocketId) ?? -1;
-        if (seq <= lastSeq) {
-          return { buffered: false, error: 'Duplicate or out-of-order message (replay rejected)' };
-        }
-        channel.seqNumbers.set(senderSocketId, seq);
+    if (data.seq !== undefined) {
+      const lastSeq = channel.seqNumbers.get(senderSocketId) ?? -1;
+      if (data.seq <= lastSeq) {
+        return { buffered: false, error: 'Duplicate or out-of-order message (replay rejected)' };
       }
+    }
+
+    const sizeBytes = this.getSerializedSize(data);
+    if (sizeBytes === null) {
+      return { buffered: false, error: 'Message payload is not serializable' };
     }
 
     // Find counterparty (the other participant)
@@ -364,25 +420,137 @@ class ChannelManager {
       }
     }
 
-    if (targetSocketId) {
-      return { targetSocketId, buffered: false };
+    if (targetSocketId && this.canSocketReceive(targetSocketId)) {
+      const sourceBytes = this.bufferedBytesByIp.get(sourceIp) ?? 0;
+      if (
+        !this.directDeliveries.has(targetSocketId) &&
+        channel.bufferedBytes + channel.directInflightBytes + sizeBytes <=
+          CONFIG.RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL &&
+        sourceBytes + sizeBytes <= CONFIG.RELAY_MAX_BUFFERED_BYTES_PER_IP &&
+        this.totalBufferedBytes + this.totalDirectInflightBytes + sizeBytes <=
+          CONFIG.RELAY_MAX_BUFFERED_BYTES_GLOBAL
+      ) {
+        const reservation = { channel, sourceIp, sizeBytes };
+        this.directDeliveries.set(targetSocketId, reservation);
+        channel.directInflightBytes += sizeBytes;
+        this.totalDirectInflightBytes += sizeBytes;
+        this.retainIpBytes(sourceIp, sizeBytes);
+        if (data.seq !== undefined) channel.seqNumbers.set(senderSocketId, data.seq);
+        return { targetSocketId, buffered: false };
+      }
     }
 
-    // Counterparty not connected - buffer the message
+    // Counterparty is absent or its transport cannot accept a bounded direct
+    // delivery. Retain the payload under the offline budgets. The server
+    // disconnects a backpressured live target so its normal reconnect drains
+    // this buffer instead of leaving an accepted payload parked indefinitely.
+    const backpressuredSocketId = targetSocketId ?? undefined;
+    const backpressureContext = backpressuredSocketId ? { backpressuredSocketId } : {};
     const otherClientType: ClientType = sender.clientType === 'dapp' ? 'wallet' : 'dapp';
 
-    if (channel.messageBuffer.length >= MAX_BUFFERED_MESSAGES) {
-      // Drop oldest message
-      channel.messageBuffer.shift();
+    // Preserve the message-count cap by evicting the oldest entry, but account
+    // for that prospective removal before evaluating all byte budgets.
+    const oldest =
+      channel.messageBuffer.length >= MAX_BUFFERED_MESSAGES ? channel.messageBuffer[0] : undefined;
+    const oldestSize = oldest?.sizeBytes ?? 0;
+    const sourceBytes = this.bufferedBytesByIp.get(sourceIp) ?? 0;
+    const sourceOldestSize = oldest?.sourceIp === sourceIp ? oldestSize : 0;
+    const channelBytesAfter =
+      channel.bufferedBytes + channel.directInflightBytes - oldestSize + sizeBytes;
+    const sourceBytesAfter = sourceBytes - sourceOldestSize + sizeBytes;
+    const globalBytesAfter =
+      this.totalBufferedBytes + this.totalDirectInflightBytes - oldestSize + sizeBytes;
+
+    if (channelBytesAfter > CONFIG.RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL) {
+      return {
+        ...backpressureContext,
+        buffered: false,
+        error: 'Channel buffered-byte capacity exceeded',
+      };
+    }
+    if (sourceBytesAfter > CONFIG.RELAY_MAX_BUFFERED_BYTES_PER_IP) {
+      return {
+        ...backpressureContext,
+        buffered: false,
+        error: 'Per-IP buffered-byte capacity exceeded',
+      };
+    }
+    if (globalBytesAfter > CONFIG.RELAY_MAX_BUFFERED_BYTES_GLOBAL) {
+      return {
+        ...backpressureContext,
+        buffered: false,
+        error: 'Global buffered-byte capacity exceeded',
+      };
     }
 
-    channel.messageBuffer.push({
+    if (oldest) {
+      channel.messageBuffer.shift();
+      this.releaseBufferedBytes(channel, oldest);
+    }
+
+    const bufferedMessage: BufferedMessage = {
       data,
       targetClientType: otherClientType,
       timestamp: Date.now(),
-    });
+      sizeBytes,
+      sourceIp,
+    };
+    channel.messageBuffer.push(bufferedMessage);
+    this.retainBufferedBytes(channel, bufferedMessage);
+    if (data.seq !== undefined) channel.seqNumbers.set(senderSocketId, data.seq);
 
-    return { buffered: true };
+    return { ...backpressureContext, buffered: true };
+  }
+
+  /** Release the one bounded live-egress reservation for a target socket. */
+  releaseDirectDelivery(socketId: string): void {
+    const reservation = this.directDeliveries.get(socketId);
+    if (!reservation) return;
+    this.directDeliveries.delete(socketId);
+    reservation.channel.directInflightBytes = Math.max(
+      0,
+      reservation.channel.directInflightBytes - reservation.sizeBytes
+    );
+    this.totalDirectInflightBytes = Math.max(
+      0,
+      this.totalDirectInflightBytes - reservation.sizeBytes
+    );
+    this.releaseIpBytes(reservation.sourceIp, reservation.sizeBytes);
+  }
+
+  hasDirectDelivery(socketId: string): boolean {
+    return this.directDeliveries.has(socketId);
+  }
+
+  private getSerializedSize(data: RelayPayload): number | null {
+    try {
+      const serialized = JSON.stringify(data);
+      return typeof serialized === 'string' ? Buffer.byteLength(serialized, 'utf8') : null;
+    } catch {
+      return null;
+    }
+  }
+
+  private retainBufferedBytes(channel: Channel, message: BufferedMessage): void {
+    channel.bufferedBytes += message.sizeBytes;
+    this.totalBufferedBytes += message.sizeBytes;
+    this.retainIpBytes(message.sourceIp, message.sizeBytes);
+  }
+
+  private releaseBufferedBytes(channel: Channel, message: BufferedMessage): void {
+    channel.bufferedBytes = Math.max(0, channel.bufferedBytes - message.sizeBytes);
+    this.totalBufferedBytes = Math.max(0, this.totalBufferedBytes - message.sizeBytes);
+    this.releaseIpBytes(message.sourceIp, message.sizeBytes);
+  }
+
+  private retainIpBytes(sourceIp: string, sizeBytes: number): void {
+    this.bufferedBytesByIp.set(sourceIp, (this.bufferedBytesByIp.get(sourceIp) ?? 0) + sizeBytes);
+  }
+
+  private releaseIpBytes(sourceIp: string, sizeBytes: number): void {
+    const ipBytes = (this.bufferedBytesByIp.get(sourceIp) ?? 0) - sizeBytes;
+    if (ipBytes > 0) this.bufferedBytesByIp.set(sourceIp, ipBytes);
+    else this.bufferedBytesByIp.delete(sourceIp);
   }
 
   /**
@@ -424,10 +592,14 @@ class ChannelManager {
     const now = Date.now();
 
     for (const [channelId, channel] of this.channels) {
-      // Remove expired buffered messages
-      channel.messageBuffer = channel.messageBuffer.filter(
-        (msg) => now - msg.timestamp < BUFFER_TTL_MS
-      );
+      // Remove expired buffered messages and release every byte-accounting
+      // bucket at the same time.
+      const retained: BufferedMessage[] = [];
+      for (const message of channel.messageBuffer) {
+        if (now - message.timestamp < BUFFER_TTL_MS) retained.push(message);
+        else this.releaseBufferedBytes(channel, message);
+      }
+      channel.messageBuffer = retained;
 
       // Terminated tombstones live on their own (longer) TTL so a dApp that
       // re-joins within a day still learns the session was closed on purpose.
@@ -470,6 +642,8 @@ class ChannelManager {
       activeChannels: this.channels.size,
       totalParticipants,
       totalBufferedMessages: totalBuffered,
+      totalBufferedBytes: this.totalBufferedBytes,
+      totalDirectInflightBytes: this.totalDirectInflightBytes,
     };
   }
 
@@ -495,6 +669,10 @@ class ChannelManager {
       clearInterval(this.cleanupTimer);
       this.cleanupTimer = null;
     }
+    this.totalBufferedBytes = 0;
+    this.totalDirectInflightBytes = 0;
+    this.directDeliveries.clear();
+    this.bufferedBytesByIp.clear();
   }
 }
 
