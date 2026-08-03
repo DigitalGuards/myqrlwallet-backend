@@ -13,12 +13,22 @@ metadata:
 data:
   NODE_ENV: "production"
   PORT: "3000"
-  # QRL RPC endpoints
-  QRL_RPC_TESTNET: "https://qrlwallet.com/api/qrl-rpc/testnet"
-  QRL_RPC_MAINNET: "https://qrlwallet.com/api/qrl-rpc/mainnet"
-  # ZondScan API for transaction history
-  ZONDSCAN_API_URL: "https://zondscan.com/api"
+  # ClusterIP provides the network boundary; containers must opt in to a pod-network bind.
+  LISTEN_HOST: "0.0.0.0"
+  # Keep empty until replaced with the ingress/reverse-proxy peer CIDRs.
+  TRUSTED_PROXY_CIDRS: ""
+  RPC_REQUIRED_NETWORKS: "testnet"
+  RPC_RATE_LIMIT_PER_MINUTE: "1000"
+  RPC_WRITE_RATE_LIMIT_PER_MINUTE: "10"
+  RPC_MAX_RESPONSE_BYTES: "8388608"
+  RPC_MAX_CONCURRENT: "16"
+  RPC_MAX_INFLIGHT_BYTES: "67108864"
+  # Replace qrl-node with the in-cluster node Service name. Never point this
+  # back at the public wallet proxy or requests recurse through the backend.
+  RPC_ENDPOINT_TESTNET: "http://qrl-node.myqrlwallet.svc.cluster.local:8545"
+  # Mainnet stays explicitly disabled until a separate trusted node is wired.
+  RPC_ENDPOINT_MAINNET: "http://127.0.0.1:9"
   # CORS allowed origins (comma-separated)
-  CORS_ORIGINS: "https://qrlwallet.com,https://www.qrlwallet.com"
+  ALLOWED_ORIGINS: "https://qrlwallet.com,https://www.qrlwallet.com"
   # Cache TTL in seconds
   CACHE_TTL: "60"

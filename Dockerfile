@@ -42,7 +42,7 @@ ENV PORT=3000
 
 # Health check using curl
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
-    CMD curl -f http://localhost:3000/health || exit 1
+    CMD curl -f http://localhost:3000/health/live || exit 1
 
 # Start the server
 CMD ["node", "server.js"]

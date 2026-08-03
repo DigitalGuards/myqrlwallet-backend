@@ -8,16 +8,24 @@
  */
 
 import type { Server as HttpServer } from 'node:http';
+import type { Transport } from 'engine.io';
 import { Server } from 'socket.io';
-import { ChannelManager, isClientType, type ClientType } from './channelManager.js';
+import {
+  ChannelManager,
+  isClientType,
+  type ClientType,
+  type RelayPayload,
+} from './channelManager.js';
 import { CONFIG } from '../config/index.js';
-import { isArray, isRecord } from '../utils/guards.js';
+import { getTrustedClientIp, normalizeClientIpForLimits } from '../utils/client-ip.js';
+import { isRecord } from '../utils/guards.js';
 import * as metrics from './metrics.js';
 
 const RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
 const RATE_LIMIT_MAX_MESSAGES = 100; // per window per IP
 const RATE_LIMIT_MAX_JOINS = 30; // per window per IP
 const RATE_LIMIT_MAX_CONNECTIONS = 60; // new connections per window per IP
+const RATE_LIMIT_MAX_CONTROL_EVENTS = 300; // ping/leave/close per window per IP
 const MAX_CHANNEL_ID_LENGTH = 128;
 const CHANNEL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_MESSAGE_BYTES = 256 * 1024;
@@ -105,12 +113,52 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
+  const directDrainListeners = new Map<string, { transport: Transport; onDrain: () => void }>();
+  const disconnectAfterDrain = new Set<string>();
+
   const channelManager = new ChannelManager({
     isSocketActive: (socketId) => io.sockets.sockets.has(socketId),
+    canSocketReceive: (socketId) => {
+      const target = io.sockets.sockets.get(socketId);
+      return (
+        target?.connected === true &&
+        target.conn.readyState === 'open' &&
+        target.conn.transport.writable &&
+        !directDrainListeners.has(socketId)
+      );
+    },
   });
 
+  function releaseDirectDelivery(socketId: string): void {
+    const armed = directDrainListeners.get(socketId);
+    if (armed) {
+      armed.transport.removeListener('drain', armed.onDrain);
+      directDrainListeners.delete(socketId);
+    }
+    disconnectAfterDrain.delete(socketId);
+    channelManager.releaseDirectDelivery(socketId);
+  }
+
+  function armDirectDelivery(socketId: string): boolean {
+    const target = io.sockets.sockets.get(socketId);
+    if (!target?.connected || target.conn.readyState !== 'open') return false;
+    const transport = target.conn.transport;
+    if (!transport.writable || directDrainListeners.has(socketId)) return false;
+
+    const onDrain = (): void => {
+      directDrainListeners.delete(socketId);
+      channelManager.releaseDirectDelivery(socketId);
+      if (disconnectAfterDrain.delete(socketId)) {
+        io.sockets.sockets.get(socketId)?.disconnect(true);
+      }
+    };
+    directDrainListeners.set(socketId, { transport, onDrain });
+    transport.once('drain', onDrain);
+    return true;
+  }
+
   interface RateLimitEntry {
-    counts: { connect: number; message: number; join: number };
+    counts: { connect: number; message: number; join: number; control: number };
     resetAt: number;
   }
   const rateLimits = new Map<string, RateLimitEntry>();
@@ -128,7 +176,10 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     let entry = rateLimits.get(ip);
 
     if (!entry || now > entry.resetAt) {
-      entry = { counts: { connect: 0, message: 0, join: 0 }, resetAt: now + RATE_LIMIT_WINDOW_MS };
+      entry = {
+        counts: { connect: 0, message: 0, join: 0, control: 0 },
+        resetAt: now + RATE_LIMIT_WINDOW_MS,
+      };
       rateLimits.set(ip, entry);
     }
 
@@ -141,59 +192,21 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
    */
   function getMessageSizeBytes(message: unknown): number {
     try {
-      if (typeof message === 'string') {
-        return Buffer.byteLength(message, 'utf8');
-      }
-      if (typeof message === 'object' && message !== null) {
-        return Buffer.byteLength(JSON.stringify(message), 'utf8');
-      }
-      return 0;
+      const serialized = JSON.stringify(message);
+      return typeof serialized === 'string'
+        ? Buffer.byteLength(serialized, 'utf8')
+        : MAX_MESSAGE_BYTES + 1;
     } catch {
       return MAX_MESSAGE_BYTES + 1;
     }
   }
 
-  /**
-   * Normalize a client IP string from proxy/socket metadata.
-   */
-  function normalizeClientIp(rawIp: unknown): string {
-    if (typeof rawIp !== 'string') return '';
-    const trimmed = rawIp.trim();
-    if (!trimmed) return '';
-    if (trimmed.startsWith('::ffff:')) {
-      return trimmed.slice('::ffff:'.length);
-    }
-    return trimmed;
-  }
-
-  /**
-   * Resolve client IP for rate limiting across direct and proxied setups.
-   */
-  function getClientIp(socket: {
-    handshake: { headers: Record<string, unknown>; address: string };
-    conn: { remoteAddress: string };
-  }): string {
-    const headers = socket.handshake.headers;
-    const xff = headers['x-forwarded-for'];
-    const forwardedFor = typeof xff === 'string' ? xff.split(',')[0] : isArray(xff) ? xff[0] : '';
-
-    const candidates: unknown[] = [
-      headers['cf-connecting-ip'],
-      headers['true-client-ip'],
-      headers['x-real-ip'],
-      forwardedFor,
-      socket.handshake.address,
-      socket.conn.remoteAddress,
-    ];
-
-    for (const candidate of candidates) {
-      const normalized = normalizeClientIp(candidate);
-      if (normalized) {
-        return normalized;
-      }
-    }
-
-    return 'unknown';
+  function refreshBufferMetrics(): void {
+    const stats = channelManager.getStats();
+    metrics.activeChannels.set(channelManager.getActiveChannelCount());
+    metrics.bufferedMessages.set(stats.totalBufferedMessages);
+    metrics.bufferedBytes.set(stats.totalBufferedBytes);
+    metrics.directInflightBytes.set(stats.totalDirectInflightBytes);
   }
 
   // Cleanup rate limit entries periodically
@@ -204,10 +217,11 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
         rateLimits.delete(ip);
       }
     }
+    refreshBufferMetrics();
   }, RATE_LIMIT_WINDOW_MS);
 
   io.on('connection', (socket) => {
-    const clientIp = getClientIp(socket);
+    const clientIp = normalizeClientIpForLimits(getTrustedClientIp(socket.request));
 
     if (!checkRateLimit(clientIp, 'connect', RATE_LIMIT_MAX_CONNECTIONS)) {
       metrics.rateLimitHits.inc({ bucket: 'connect' });
@@ -242,6 +256,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     metrics.activeSockets.inc();
     let currentChannelId: string | null = null;
     let releasedSocketCounter = false;
+    let joinInProgress = false;
 
     const releaseSocketCounter = (): void => {
       if (releasedSocketCounter) {
@@ -264,95 +279,130 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
      * The relay binds it to the channel and echoes it back to the wallet
      * on its join so the wallet can verify the fingerprint from the QR.
      */
-    socket.on('join_channel', (payload, rawCallback) => {
+    socket.on('join_channel', async (payload, rawCallback) => {
       const callback = toAck(rawCallback);
-      if (!checkRateLimit(clientIp, 'join', RATE_LIMIT_MAX_JOINS)) {
-        metrics.rateLimitHits.inc({ bucket: 'join' });
-        callback?.({ success: false, error: 'Join rate limit exceeded' });
+      if (joinInProgress) {
+        callback?.({ success: false, error: 'Another channel join is in progress' });
         return;
       }
+      joinInProgress = true;
+      let joinedRoom = false;
+      let joinedManager = false;
+      let requestedChannelId: string | null = null;
+      try {
+        if (!checkRateLimit(clientIp, 'join', RATE_LIMIT_MAX_JOINS)) {
+          metrics.rateLimitHits.inc({ bucket: 'join' });
+          callback?.({ success: false, error: 'Join rate limit exceeded' });
+          return;
+        }
 
-      const data = isRecord(payload) ? payload : {};
-      const channelId = data.channelId;
-      const clientType = data.clientType;
-      const publicKey = data.publicKey;
+        const data = isRecord(payload) ? payload : {};
+        const channelId = data.channelId;
+        const clientType = data.clientType;
+        const publicKey = data.publicKey;
 
-      if (!isValidChannelId(channelId)) {
-        callback?.({ success: false, error: 'Invalid channelId' });
-        return;
-      }
-      if (
-        !channelManager.getChannelInfo(channelId) &&
-        channelManager.getActiveChannelCount() >= CONFIG.RELAY_MAX_ACTIVE_CHANNELS
-      ) {
-        callback?.({ success: false, error: 'Relay channel capacity reached' });
-        return;
-      }
+        if (!isValidChannelId(channelId)) {
+          callback?.({ success: false, error: 'Invalid channelId' });
+          return;
+        }
+        requestedChannelId = channelId;
+        if (
+          !channelManager.getChannelInfo(channelId) &&
+          channelManager.getActiveChannelCount() >= CONFIG.RELAY_MAX_ACTIVE_CHANNELS
+        ) {
+          callback?.({ success: false, error: 'Relay channel capacity reached' });
+          return;
+        }
 
-      if (!isClientType(clientType)) {
-        callback?.({
-          success: false,
-          error: 'clientType must be "dapp" or "wallet"',
+        if (!isClientType(clientType)) {
+          callback?.({
+            success: false,
+            error: 'clientType must be "dapp" or "wallet"',
+          });
+          return;
+        }
+
+        if (publicKey !== undefined && typeof publicKey !== 'string') {
+          callback?.({ success: false, error: 'publicKey must be a base64 string' });
+          return;
+        }
+
+        const switchingChannels = currentChannelId !== null && currentChannelId !== channelId;
+        if (currentChannelId !== channelId) {
+          await socket.join(channelId);
+          joinedRoom = true;
+        }
+
+        const result = channelManager.join(channelId, socket.id, clientType, publicKey);
+
+        if (!result.success) {
+          if (joinedRoom) await socket.leave(channelId);
+          callback?.({ success: false, error: result.error });
+          return;
+        }
+
+        // Re-join to an explicitly closed (tombstoned) channel: report the
+        // tombstone so the peer drops its stored session, but do NOT park the
+        // socket in the dead room, point currentChannelId at it, or emit a
+        // phantom 'join'. channelManager.join() added no participant for a
+        // terminated channel and routing is refused there, so joining the room
+        // would only leak a spurious presence event to other re-joiners.
+        if (result.terminated) {
+          if (joinedRoom) await socket.leave(channelId);
+          callback?.({
+            success: true,
+            terminated: true,
+            participants: [],
+            channelPublicKey: null,
+            bufferedMessages: [],
+          });
+          return;
+        }
+        joinedManager = true;
+
+        if (switchingChannels && currentChannelId) {
+          const previousChannelId = currentChannelId;
+          const previousParticipant = channelManager.leave(socket.id, previousChannelId);
+          if (previousParticipant) {
+            socket.to(previousChannelId).emit('participants_changed', {
+              event: 'leave',
+              clientType: previousParticipant.clientType,
+            });
+          }
+          await socket.leave(previousChannelId);
+        }
+
+        metrics.channelJoins.inc({ status: 'success' });
+        refreshBufferMetrics();
+        currentChannelId = channelId;
+
+        // Notify other participant that counterparty joined
+        socket.to(channelId).emit('participants_changed', {
+          event: 'join',
+          clientType,
         });
-        return;
-      }
 
-      if (publicKey !== undefined && typeof publicKey !== 'string') {
-        callback?.({ success: false, error: 'publicKey must be a base64 string' });
-        return;
-      }
-
-      // Leave previous channel if any
-      if (currentChannelId && currentChannelId !== channelId) {
-        void socket.leave(currentChannelId);
-        channelManager.leave(socket.id, currentChannelId);
-      }
-
-      const result = channelManager.join(channelId, socket.id, clientType, publicKey);
-
-      if (!result.success) {
-        callback?.({ success: false, error: result.error });
-        return;
-      }
-
-      // Re-join to an explicitly closed (tombstoned) channel: report the
-      // tombstone so the peer drops its stored session, but do NOT park the
-      // socket in the dead room, point currentChannelId at it, or emit a
-      // phantom 'join'. channelManager.join() added no participant for a
-      // terminated channel and routing is refused there, so joining the room
-      // would only leak a spurious presence event to other re-joiners.
-      if (result.terminated) {
         callback?.({
           success: true,
-          terminated: true,
-          participants: [],
-          channelPublicKey: null,
-          bufferedMessages: [],
+          bufferedMessages: result.bufferedMessages,
+          channelPublicKey: result.channelPublicKey,
+          // Counterparty roster so a (re)joining peer can detect an absent
+          // wallet immediately; `terminated` flags a channel that was closed
+          // on purpose so the peer drops its stored session instead of waiting.
+          participants: result.participants,
+          terminated: result.terminated,
         });
-        return;
+      } catch {
+        if (joinedManager && requestedChannelId) {
+          channelManager.leave(socket.id, requestedChannelId);
+        }
+        if (joinedRoom && requestedChannelId) {
+          await Promise.resolve(socket.leave(requestedChannelId)).catch(() => undefined);
+        }
+        callback?.({ success: false, error: 'Unable to join channel' });
+      } finally {
+        joinInProgress = false;
       }
-
-      void socket.join(channelId);
-      metrics.channelJoins.inc({ status: 'success' });
-      metrics.activeChannels.set(channelManager.getActiveChannelCount());
-      currentChannelId = channelId;
-
-      // Notify other participant that counterparty joined
-      socket.to(channelId).emit('participants_changed', {
-        event: 'join',
-        clientType,
-      });
-
-      callback?.({
-        success: true,
-        bufferedMessages: result.bufferedMessages,
-        channelPublicKey: result.channelPublicKey,
-        // Counterparty roster so a (re)joining peer can detect an absent
-        // wallet immediately; `terminated` flags a channel that was closed
-        // on purpose so the peer drops its stored session instead of waiting.
-        participants: result.participants,
-        terminated: result.terminated,
-      });
     });
 
     /**
@@ -370,17 +420,43 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
       const data = isRecord(payload) ? payload : {};
       const channelId = data.id;
       const message = data.message;
+      const clientType = data.clientType;
+      const seq = data.seq;
 
-      if (!isValidChannelId(channelId) || !message) {
-        callback?.({ success: false, error: 'Invalid channelId or missing message' });
+      if (
+        !isValidChannelId(channelId) ||
+        message === undefined ||
+        message === null ||
+        !isClientType(clientType)
+      ) {
+        callback?.({ success: false, error: 'Invalid channelId, clientType, or missing message' });
         return;
       }
-      if (getMessageSizeBytes(message) > MAX_MESSAGE_BYTES) {
+      if (seq !== undefined && (typeof seq !== 'number' || !Number.isSafeInteger(seq) || seq < 0)) {
+        callback?.({ success: false, error: 'seq must be a non-negative safe integer' });
+        return;
+      }
+
+      const payloadSize = getMessageSizeBytes(payload);
+      if (payloadSize > MAX_MESSAGE_BYTES) {
         callback?.({ success: false, error: 'Message payload too large' });
         return;
       }
 
-      const result = channelManager.routeMessage(channelId, socket.id, payload);
+      const canonicalPayload: RelayPayload =
+        seq === undefined
+          ? { id: channelId, clientType, message }
+          : { id: channelId, clientType, message, seq };
+      const result = channelManager.routeMessage(channelId, socket.id, canonicalPayload, clientIp);
+
+      if (result.backpressuredSocketId !== undefined) {
+        const slowTarget = io.sockets.sockets.get(result.backpressuredSocketId);
+        if (channelManager.hasDirectDelivery(result.backpressuredSocketId)) {
+          disconnectAfterDrain.add(result.backpressuredSocketId);
+        } else {
+          slowTarget?.disconnect(true);
+        }
+      }
 
       if (result.error !== undefined) {
         callback?.({ success: false, error: result.error });
@@ -388,10 +464,19 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
       }
 
       if (result.targetSocketId !== undefined) {
-        // Deliver directly to counterparty
-        io.to(result.targetSocketId).emit('message', payload);
+        const target = io.sockets.sockets.get(result.targetSocketId);
+        if (!target || !armDirectDelivery(result.targetSocketId)) {
+          releaseDirectDelivery(result.targetSocketId);
+          target?.disconnect(true);
+          callback?.({ success: false, error: 'Counterparty transport unavailable' });
+          return;
+        }
+        // The transport was writable at admission and the delivery is reserved
+        // until its actual transport drain. Volatile is a final race guard: it
+        // prevents Socket.IO from silently creating a second unaccounted queue.
+        target.volatile.emit('message', canonicalPayload);
         metrics.messagesRouted.inc({ status: 'delivered' });
-        metrics.messageSize.observe(getMessageSizeBytes(message));
+        metrics.messageSize.observe(payloadSize);
       }
 
       callback?.({ success: true, buffered: result.buffered });
@@ -405,6 +490,11 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
      */
     socket.on('leave_channel', (payload, rawCallback) => {
       const callback = toAck(rawCallback);
+      if (!checkRateLimit(clientIp, 'control', RATE_LIMIT_MAX_CONTROL_EVENTS)) {
+        metrics.rateLimitHits.inc({ bucket: 'control' });
+        callback?.({ success: false, error: 'Control rate limit exceeded' });
+        return;
+      }
       const requested = isRecord(payload) ? payload.channelId : undefined;
       const channelId = typeof requested === 'string' && requested ? requested : currentChannelId;
 
@@ -438,6 +528,11 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
      */
     socket.on('close_channel', (payload, rawCallback) => {
       const callback = toAck(rawCallback);
+      if (!checkRateLimit(clientIp, 'control', RATE_LIMIT_MAX_CONTROL_EVENTS)) {
+        metrics.rateLimitHits.inc({ bucket: 'control' });
+        callback?.({ success: false, error: 'Control rate limit exceeded' });
+        return;
+      }
       const requested = isRecord(payload) ? payload.channelId : undefined;
       const channelId = typeof requested === 'string' && requested ? requested : currentChannelId;
 
@@ -453,6 +548,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
 
         if (participant) {
           channelManager.close(channelId);
+          refreshBufferMetrics();
 
           // Tell a currently-connected counterparty this was an explicit
           // close, distinct from a transient 'disconnect'.
@@ -475,6 +571,11 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
      */
     socket.on('ping', (rawCallback) => {
       const callback = toAck(rawCallback);
+      if (!checkRateLimit(clientIp, 'control', RATE_LIMIT_MAX_CONTROL_EVENTS)) {
+        metrics.rateLimitHits.inc({ bucket: 'control' });
+        callback?.({ success: false, error: 'Control rate limit exceeded' });
+        return;
+      }
       callback?.({ type: 'pong', timestamp: Date.now() });
     });
 
@@ -484,6 +585,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     socket.on('disconnect', () => {
       metrics.activeSockets.dec();
       releaseSocketCounter();
+      releaseDirectDelivery(socket.id);
       if (currentChannelId) {
         const participant = channelManager.leave(socket.id, currentChannelId);
 
@@ -504,7 +606,13 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     clearInterval(rateLimitCleanupTimer);
     activeSocketsByIp.clear();
     rateLimits.clear();
+    for (const socketId of directDrainListeners.keys()) releaseDirectDelivery(socketId);
+    disconnectAfterDrain.clear();
     channelManager.destroy();
+    metrics.activeChannels.set(0);
+    metrics.bufferedMessages.set(0);
+    metrics.bufferedBytes.set(0);
+    metrics.directInflightBytes.set(0);
     io.removeAllListeners();
   };
 

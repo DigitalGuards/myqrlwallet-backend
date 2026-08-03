@@ -1,6 +1,7 @@
 import { CONFIG } from '../../config/index.js';
 import { logger } from '../../utils/logger.js';
 import { isRecord, toError } from '../../utils/guards.js';
+import { BoundedJsonError, readBoundedJsonResponse } from '../../utils/bounded-json.js';
 import { notify } from '../notifier.js';
 
 export type EndpointState = 'up' | 'down' | 'stalled' | 'unknown';
@@ -9,6 +10,7 @@ const STATE_UP: EndpointState = 'up';
 const STATE_DOWN: EndpointState = 'down';
 const STATE_STALLED: EndpointState = 'stalled';
 const STATE_UNKNOWN: EndpointState = 'unknown';
+const HEALTH_RESPONSE_MAX_BYTES = 16 * 1024;
 
 const STATE_ORDER: Record<EndpointState, number> = {
   [STATE_UP]: 0,
@@ -61,6 +63,16 @@ function parseHexHeight(hex: unknown): number | null {
   if (typeof hex !== 'string' || !hex.startsWith('0x')) return null;
   const n = Number.parseInt(hex.slice(2), 16);
   return Number.isFinite(n) ? n : null;
+}
+
+/** Convert untrusted fetch failures into stable, credential-free categories. */
+function sanitizeHealthError(error: unknown): Error {
+  const err = toError(error);
+  if (err instanceof BoundedJsonError) return new Error(err.message);
+  if (err.name === 'AbortError') return new Error('upstream request timed out');
+  if (/^HTTP \d{3}$/.test(err.message)) return new Error(err.message);
+  if (err.message === 'Unparseable qrl_blockNumber result') return new Error(err.message);
+  return new Error('upstream health check failed');
 }
 
 class HealthMonitor {
@@ -149,23 +161,9 @@ class HealthMonitor {
     this.init();
     const endpoints = this.networks.get(network);
     if (!endpoints) return false;
-    // Stalled endpoints still route requests (with stale data), so /health
-    // mirrors that: 503 only when every endpoint is fully `down`. The
-    // per-endpoint `state` in the response surfaces stalled vs up.
-    return endpoints.some((e) => e.state !== STATE_DOWN);
-  }
-
-  recordRequestResult(network: string, url: string, ok: boolean, error?: unknown): void {
-    this.init();
-    const endpoints = this.networks.get(network);
-    if (!endpoints) return;
-    const ep = endpoints.find((e) => e.url === url);
-    if (!ep) return;
-    if (ok) {
-      this.applyRequestSuccess(network, ep);
-    } else {
-      this.applyFailure(network, ep, error);
-    }
+    // Only a confirmed-up endpoint makes the network ready. Unknown startup
+    // state, stalled chain height and transport failure all fail readiness.
+    return endpoints.some((e) => e.state === STATE_UP);
   }
 
   getSnapshot(): HealthSnapshot {
@@ -215,14 +213,19 @@ class HealthMonitor {
           params: [],
         }),
         signal: controller.signal,
+        redirect: 'error',
       });
       ep.lastPollAt = Date.now();
       ep.lastLatencyMs = Date.now() - start;
       if (!response.ok) {
+        controller.abort();
         this.applyFailure(network, ep, new Error(`HTTP ${response.status}`));
         return;
       }
-      const json: unknown = await response.json();
+      // qrl_blockNumber is a tiny envelope. Bound even this operator poll so
+      // a compromised or misconfigured upstream cannot stream the process out
+      // of memory outside the client-facing RPC admission controls.
+      const json = await readBoundedJsonResponse(response, controller, HEALTH_RESPONSE_MAX_BYTES);
       const height = parseHexHeight(isRecord(json) ? json.result : undefined);
       if (height === null) {
         this.applyFailure(network, ep, new Error('Unparseable qrl_blockNumber result'));
@@ -314,38 +317,9 @@ class HealthMonitor {
     }
   }
 
-  applyRequestSuccess(network: string, ep: EndpointRecord): void {
-    ep.consecutiveFailures = 0;
-    ep.consecutiveSuccesses += 1;
-    ep.lastError = null;
-    const previousState = ep.state;
-    let newState = previousState;
-    if (
-      previousState === STATE_DOWN &&
-      ep.consecutiveSuccesses >= CONFIG.RPC_HEALTH.UP_AFTER_SUCCESSES
-    ) {
-      newState = STATE_UP;
-    } else if (previousState === STATE_UNKNOWN) {
-      // A real request succeeded: flip out of unknown immediately rather
-      // than waiting for the next background poll. Otherwise the selector
-      // keeps ranking this endpoint behind any sibling already at `up`.
-      newState = STATE_UP;
-    }
-    if (newState !== previousState) {
-      ep.state = newState;
-      notify({
-        severity: 'info',
-        network,
-        endpoint: ep.url,
-        event: 'up',
-        detail: { source: 'request', previousState },
-      });
-    }
-  }
-
   applyFailure(network: string, ep: EndpointRecord, error: unknown): void {
     const previousState = ep.state;
-    const err = toError(error);
+    const err = sanitizeHealthError(error);
     ep.consecutiveFailures += 1;
     ep.consecutiveSuccesses = 0;
     ep.lastError = err;

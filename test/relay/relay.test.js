@@ -28,13 +28,14 @@ function startRelay(configOverrides = {}) {
   }
 
   const httpServer = createServer();
-  const { io, destroy } = createRelayServer(httpServer);
+  const { io, channelManager, destroy } = createRelayServer(httpServer);
 
   return new Promise((resolve) => {
     httpServer.listen(0, () => {
       const port = httpServer.address().port;
       resolve({
         io,
+        channelManager,
         httpServer,
         port,
         cleanup: () => {
@@ -241,6 +242,17 @@ describe('Relay Server', function () {
 
     // ── v2 PK-binding semantics ─────────────────────────────────────────
 
+    it('should pin a joined socket to its original clientType', async () => {
+      const socket = await connect(relay.port);
+      expect((await joinChannel(socket, 'ch-role-pin', 'dapp')).success).to.equal(true);
+
+      const switched = await joinChannel(socket, 'ch-role-pin', 'wallet');
+
+      expect(switched.success).to.equal(false);
+      expect(switched.error).to.include('cannot change clientType');
+      await disconnect(socket);
+    });
+
     it('should bind a dapp public key to the channel on first join', async () => {
       const dapp = await connect(relay.port);
       const resp = await joinChannel(dapp, 'ch-pk-bind', 'dapp', TEST_DAPP_PK);
@@ -358,6 +370,45 @@ describe('Relay Server', function () {
 
       await disconnect(replacement);
       for (const s of sockets) await disconnect(s);
+    });
+  });
+
+  describe('trusted proxy attribution', () => {
+    it('ignores spoofed vendor IP headers from a direct peer', async () => {
+      const relay = await startRelay({
+        RELAY_MAX_SOCKETS_PER_IP: 2,
+        TRUSTED_PROXY_CIDRS: [],
+      });
+      const sockets = [];
+      try {
+        for (let i = 0; i < 2; i++) {
+          sockets.push(
+            await connect(relay.port, {
+              extraHeaders: { 'CF-Connecting-IP': `198.51.100.${i + 1}` },
+            })
+          );
+        }
+
+        let extra = null;
+        try {
+          extra = await connect(relay.port, {
+            extraHeaders: { 'CF-Connecting-IP': '198.51.100.200' },
+          });
+        } catch {
+          // A connection-level rejection is also a successful cap outcome.
+        }
+        if (extra) {
+          await new Promise((resolve) => {
+            extra.on('disconnect', resolve);
+            setTimeout(resolve, 500);
+          });
+          expect(extra.connected).to.be.false;
+          extra.close();
+        }
+      } finally {
+        for (const socket of sockets) await disconnect(socket);
+        relay.cleanup();
+      }
     });
   });
 
@@ -523,6 +574,94 @@ describe('Relay Server', function () {
     });
   });
 
+  describe('atomic channel switching', () => {
+    let relay;
+
+    before(async () => {
+      relay = await startRelay();
+    });
+    after(() => relay.cleanup());
+
+    it('preserves the old channel when the new channel has a role conflict', async () => {
+      const switchingDapp = await connect(relay.port);
+      const oldWallet = await connect(relay.port);
+      const conflictingDapp = await connect(relay.port);
+      await joinChannel(switchingDapp, 'switch-old-conflict', 'dapp');
+      await joinChannel(oldWallet, 'switch-old-conflict', 'wallet');
+      await joinChannel(conflictingDapp, 'switch-new-conflict', 'dapp');
+
+      const notices = [];
+      oldWallet.on('participants_changed', (notice) => notices.push(notice));
+      const conflict = await joinChannel(switchingDapp, 'switch-new-conflict', 'dapp');
+      expect(conflict.success).to.equal(false);
+      expect(conflict.error).to.include('already connected');
+
+      const received = waitForEvent(oldWallet, 'message');
+      const routed = await sendMessage(
+        switchingDapp,
+        'switch-old-conflict',
+        'old-channel-still-live'
+      );
+      expect(routed.success).to.equal(true);
+      expect((await received).message).to.equal('old-channel-still-live');
+      expect(notices).to.deep.equal([]);
+
+      const disconnected = waitForEvent(oldWallet, 'participants_changed');
+      await disconnect(switchingDapp);
+      expect((await disconnected).event).to.equal('disconnect');
+      await disconnect(oldWallet);
+      await disconnect(conflictingDapp);
+    });
+
+    it('preserves the old channel when the requested channel is tombstoned', async () => {
+      const switchingDapp = await connect(relay.port);
+      const oldWallet = await connect(relay.port);
+      const closer = await connect(relay.port);
+      await joinChannel(switchingDapp, 'switch-old-tombstone', 'dapp');
+      await joinChannel(oldWallet, 'switch-old-tombstone', 'wallet');
+      await joinChannel(closer, 'switch-dead', 'dapp');
+      await new Promise((resolve) => {
+        closer.emit('close_channel', { channelId: 'switch-dead' }, resolve);
+      });
+
+      const tombstone = await joinChannel(switchingDapp, 'switch-dead', 'dapp');
+      expect(tombstone.success).to.equal(true);
+      expect(tombstone.terminated).to.equal(true);
+
+      const received = waitForEvent(oldWallet, 'message');
+      const routed = await sendMessage(
+        switchingDapp,
+        'switch-old-tombstone',
+        'old-channel-survived'
+      );
+      expect(routed.success).to.equal(true);
+      expect((await received).message).to.equal('old-channel-survived');
+
+      await disconnect(switchingDapp);
+      await disconnect(oldWallet);
+      await disconnect(closer);
+    });
+
+    it('emits one leave event after a successful channel switch', async () => {
+      const dapp = await connect(relay.port);
+      const oldWallet = await connect(relay.port);
+      await joinChannel(dapp, 'switch-old-success', 'dapp');
+      await joinChannel(oldWallet, 'switch-old-success', 'wallet');
+
+      const notice = waitForEvent(oldWallet, 'participants_changed');
+      const switched = await joinChannel(dapp, 'switch-new-success', 'dapp');
+
+      expect(switched.success).to.equal(true);
+      expect(await notice).to.deep.equal({ event: 'leave', clientType: 'dapp' });
+      expect((await sendMessage(dapp, 'switch-old-success', 'must-not-route')).error).to.equal(
+        'Sender not in channel'
+      );
+
+      await disconnect(dapp);
+      await disconnect(oldWallet);
+    });
+  });
+
   // ── Leave channel ────────────────────────────────────────────────────
 
   describe('leave channel', () => {
@@ -597,6 +736,17 @@ describe('Relay Server', function () {
       expect(overLimit.error).to.include('Rate limit');
 
       await disconnect(dapp);
+    });
+
+    it('rate limits custom control events', async () => {
+      const socket = await connect(relay.port);
+      let response;
+      for (let i = 0; i < 301; i++) {
+        response = await new Promise((resolve) => socket.emit('ping', resolve));
+      }
+      expect(response.success).to.equal(false);
+      expect(response.error).to.include('Control rate limit');
+      await disconnect(socket);
     });
   });
 
@@ -691,6 +841,140 @@ describe('Relay Server', function () {
       });
       expect(resp.type).to.equal('pong');
       await disconnect(s);
+    });
+  });
+
+  describe('message canonicalization', () => {
+    it('drops unrecognized payload fields before forwarding', async () => {
+      const relay = await startRelay();
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      try {
+        await joinChannel(dapp, 'canonical-msg', 'dapp');
+        await joinChannel(wallet, 'canonical-msg', 'wallet');
+
+        const receivedPromise = waitForEvent(wallet, 'message');
+        const ackPromise = new Promise((resolve) => {
+          dapp.emit(
+            'message',
+            {
+              id: 'canonical-msg',
+              clientType: 'dapp',
+              message: 'ciphertext',
+              seq: 7,
+              attackerPadding: 'x'.repeat(100_000),
+            },
+            resolve
+          );
+        });
+
+        expect((await ackPromise).success).to.be.true;
+        expect(await receivedPromise).to.deep.equal({
+          id: 'canonical-msg',
+          clientType: 'dapp',
+          message: 'ciphertext',
+          seq: 7,
+        });
+      } finally {
+        await disconnect(dapp);
+        await disconnect(wallet);
+        relay.cleanup();
+      }
+    });
+  });
+
+  describe('live egress budgets', () => {
+    it('bounds a stalled target and drains buffered work through reconnect', async () => {
+      const relay = await startRelay({
+        RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: 1800,
+        RELAY_MAX_BUFFERED_BYTES_PER_IP: 1800,
+        RELAY_MAX_BUFFERED_BYTES_GLOBAL: 1800,
+      });
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      let replacement;
+      try {
+        await joinChannel(dapp, 'live-egress-budget', 'dapp');
+        await joinChannel(wallet, 'live-egress-budget', 'wallet');
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const target = relay.io.sockets.sockets.get(wallet.id);
+        const transport = target.conn.transport;
+        const originalSend = transport.send;
+        transport.send = function () {
+          this.writable = false;
+        };
+        transport.writable = true;
+
+        const payload = 'x'.repeat(700);
+        const first = await sendMessage(dapp, 'live-egress-budget', payload);
+        expect(first).to.deep.include({ success: true, buffered: false });
+
+        const second = await sendMessage(dapp, 'live-egress-budget', `${payload}2`);
+        expect(second).to.deep.include({ success: true, buffered: true });
+
+        const rejected = await sendMessage(dapp, 'live-egress-budget', `${payload}3`);
+        expect(rejected.success).to.equal(false);
+        expect(rejected.error).to.include('capacity exceeded');
+
+        const stats = relay.channelManager.getStats();
+        expect(stats.totalDirectInflightBytes).to.be.greaterThan(0);
+        expect(stats.totalBufferedMessages).to.equal(1);
+        expect(stats.totalDirectInflightBytes + stats.totalBufferedBytes).to.be.at.most(1800);
+        expect(target.conn.writeBuffer.length).to.equal(0);
+
+        const disconnected = waitForEvent(wallet, 'disconnect');
+        transport.send = originalSend;
+        transport.emit('drain');
+        transport.writable = true;
+        transport.emit('ready');
+        await disconnected;
+        expect(relay.channelManager.getStats().totalDirectInflightBytes).to.equal(0);
+
+        replacement = await connect(relay.port);
+        const rejoined = await joinChannel(replacement, 'live-egress-budget', 'wallet');
+        expect(rejoined.success).to.equal(true);
+        expect(rejoined.bufferedMessages).to.have.length(1);
+        expect(rejoined.bufferedMessages[0].message).to.equal(`${payload}2`);
+      } finally {
+        await disconnect(dapp);
+        await disconnect(wallet);
+        if (replacement) await disconnect(replacement);
+        relay.cleanup();
+      }
+    });
+
+    it('does not traverse every channel after each routed message', async () => {
+      const relay = await startRelay();
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      try {
+        await joinChannel(dapp, 'metrics-cost', 'dapp');
+        await joinChannel(wallet, 'metrics-cost', 'wallet');
+
+        const originalGetStats = relay.channelManager.getStats.bind(relay.channelManager);
+        const originalGetActive = relay.channelManager.getActiveChannelCount.bind(
+          relay.channelManager
+        );
+        let traversals = 0;
+        relay.channelManager.getStats = () => {
+          traversals += 1;
+          return originalGetStats();
+        };
+        relay.channelManager.getActiveChannelCount = () => {
+          traversals += 1;
+          return originalGetActive();
+        };
+
+        const received = waitForEvent(wallet, 'message');
+        expect((await sendMessage(dapp, 'metrics-cost', 'ciphertext')).success).to.equal(true);
+        await received;
+        expect(traversals).to.equal(0);
+      } finally {
+        await disconnect(dapp);
+        await disconnect(wallet);
+        relay.cleanup();
+      }
     });
   });
 
@@ -810,6 +1094,17 @@ describe('Relay Server', function () {
   // ── ChannelManager unit: tombstone memory hygiene ────────────────────
 
   describe('ChannelManager tombstones', () => {
+    it('does not allocate a channel for an invalid public key', () => {
+      const cm = new ChannelManager();
+      try {
+        const result = cm.join('invalid-key-no-allocation', 'sock-a', 'dapp', 'not base64!');
+        expect(result.success).to.equal(false);
+        expect(cm.getChannelInfo('invalid-key-no-allocation')).to.equal(null);
+      } finally {
+        cm.destroy();
+      }
+    });
+
     it('close() clears heavy channel state but keeps the tombstone flag', () => {
       const cm = new ChannelManager();
       try {
@@ -818,6 +1113,7 @@ describe('Relay Server', function () {
         cm.join('unit-close', 'sock-d', 'dapp', 'YQ==');
         const routed = cm.routeMessage('unit-close', 'sock-d', {
           id: 'unit-close',
+          clientType: 'dapp',
           message: 'x',
           seq: 0,
         });
@@ -840,7 +1136,12 @@ describe('Relay Server', function () {
         expect(cm.getActiveChannelCount()).to.equal(0);
         // ... and routing through it is refused.
         expect(
-          cm.routeMessage('unit-close', 'sock-d', { id: 'unit-close', message: 'y', seq: 1 }).error
+          cm.routeMessage('unit-close', 'sock-d', {
+            id: 'unit-close',
+            clientType: 'dapp',
+            message: 'y',
+            seq: 1,
+          }).error
         ).to.equal('Channel terminated');
       } finally {
         clearInterval(cm.cleanupTimer);
@@ -865,6 +1166,134 @@ describe('Relay Server', function () {
       } finally {
         clearInterval(cm.cleanupTimer);
       }
+    });
+  });
+
+  describe('ChannelManager buffered-byte budgets', () => {
+    const budgetKeys = [
+      'RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL',
+      'RELAY_MAX_BUFFERED_BYTES_PER_IP',
+      'RELAY_MAX_BUFFERED_BYTES_GLOBAL',
+    ];
+
+    function withBudgets(overrides, fn) {
+      const originals = {};
+      for (const key of budgetKeys) originals[key] = CONFIG[key];
+      Object.assign(CONFIG, overrides);
+      try {
+        fn();
+      } finally {
+        Object.assign(CONFIG, originals);
+      }
+    }
+
+    it('enforces the per-channel byte cap and releases accounting on delivery', () => {
+      const payload = {
+        id: 'bytes-ch',
+        clientType: 'dapp',
+        message: 'x'.repeat(64),
+      };
+      const bytes = Buffer.byteLength(JSON.stringify(payload));
+
+      withBudgets(
+        {
+          RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: bytes,
+          RELAY_MAX_BUFFERED_BYTES_PER_IP: bytes * 10,
+          RELAY_MAX_BUFFERED_BYTES_GLOBAL: bytes * 10,
+        },
+        () => {
+          const cm = new ChannelManager();
+          try {
+            cm.join('bytes-ch', 'dapp-socket', 'dapp');
+            expect(cm.routeMessage('bytes-ch', 'dapp-socket', payload, '192.0.2.1').buffered).to.be
+              .true;
+            expect(cm.getStats().totalBufferedBytes).to.equal(bytes);
+
+            const rejected = cm.routeMessage('bytes-ch', 'dapp-socket', payload, '192.0.2.1');
+            expect(rejected.error).to.include('Channel buffered-byte');
+
+            const walletJoin = cm.join('bytes-ch', 'wallet-socket', 'wallet');
+            expect(walletJoin.success).to.be.true;
+            expect(walletJoin.bufferedMessages).to.have.length(1);
+            expect(cm.getStats().totalBufferedBytes).to.equal(0);
+          } finally {
+            cm.destroy();
+          }
+        }
+      );
+    });
+
+    it('retains live-egress accounting until transport drain after a leave', () => {
+      const cm = new ChannelManager({ canSocketReceive: () => true });
+      try {
+        cm.join('leave-inflight', 'dapp-socket', 'dapp');
+        cm.join('leave-inflight', 'wallet-socket', 'wallet');
+        const routed = cm.routeMessage(
+          'leave-inflight',
+          'dapp-socket',
+          { id: 'leave-inflight', clientType: 'dapp', message: 'ciphertext' },
+          '192.0.2.1'
+        );
+        expect(routed.targetSocketId).to.equal('wallet-socket');
+        const reserved = cm.getStats().totalDirectInflightBytes;
+        expect(reserved).to.be.greaterThan(0);
+
+        cm.leave('wallet-socket', 'leave-inflight');
+        expect(cm.getStats().totalDirectInflightBytes).to.equal(reserved);
+
+        cm.releaseDirectDelivery('wallet-socket');
+        expect(cm.getStats().totalDirectInflightBytes).to.equal(0);
+      } finally {
+        cm.destroy();
+      }
+    });
+
+    it('enforces per-IP and global buffered-byte caps across channels', () => {
+      const first = { id: 'budget-a', clientType: 'dapp', message: 'x'.repeat(32) };
+      const second = { id: 'budget-b', clientType: 'dapp', message: 'x'.repeat(32) };
+      const bytes = Buffer.byteLength(JSON.stringify(first));
+
+      withBudgets(
+        {
+          RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: bytes * 10,
+          RELAY_MAX_BUFFERED_BYTES_PER_IP: bytes,
+          RELAY_MAX_BUFFERED_BYTES_GLOBAL: bytes * 10,
+        },
+        () => {
+          const cm = new ChannelManager();
+          try {
+            cm.join('budget-a', 'socket-a', 'dapp');
+            cm.join('budget-b', 'socket-b', 'dapp');
+            expect(cm.routeMessage('budget-a', 'socket-a', first, '192.0.2.1').buffered).to.be.true;
+            expect(cm.routeMessage('budget-b', 'socket-b', second, '192.0.2.1').error).to.include(
+              'Per-IP buffered-byte'
+            );
+          } finally {
+            cm.destroy();
+          }
+        }
+      );
+
+      withBudgets(
+        {
+          RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: bytes * 10,
+          RELAY_MAX_BUFFERED_BYTES_PER_IP: bytes * 10,
+          RELAY_MAX_BUFFERED_BYTES_GLOBAL: bytes,
+        },
+        () => {
+          const cm = new ChannelManager();
+          try {
+            cm.join('budget-a', 'socket-a', 'dapp');
+            cm.join('budget-b', 'socket-b', 'dapp');
+            expect(cm.routeMessage('budget-a', 'socket-a', first, '192.0.2.1').buffered).to.be.true;
+            expect(cm.routeMessage('budget-b', 'socket-b', second, '192.0.2.2').error).to.include(
+              'Global buffered-byte'
+            );
+          } finally {
+            cm.destroy();
+          }
+        }
+      );
     });
   });
 });

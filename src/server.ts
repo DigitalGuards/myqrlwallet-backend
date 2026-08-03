@@ -5,7 +5,13 @@ import { CONFIG } from './config/index.js';
 import { createRelayServer } from './relay/relayServer.js';
 import { timingSafeEqualStrings } from './crypto/primitives.js';
 import { logger } from './utils/logger.js';
-import { activeChannels, bufferedMessages, register } from './relay/metrics.js';
+import {
+  activeChannels,
+  bufferedBytes,
+  bufferedMessages,
+  directInflightBytes,
+  register,
+} from './relay/metrics.js';
 import { healthMonitor } from './services/rpc/healthMonitor.js';
 
 const httpServer = createServer(app);
@@ -41,6 +47,8 @@ function refreshRelayGauges(): void {
   const stats = relay.channelManager.getStats();
   activeChannels.set(relay.channelManager.getActiveChannelCount());
   bufferedMessages.set(stats.totalBufferedMessages);
+  bufferedBytes.set(stats.totalBufferedBytes);
+  directInflightBytes.set(stats.totalDirectInflightBytes);
 }
 
 // Relay stats health endpoint
@@ -81,8 +89,8 @@ process.on('SIGTERM', () => {
   shutdown('SIGTERM');
 });
 
-httpServer.listen(CONFIG.PORT, () => {
-  logger.info({ port: CONFIG.PORT }, 'Server started');
+httpServer.listen(CONFIG.PORT, CONFIG.LISTEN_HOST, () => {
+  logger.info({ host: CONFIG.LISTEN_HOST, port: CONFIG.PORT }, 'Server started');
   logger.info('Socket.IO relay available at /relay');
   healthMonitor.start();
 });

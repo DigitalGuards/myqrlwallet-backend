@@ -16,7 +16,9 @@ const txHistoryRateLimit = rateLimit({
 });
 
 const TX_HISTORY_MAX_LIMIT = 50;
+const TX_HISTORY_MAX_PAGE = 100_000;
 const TX_HISTORY_TIMEOUT_MS = 8000;
+const TX_HISTORY_MAX_RESPONSE_BYTES = 2 * 1024 * 1024;
 
 const clampPositiveInt = (raw: unknown, fallback: number, max: number | null): number => {
   const n = Number(raw);
@@ -42,7 +44,7 @@ appRouter.post(
     // limit=100000 forces zondscan to return (and us to buffer) an enormous
     // response, and a no-timeout axios call below would block the worker for
     // the full TCP timeout (~2 min) if zondscan stalls.
-    const page = clampPositiveInt(isRecord(body) ? body.page : undefined, 1, null);
+    const page = clampPositiveInt(isRecord(body) ? body.page : undefined, 1, TX_HISTORY_MAX_PAGE);
     const limit = clampPositiveInt(
       isRecord(body) ? body.limit : undefined,
       5,
@@ -53,7 +55,15 @@ appRouter.post(
     try {
       const response = await axios.get<unknown>(
         `https://zondscan.com/api/address/${formattedAddress}/transactions`,
-        { params: { page, limit }, timeout: TX_HISTORY_TIMEOUT_MS }
+        {
+          params: { page, limit },
+          timeout: TX_HISTORY_TIMEOUT_MS,
+          maxContentLength: TX_HISTORY_MAX_RESPONSE_BYTES,
+          // Keep this fixed-origin proxy from following a compromised
+          // upstream redirect into loopback, metadata, or another private
+          // service.
+          maxRedirects: 0,
+        }
       );
       log.debug({ address: formattedAddress }, 'Tx history fetched');
       res.status(200).json(response.data);
