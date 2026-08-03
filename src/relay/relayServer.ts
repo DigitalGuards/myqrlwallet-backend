@@ -575,34 +575,43 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
       const requested = isRecord(payload) ? payload.channelId : undefined;
       const channelId = typeof requested === 'string' && requested ? requested : currentChannelId;
 
-      if (isValidChannelId(channelId)) {
-        // Authorize: only an actual participant may terminate the channel.
-        // leave() returns the participant record (and null if this socket is
-        // not in the channel), so it doubles as the membership check. This
-        // blocks an attacker from closing arbitrary channels by guessing a
-        // channelId, and from creating tombstones for channels they were
-        // never part of (the close() below only marks an existing channel).
-        void socket.leave(channelId);
-        const participant = channelManager.leave(socket.id, channelId);
-
-        if (participant) {
-          channelManager.close(channelId);
-          refreshBufferMetrics();
-
-          // Tell a currently-connected counterparty this was an explicit
-          // close, distinct from a transient 'disconnect'.
-          socket.to(channelId).emit('participants_changed', {
-            event: 'close',
-            clientType: participant.clientType,
-          });
-
-          if (currentChannelId === channelId) {
-            currentChannelId = null;
-          }
-        }
+      if (!isValidChannelId(channelId)) {
+        callback?.({
+          success: false,
+          terminated: false,
+          error: 'Channel close was not confirmed',
+        });
+        return;
       }
 
-      callback?.({ success: true });
+      // Only an actual participant may terminate the channel. Return the same
+      // failure for unknown channels and non-participants so the ack cannot be
+      // mistaken for a durable tombstone or used as a channel-existence probe.
+      const participant = channelManager.leave(socket.id, channelId);
+      if (!participant || !channelManager.close(channelId)) {
+        callback?.({
+          success: false,
+          terminated: false,
+          error: 'Channel close was not confirmed',
+        });
+        return;
+      }
+
+      void socket.leave(channelId);
+      refreshBufferMetrics();
+
+      // Tell a currently-connected counterparty this was an explicit close,
+      // distinct from a transient disconnect.
+      socket.to(channelId).emit('participants_changed', {
+        event: 'close',
+        clientType: participant.clientType,
+      });
+
+      if (currentChannelId === channelId) {
+        currentChannelId = null;
+      }
+
+      callback?.({ success: true, terminated: true });
     });
 
     /**
