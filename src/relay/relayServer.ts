@@ -113,8 +113,10 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
   });
 
-  const directDrainListeners = new Map<string, { transport: Transport; onDrain: () => void }>();
-  const disconnectAfterDrain = new Set<string>();
+  const directTransportListeners = new Map<
+    string,
+    { transport: Transport; event: 'drain' | 'ready'; listener: () => void }
+  >();
 
   const channelManager = new ChannelManager({
     isSocketActive: (socketId) => io.sockets.sockets.has(socketId),
@@ -124,35 +126,74 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
         target?.connected === true &&
         target.conn.readyState === 'open' &&
         target.conn.transport.writable &&
-        !directDrainListeners.has(socketId)
+        !directTransportListeners.has(socketId)
       );
     },
   });
 
   function releaseDirectDelivery(socketId: string): void {
-    const armed = directDrainListeners.get(socketId);
+    const armed = directTransportListeners.get(socketId);
     if (armed) {
-      armed.transport.removeListener('drain', armed.onDrain);
-      directDrainListeners.delete(socketId);
+      armed.transport.removeListener(armed.event, armed.listener);
+      directTransportListeners.delete(socketId);
     }
-    disconnectAfterDrain.delete(socketId);
     channelManager.releaseDirectDelivery(socketId);
+  }
+
+  function waitForDirectReady(socketId: string, transport: Transport): void {
+    const onReady = (): void => {
+      directTransportListeners.delete(socketId);
+      const target = io.sockets.sockets.get(socketId);
+      if (!target?.connected || target.conn.readyState !== 'open') {
+        channelManager.releaseDirectDelivery(socketId);
+        return;
+      }
+
+      // Engine.IO's own ready listener runs first and can consume the newly
+      // writable transport for an existing control packet. Wait for its next
+      // ready cycle while the relay's reservation remains fully accounted.
+      if (!target.conn.transport.writable) {
+        waitForDirectReady(socketId, target.conn.transport);
+        return;
+      }
+
+      // Arm the next drain before moving an accepted buffered message into
+      // the single direct reservation. All checks and the promotion happen in
+      // one synchronous turn, so a failed arm leaves the message buffered for
+      // reconnect.
+      if (!armDirectDelivery(socketId)) {
+        channelManager.releaseDirectDelivery(socketId);
+        target.disconnect(true);
+        return;
+      }
+
+      const nextPayload = channelManager.advanceDirectDelivery(socketId);
+      if (!nextPayload) {
+        releaseDirectDelivery(socketId);
+        return;
+      }
+
+      target.volatile.emit('message', nextPayload);
+    };
+    directTransportListeners.set(socketId, { transport, event: 'ready', listener: onReady });
+    transport.once('ready', onReady);
   }
 
   function armDirectDelivery(socketId: string): boolean {
     const target = io.sockets.sockets.get(socketId);
     if (!target?.connected || target.conn.readyState !== 'open') return false;
     const transport = target.conn.transport;
-    if (!transport.writable || directDrainListeners.has(socketId)) return false;
+    if (!transport.writable || directTransportListeners.has(socketId)) return false;
 
     const onDrain = (): void => {
-      directDrainListeners.delete(socketId);
-      channelManager.releaseDirectDelivery(socketId);
-      if (disconnectAfterDrain.delete(socketId)) {
-        io.sockets.sockets.get(socketId)?.disconnect(true);
-      }
+      directTransportListeners.delete(socketId);
+
+      // Engine.IO emits drain before making websocket and WebTransport
+      // writable again. Polling also waits for the next poll request. Keep the
+      // completed reservation accounted until that transport emits ready.
+      waitForDirectReady(socketId, transport);
     };
-    directDrainListeners.set(socketId, { transport, onDrain });
+    directTransportListeners.set(socketId, { transport, event: 'drain', listener: onDrain });
     transport.once('drain', onDrain);
     return true;
   }
@@ -451,9 +492,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
 
       if (result.backpressuredSocketId !== undefined) {
         const slowTarget = io.sockets.sockets.get(result.backpressuredSocketId);
-        if (channelManager.hasDirectDelivery(result.backpressuredSocketId)) {
-          disconnectAfterDrain.add(result.backpressuredSocketId);
-        } else {
+        if (!channelManager.hasDirectDelivery(result.backpressuredSocketId)) {
           slowTarget?.disconnect(true);
         }
       }
@@ -606,8 +645,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     clearInterval(rateLimitCleanupTimer);
     activeSocketsByIp.clear();
     rateLimits.clear();
-    for (const socketId of directDrainListeners.keys()) releaseDirectDelivery(socketId);
-    disconnectAfterDrain.clear();
+    for (const socketId of directTransportListeners.keys()) releaseDirectDelivery(socketId);
     channelManager.destroy();
     metrics.activeChannels.set(0);
     metrics.bufferedMessages.set(0);
