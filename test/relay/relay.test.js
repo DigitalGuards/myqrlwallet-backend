@@ -884,7 +884,49 @@ describe('Relay Server', function () {
   });
 
   describe('live egress budgets', () => {
-    it('bounds a stalled target and drains buffered work through reconnect', async () => {
+    it('delivers back-to-back ACK and ORIGINATOR_INFO without disconnecting', async () => {
+      const relay = await startRelay();
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      try {
+        await joinChannel(dapp, 'handshake-burst', 'dapp');
+        await joinChannel(wallet, 'handshake-burst', 'wallet');
+
+        const received = [];
+        const bothMessages = new Promise((resolve, reject) => {
+          const timer = setTimeout(
+            () => reject(new Error('Timeout waiting for handshake burst')),
+            2000
+          );
+          wallet.on('message', (message) => {
+            received.push(message);
+            if (received.length === 2) {
+              clearTimeout(timer);
+              resolve(received);
+            }
+          });
+        });
+
+        const [ackResult, originatorInfoResult] = await Promise.all([
+          sendMessage(dapp, 'handshake-burst', { type: 'ACK' }),
+          sendMessage(dapp, 'handshake-burst', { type: 'ORIGINATOR_INFO' }),
+        ]);
+
+        expect(ackResult.success).to.equal(true);
+        expect(originatorInfoResult.success).to.equal(true);
+        expect((await bothMessages).map((payload) => payload.message.type)).to.deep.equal([
+          'ACK',
+          'ORIGINATOR_INFO',
+        ]);
+        expect(wallet.connected).to.equal(true);
+      } finally {
+        await disconnect(dapp);
+        await disconnect(wallet);
+        relay.cleanup();
+      }
+    });
+
+    it('bounds a stalled target and resumes buffered work on drain', async () => {
       const relay = await startRelay({
         RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: 1800,
         RELAY_MAX_BUFFERED_BYTES_PER_IP: 1800,
@@ -892,7 +934,6 @@ describe('Relay Server', function () {
       });
       const dapp = await connect(relay.port);
       const wallet = await connect(relay.port);
-      let replacement;
       try {
         await joinChannel(dapp, 'live-egress-budget', 'dapp');
         await joinChannel(wallet, 'live-egress-budget', 'wallet');
@@ -923,19 +964,47 @@ describe('Relay Server', function () {
         expect(stats.totalDirectInflightBytes + stats.totalBufferedBytes).to.be.at.most(1800);
         expect(target.conn.writeBuffer.length).to.equal(0);
 
-        const disconnected = waitForEvent(wallet, 'disconnect');
+        const resumed = waitForEvent(wallet, 'message');
         transport.send = originalSend;
         transport.emit('drain');
+        transport.emit('ready');
+        expect(relay.channelManager.getStats().totalBufferedMessages).to.equal(1);
         transport.writable = true;
         transport.emit('ready');
+
+        expect((await resumed).message).to.equal(`${payload}2`);
+        expect(wallet.connected).to.equal(true);
+        expect(relay.channelManager.getStats().totalBufferedMessages).to.equal(0);
+      } finally {
+        await disconnect(dapp);
+        await disconnect(wallet);
+        relay.cleanup();
+      }
+    });
+
+    it('disconnects an idle unwritable target so reconnect drains its buffer', async () => {
+      const relay = await startRelay();
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      let replacement;
+      try {
+        await joinChannel(dapp, 'idle-backpressure', 'dapp');
+        await joinChannel(wallet, 'idle-backpressure', 'wallet');
+        await new Promise((resolve) => setImmediate(resolve));
+
+        const target = relay.io.sockets.sockets.get(wallet.id);
+        target.conn.transport.writable = false;
+        const disconnected = waitForEvent(target, 'disconnect');
+
+        const result = await sendMessage(dapp, 'idle-backpressure', 'queued-ciphertext');
+        expect(result).to.deep.include({ success: true, buffered: true });
         await disconnected;
-        expect(relay.channelManager.getStats().totalDirectInflightBytes).to.equal(0);
 
         replacement = await connect(relay.port);
-        const rejoined = await joinChannel(replacement, 'live-egress-budget', 'wallet');
+        const rejoined = await joinChannel(replacement, 'idle-backpressure', 'wallet');
         expect(rejoined.success).to.equal(true);
         expect(rejoined.bufferedMessages).to.have.length(1);
-        expect(rejoined.bufferedMessages[0].message).to.equal(`${payload}2`);
+        expect(rejoined.bufferedMessages[0].message).to.equal('queued-ciphertext');
       } finally {
         await disconnect(dapp);
         await disconnect(wallet);
@@ -1240,6 +1309,44 @@ describe('Relay Server', function () {
 
         cm.leave('wallet-socket', 'leave-inflight');
         expect(cm.getStats().totalDirectInflightBytes).to.equal(reserved);
+
+        cm.releaseDirectDelivery('wallet-socket');
+        expect(cm.getStats().totalDirectInflightBytes).to.equal(0);
+      } finally {
+        cm.destroy();
+      }
+    });
+
+    it('moves one buffered message into the live reservation after each drain', () => {
+      const cm = new ChannelManager({ canSocketReceive: () => true });
+      try {
+        cm.join('burst-accounting', 'dapp-socket', 'dapp');
+        cm.join('burst-accounting', 'wallet-socket', 'wallet');
+        const first = {
+          id: 'burst-accounting',
+          clientType: 'dapp',
+          message: { type: 'ACK' },
+        };
+        const second = {
+          id: 'burst-accounting',
+          clientType: 'dapp',
+          message: { type: 'ORIGINATOR_INFO' },
+        };
+
+        expect(cm.routeMessage('burst-accounting', 'dapp-socket', first).buffered).to.equal(false);
+        expect(cm.routeMessage('burst-accounting', 'dapp-socket', second).buffered).to.equal(true);
+
+        const retainedBefore = cm.getStats();
+        expect(retainedBefore.totalDirectInflightBytes).to.be.greaterThan(0);
+        expect(retainedBefore.totalBufferedBytes).to.be.greaterThan(0);
+
+        expect(cm.advanceDirectDelivery('wallet-socket')).to.deep.equal(second);
+        const retainedAfter = cm.getStats();
+        expect(retainedAfter.totalBufferedMessages).to.equal(0);
+        expect(retainedAfter.totalBufferedBytes).to.equal(0);
+        expect(retainedAfter.totalDirectInflightBytes).to.equal(
+          Buffer.byteLength(JSON.stringify(second))
+        );
 
         cm.releaseDirectDelivery('wallet-socket');
         expect(cm.getStats().totalDirectInflightBytes).to.equal(0);

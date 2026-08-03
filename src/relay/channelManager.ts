@@ -441,9 +441,9 @@ class ChannelManager {
     }
 
     // Counterparty is absent or its transport cannot accept a bounded direct
-    // delivery. Retain the payload under the offline budgets. The server
-    // disconnects a backpressured live target so its normal reconnect drains
-    // this buffer instead of leaving an accepted payload parked indefinitely.
+    // delivery. Retain the payload under the offline budgets. A live target
+    // with an in-flight reservation consumes this buffer one message per
+    // transport drain.
     const backpressuredSocketId = targetSocketId ?? undefined;
     const backpressureContext = backpressuredSocketId ? { backpressuredSocketId } : {};
     const otherClientType: ClientType = sender.clientType === 'dapp' ? 'wallet' : 'dapp';
@@ -516,6 +516,40 @@ class ChannelManager {
       this.totalDirectInflightBytes - reservation.sizeBytes
     );
     this.releaseIpBytes(reservation.sourceIp, reservation.sizeBytes);
+  }
+
+  /**
+   * Complete a target's in-flight delivery and reserve its oldest buffered
+   * message for the next transport write. The buffered-to-direct transition
+   * preserves every byte budget while keeping at most one live reservation.
+   */
+  advanceDirectDelivery(socketId: string): RelayPayload | null {
+    const reservation = this.directDeliveries.get(socketId);
+    if (!reservation) return null;
+
+    const { channel } = reservation;
+    const participant = channel.participants.get(socketId);
+    this.releaseDirectDelivery(socketId);
+    if (!participant || channel.terminated) return null;
+
+    const nextIndex = channel.messageBuffer.findIndex(
+      (message) => message.targetClientType === participant.clientType
+    );
+    if (nextIndex < 0) return null;
+
+    const next = channel.messageBuffer.splice(nextIndex, 1)[0];
+    if (!next) return null;
+
+    this.releaseBufferedBytes(channel, next);
+    this.directDeliveries.set(socketId, {
+      channel,
+      sourceIp: next.sourceIp,
+      sizeBytes: next.sizeBytes,
+    });
+    channel.directInflightBytes += next.sizeBytes;
+    this.totalDirectInflightBytes += next.sizeBytes;
+    this.retainIpBytes(next.sourceIp, next.sizeBytes);
+    return next.data;
   }
 
   hasDirectDelivery(socketId: string): boolean {
