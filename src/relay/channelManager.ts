@@ -304,18 +304,18 @@ class ChannelManager {
    * The tombstone is retained for TOMBSTONE_TTL_MS and is excluded from the
    * active-channel admission count so it cannot block new channels.
    */
-  close(channelId: string): void {
+  close(channelId: string): boolean {
     const channel = this.channels.get(channelId);
     // Only mark an existing channel. Never fabricate a tombstone for an
     // unknown channelId: a non-existent channel is already dead (a re-joining
     // peer sees no participants anyway), and creating one would let an
     // attacker fill memory with tombstones that bypass the channel cap.
-    if (!channel) return;
+    if (!channel) return false;
     // Idempotent: a channel can only be tombstoned once. Without this a
     // repeated close() (or a re-join->close loop on the same id) would push
     // duplicate entries into terminatedOrder and the FIFO eviction would then
     // flush out legitimate tombstones.
-    if (channel.terminated) return;
+    if (channel.terminated) return false;
     channel.terminated = true;
     channel.terminatedAt = Date.now();
     channel.lastActivity = Date.now();
@@ -341,6 +341,7 @@ class ChannelManager {
         this.channels.delete(oldest);
       }
     }
+    return true;
   }
 
   /**

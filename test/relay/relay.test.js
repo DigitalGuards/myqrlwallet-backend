@@ -94,6 +94,13 @@ function sendMessage(socket, channelId, message, clientType = 'dapp') {
   });
 }
 
+/** Explicitly close a channel and return the relay's durable-close ack. */
+function closeChannel(socket, channelId) {
+  return new Promise((resolve) => {
+    socket.emit('close_channel', { channelId }, (resp) => resolve(resp));
+  });
+}
+
 /** Wait for a specific event with a timeout. */
 function waitForEvent(socket, event, timeoutMs = 2000) {
   return new Promise((resolve, reject) => {
@@ -1081,8 +1088,9 @@ describe('Relay Server', function () {
     it('close_channel marks a tombstone surfaced on a later re-join', async () => {
       const dapp = await connect(relay.port);
       await joinChannel(dapp, 'tombstone-ch', 'dapp');
-      await new Promise((resolve) => {
-        dapp.emit('close_channel', { channelId: 'tombstone-ch' }, () => resolve());
+      expect(await closeChannel(dapp, 'tombstone-ch')).to.deep.equal({
+        success: true,
+        terminated: true,
       });
       await disconnect(dapp);
 
@@ -1092,6 +1100,37 @@ describe('Relay Server', function () {
       expect(resp.success).to.be.true;
       expect(resp.terminated).to.be.true;
       await disconnect(dapp2);
+    });
+
+    it('fails closed when no participant-backed tombstone was created', async () => {
+      const dapp = await connect(relay.port);
+      const wallet = await connect(relay.port);
+      const attacker = await connect(relay.port);
+      await joinChannel(dapp, 'close-authz', 'dapp');
+      await joinChannel(wallet, 'close-authz', 'wallet');
+
+      const expectedFailure = {
+        success: false,
+        terminated: false,
+        error: 'Channel close was not confirmed',
+      };
+      expect(await closeChannel(attacker, 'close-authz')).to.deep.equal(expectedFailure);
+      expect(await closeChannel(attacker, 'close-unknown')).to.deep.equal(expectedFailure);
+      expect(await closeChannel(attacker, '')).to.deep.equal(expectedFailure);
+
+      const received = waitForEvent(wallet, 'message');
+      expect((await sendMessage(dapp, 'close-authz', 'still-live')).success).to.equal(true);
+      expect((await received).message).to.equal('still-live');
+
+      expect(await closeChannel(dapp, 'close-authz')).to.deep.equal({
+        success: true,
+        terminated: true,
+      });
+      expect(await closeChannel(dapp, 'close-authz')).to.deep.equal(expectedFailure);
+
+      await disconnect(dapp);
+      await disconnect(wallet);
+      await disconnect(attacker);
     });
 
     it('notifies a connected counterparty of an explicit close', async () => {
