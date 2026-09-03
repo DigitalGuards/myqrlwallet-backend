@@ -6,11 +6,3 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 10
-    ignore:
-      # Express 5 is a breaking router rewrite (router 2.x / path-to-regexp 8.x):
-      # unnamed wildcards like `/:cid/*` throw at registration, `req.query` is a
-      # getter, and async error propagation changed. Two automated attempts at
-      # this bump took prod down on 2026-09-03 (#82, #83). Migrate deliberately,
-      # then drop this ignore.
-      - dependency-name: express
-        update-types: [version-update:semver-major]
