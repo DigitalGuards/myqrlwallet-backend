@@ -187,6 +187,60 @@ describe('IPFS Routes', () => {
     expect(fetchStub.firstCall.args[0]).to.match(new RegExp(`/ipfs/${cid}/metadata\\.json$`));
   });
 
+  it('re-joins a multi-segment path suffix into one gateway path', async () => {
+    // Express 5 (path-to-regexp v8) returns the `*splat` wildcard as an array
+    // of decoded segments; the handler must hand the gateway the original
+    // `/`-joined path, exactly as Express 4's `params[0]` string did.
+    fetchStub.resolves(
+      buildFetchResponse({ contentType: 'image/png', chunks: [Buffer.from('PNGDATA')] })
+    );
+
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const res = await request.execute(app).get(`/api/ipfs/${cid}/images/1/asset.png`);
+
+    expect(res).to.have.status(200);
+    expect(fetchStub.calledOnce).to.equal(true);
+    expect(fetchStub.firstCall.args[0]).to.match(new RegExp(`/ipfs/${cid}/images/1/asset\\.png$`));
+  });
+
+  it('rejects traversal that reaches the router inside the wildcard', async () => {
+    // superagent and the WHATWG URL parser both collapse `..` and `%2e%2e`
+    // dot-segments client-side, so chai-http can never deliver them. A raw
+    // node:http request sends the path verbatim. Express 5 decodes each
+    // wildcard segment, so `%2e%2e` arrives at the handler as `..` and the
+    // re-joined path must still trip the traversal check before any fetch.
+    const server = createServer(app);
+    await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+    const address = server.address();
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+    const rawGet = (path) =>
+      new Promise((resolve, reject) => {
+        const req = httpRequest(
+          { host: '127.0.0.1', port: address.port, path, method: 'GET' },
+          (res) => {
+            const chunks = [];
+            res.on('data', (c) => chunks.push(c));
+            res.on('end', () =>
+              resolve({ status: res.statusCode, body: Buffer.concat(chunks).toString() })
+            );
+          }
+        );
+        req.on('error', reject);
+        req.end();
+      });
+    try {
+      for (const suffix of ['a/%2e%2e/b', 'a/../b', '%2e%2e']) {
+        const res = await rawGet(`/api/ipfs/${cid}/${suffix}`);
+        expect(res.status, suffix).to.equal(400);
+        expect(JSON.parse(res.body).error, suffix).to.equal('invalid path');
+      }
+      expect(fetchStub.called).to.equal(false);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
   it('rejects oversize responses up front via declared Content-Length', async () => {
     fetchStub.resolves(
       buildFetchResponse({ contentLength: 20 * 1024 * 1024, chunks: [Buffer.alloc(8)] })

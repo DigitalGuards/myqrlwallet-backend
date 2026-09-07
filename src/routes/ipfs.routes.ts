@@ -2,6 +2,7 @@ import { Router, type Request, type Response } from 'express';
 import rateLimit from 'express-rate-limit';
 import { CONFIG } from '../config/index.js';
 import { asyncHandler } from '../utils/async-handler.js';
+import { readStringParam, readWildcardParam } from '../utils/route-params.js';
 import { isRecord } from '../utils/guards.js';
 import { logger } from '../utils/logger.js';
 
@@ -123,13 +124,13 @@ ipfsRouter.use(ipfsRateLimit);
  * that would be a giant SSRF surface. Only well-formed IPFS CIDs are
  * dereferenced through the configured `IPFS_GATEWAY`.
  *
- * Two route patterns share a handler because Express 4's path-to-regexp
- * won't match `/:cid` against `/:cid/*?`: the optional star modifier still
- * requires a `/` separator that isn't present when only the CID is supplied.
+ * Two route patterns share a handler because a wildcard cannot also match the
+ * bare `/:cid` form: the separator it needs is absent when only the CID is
+ * supplied.
  */
 async function ipfsHandler(req: Request, res: Response): Promise<void> {
-  const cid = req.params.cid ?? '';
-  const rest = req.params['0'] ?? '';
+  const cid = readStringParam(req, 'cid');
+  const rest = readWildcardParam(req, 'splat');
 
   if (!isValidCid(cid)) {
     res.status(400).json({ error: 'invalid CID' });
@@ -293,6 +294,6 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
 }
 
 ipfsRouter.get('/:cid', asyncHandler(ipfsHandler));
-ipfsRouter.get('/:cid/*', asyncHandler(ipfsHandler));
+ipfsRouter.get('/:cid/*splat', asyncHandler(ipfsHandler));
 
 export { ipfsRouter };

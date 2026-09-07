@@ -1,10 +1,5 @@
 export type BoundedJsonFailure =
-  | 'too-large'
-  | 'empty'
-  | 'non-binary'
-  | 'invalid-utf8'
-  | 'invalid-json'
-  | 'stream-error';
+  'too-large' | 'empty' | 'non-binary' | 'invalid-utf8' | 'invalid-json' | 'stream-error';
 
 export class BoundedJsonError extends Error {
   constructor(

@@ -3,6 +3,7 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { CONFIG, isNetworkName } from '../config/index.js';
 import { normalizeRpcId, type RpcId } from '../services/rpc.service.js';
 import { isArray, isRecord } from '../utils/guards.js';
+import { readStringParam } from '../utils/route-params.js';
 import { logger } from '../utils/logger.js';
 
 const log = logger.child({ module: 'rpc-security' });
@@ -147,7 +148,7 @@ export const rpcRateLimitGeneral = rateLimit({
     // Collapse arbitrary path values into one bucket. Valid configured
     // networks retain separate quotas without letting attackers rotate an
     // unbounded `:network` string to bypass admission or grow the store.
-    const requestedNetwork = req.params.network ?? '';
+    const requestedNetwork = readStringParam(req, 'network');
     const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
     return `${ipKeyGenerator(req.ip ?? 'unknown')}-${network}`;
   },
@@ -173,7 +174,7 @@ export const rpcRateLimitWrite = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    const requestedNetwork = req.params.network ?? '';
+    const requestedNetwork = readStringParam(req, 'network');
     const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
     return `${ipKeyGenerator(req.ip ?? 'unknown')}-write-${network}`;
   },
