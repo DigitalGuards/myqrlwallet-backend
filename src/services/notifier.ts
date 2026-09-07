@@ -51,17 +51,4 @@ export function notify({ severity = 'info', network, endpoint, event, detail }: 
     },
     `[rpc-health] ${event} ${safeEndpoint ?? ''} (${network ?? 'n/a'})`.trim()
   );
-  const alertText = [
-    severity === 'info' ? 'MyQRLWallet recovery' : 'MyQRLWallet health alert',
-    `Event: ${event}`,
-    `Network: ${network ?? 'n/a'}`,
-    safeEndpoint ? `Endpoint: ${safeEndpoint}` : '',
-  ]
-    .filter(Boolean)
-    .join('\n');
-  void import('./telegramBot.js')
-    .then(({ broadcastTelegramAlert }) => broadcastTelegramAlert(alertText))
-    .catch((error: unknown) => {
-      logger.error({ err: error }, 'Telegram health alert delivery failed');
-    });
 }
