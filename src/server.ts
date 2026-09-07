@@ -13,6 +13,7 @@ import {
   register,
 } from './relay/metrics.js';
 import { healthMonitor } from './services/rpc/healthMonitor.js';
+import { configureTelegramBot } from './services/telegramBot.js';
 
 const httpServer = createServer(app);
 
@@ -93,4 +94,5 @@ httpServer.listen(CONFIG.PORT, CONFIG.LISTEN_HOST, () => {
   logger.info({ host: CONFIG.LISTEN_HOST, port: CONFIG.PORT }, 'Server started');
   logger.info('Socket.IO relay available at /relay');
   healthMonitor.start();
+  void configureTelegramBot();
 });
