@@ -68,7 +68,7 @@ function miniAppButton(): Record<string, unknown> | null {
   return { text: 'Open control center', web_app: { url: CONFIG.TELEGRAM_MINI_APP_URL } };
 }
 
-function homeKeyboard(): Record<string, unknown> {
+function homeKeyboard(includeMiniApp = true): Record<string, unknown> {
   const rows: unknown[][] = [
     [
       { text: 'System status', callback_data: 'status' },
@@ -76,7 +76,7 @@ function homeKeyboard(): Record<string, unknown> {
     ],
   ];
   const appButton = miniAppButton();
-  if (appButton) rows.unshift([appButton]);
+  if (includeMiniApp && appButton) rows.unshift([appButton]);
   return { inline_keyboard: rows };
 }
 
@@ -98,7 +98,7 @@ async function sendHome(chatId: number): Promise<void> {
     payload: {
       chat_id: chatId,
       text: 'MyQRLWallet control center\n\nChoose an action below. Wallet secrets and signing stay inside MyQRLWallet.',
-      reply_markup: homeKeyboard(),
+      reply_markup: homeKeyboard(chatId > 0),
     },
   });
 }
@@ -109,7 +109,7 @@ async function sendStatus(chatId: number): Promise<void> {
     payload: {
       chat_id: chatId,
       text: statusText(),
-      reply_markup: homeKeyboard(),
+      reply_markup: homeKeyboard(chatId > 0),
     },
   });
 }
@@ -137,7 +137,7 @@ async function handleCallback(callback: Record<string, unknown>, userId: number)
       payload: {
         chat_id: chatId,
         text: 'Security reminder\n\nNever send a seed, mnemonic, private key, PIN, or wallet file to this bot. Transaction signing only happens inside MyQRLWallet.',
-        reply_markup: homeKeyboard(),
+        reply_markup: homeKeyboard(chatId > 0),
       },
     });
   }
@@ -224,7 +224,7 @@ export async function broadcastTelegramAlert(message: string): Promise<void> {
         payload: {
           chat_id: chatId,
           text: message.slice(0, 4096),
-          reply_markup: homeKeyboard(),
+          reply_markup: homeKeyboard(!chatId.startsWith('-')),
         },
       })
     )

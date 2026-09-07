@@ -95,6 +95,8 @@ describe('Telegram routes', () => {
 
     expect(res).to.have.status(200);
     expect(fetchStub.callCount).to.equal(1);
+    const requestBody = JSON.parse(fetchStub.firstCall.args[1].body);
+    expect(JSON.stringify(requestBody.reply_markup)).not.to.include('web_app');
   });
 
   it('accepts a direct chat from an administrator of an allowed group', async () => {
