@@ -86,12 +86,6 @@ export interface AppConfig {
   IPFS_MAX_SIZE_BYTES: number;
   IPFS_MAX_CONCURRENT: number;
   IPFS_MAX_INFLIGHT_BYTES: number;
-  TELEGRAM_BOT_TOKEN: string;
-  TELEGRAM_WEBHOOK_SECRET: string;
-  TELEGRAM_WEBHOOK_URL: string;
-  TELEGRAM_MINI_APP_URL: string;
-  TELEGRAM_ALLOWED_USER_IDS: string[];
-  TELEGRAM_ALLOWED_CHAT_IDS: string[];
 }
 
 export function resolveListenHost(value: string | undefined): string {
@@ -181,17 +175,4 @@ export const CONFIG: AppConfig = {
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),
-
-  TELEGRAM_BOT_TOKEN: process.env.TELEGRAM_BOT_TOKEN ?? '',
-  TELEGRAM_WEBHOOK_SECRET: process.env.TELEGRAM_WEBHOOK_SECRET ?? '',
-  TELEGRAM_WEBHOOK_URL: process.env.TELEGRAM_WEBHOOK_URL ?? '',
-  TELEGRAM_MINI_APP_URL: process.env.TELEGRAM_MINI_APP_URL ?? '',
-  TELEGRAM_ALLOWED_USER_IDS: (process.env.TELEGRAM_ALLOWED_USER_IDS ?? '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean),
-  TELEGRAM_ALLOWED_CHAT_IDS: (process.env.TELEGRAM_ALLOWED_CHAT_IDS ?? '')
-    .split(',')
-    .map((id) => id.trim())
-    .filter(Boolean),
 };
