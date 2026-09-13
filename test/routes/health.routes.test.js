@@ -25,6 +25,12 @@ describe('Health Routes', () => {
       'http://example.test:8545',
       HEALTH_STATES.STATE_UP
     );
+    Object.assign(healthMonitor.networks.get('testnet')[0], {
+      lastHeight: 100,
+      syncing: false,
+      headTimestamp: Date.now(),
+      lastVerifiedPollAt: Date.now(),
+    });
     const res = await request.execute(app).get('/health');
     expect(res).to.have.status(200);
     expect(res.body.status).to.equal('ok');

@@ -55,6 +55,34 @@ export interface RpcHealthConfig {
   DOWN_AFTER_FAILURES: number;
   UP_AFTER_SUCCESSES: number;
   STALL_AFTER_MS: number;
+  MAX_HEAD_AGE_MS: number;
+  MAX_HEAD_FUTURE_MS: number;
+  MAX_LAG_BLOCKS: number;
+}
+
+export interface RpcIdentity {
+  chainId: string;
+  genesisHash: string;
+}
+
+/** Both pins are optional together. Partial or malformed identity configuration is fatal. */
+export function parseRpcIdentity(
+  chainId: string | undefined,
+  genesisHash: string | undefined
+): RpcIdentity | null {
+  if (chainId === undefined && genesisHash === undefined) return null;
+  if (
+    chainId === undefined ||
+    genesisHash === undefined ||
+    !/^[1-9][0-9]{0,77}$/.test(chainId) ||
+    !/^0x[0-9a-fA-F]{64}$/.test(genesisHash) ||
+    BigInt(chainId) >= 1n << 256n
+  ) {
+    throw new Error(
+      'RPC expected identity requires both a positive decimal uint256 chain ID and a 32-byte genesis hash'
+    );
+  }
+  return { chainId: `0x${BigInt(chainId).toString(16)}`, genesisHash: genesisHash.toLowerCase() };
 }
 
 export interface AppConfig {
@@ -75,6 +103,8 @@ export interface AppConfig {
   TRUSTED_PROXY_CIDRS: string[];
   ALLOWED_ORIGINS: string[];
   RPC_ENDPOINTS: Record<NetworkName, string[]>;
+  RPC_EXPECTED_IDENTITIES: Record<NetworkName, RpcIdentity | null>;
+  TX_HISTORY_ORIGINS: Record<NetworkName, string | null>;
   RPC_REQUIRED_NETWORKS: NetworkName[];
   RPC_HEALTH: RpcHealthConfig;
   RPC_RATE_LIMIT_PER_MINUTE: number;
@@ -92,6 +122,29 @@ export function resolveListenHost(value: string | undefined): string {
   const host = value?.trim();
   if (host === undefined || host.length === 0) return '127.0.0.1';
   return host;
+}
+
+/** History destinations are configured by the server and contain only an origin. */
+export function parseHistoryOrigin(
+  value: string | undefined,
+  fallback: string | null
+): string | null {
+  if (value === undefined) return fallback;
+  const input = value.trim();
+  if (input.length === 0) return null;
+  const url = new URL(input);
+  const loopback = ['localhost', '127.0.0.1', '[::1]'].includes(url.hostname);
+  if (
+    (url.protocol !== 'https:' && !(url.protocol === 'http:' && loopback)) ||
+    url.username ||
+    url.password ||
+    url.pathname !== '/' ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error('Transaction-history origin must be credential-free HTTPS or loopback HTTP');
+  }
+  return url.origin;
 }
 
 function parseRequiredNetworks(value: string | undefined): NetworkName[] {
@@ -151,6 +204,27 @@ export const CONFIG: AppConfig = {
     mainnet: parseEndpointList('MAINNET', ['http://localhost:8545']),
   },
 
+  RPC_EXPECTED_IDENTITIES: {
+    dev: parseRpcIdentity(
+      process.env.RPC_EXPECTED_CHAIN_ID_DEV,
+      process.env.RPC_EXPECTED_GENESIS_HASH_DEV
+    ),
+    testnet: parseRpcIdentity(
+      process.env.RPC_EXPECTED_CHAIN_ID_TESTNET,
+      process.env.RPC_EXPECTED_GENESIS_HASH_TESTNET
+    ),
+    mainnet: parseRpcIdentity(
+      process.env.RPC_EXPECTED_CHAIN_ID_MAINNET,
+      process.env.RPC_EXPECTED_GENESIS_HASH_MAINNET
+    ),
+  },
+
+  TX_HISTORY_ORIGINS: {
+    dev: parseHistoryOrigin(process.env.TX_HISTORY_ORIGIN_DEV, null),
+    testnet: parseHistoryOrigin(process.env.TX_HISTORY_ORIGIN_TESTNET, 'https://zondscan.com'),
+    mainnet: parseHistoryOrigin(process.env.TX_HISTORY_ORIGIN_MAINNET, null),
+  },
+
   RPC_REQUIRED_NETWORKS: parseRequiredNetworks(process.env.RPC_REQUIRED_NETWORKS),
 
   RPC_HEALTH: {
@@ -160,6 +234,9 @@ export const CONFIG: AppConfig = {
     DOWN_AFTER_FAILURES: parsePositiveInt(process.env.RPC_DOWN_AFTER_FAILURES, 3),
     UP_AFTER_SUCCESSES: parsePositiveInt(process.env.RPC_UP_AFTER_SUCCESSES, 3),
     STALL_AFTER_MS: parsePositiveInt(process.env.RPC_STALL_AFTER_MS, 300000), // 5 min
+    MAX_HEAD_AGE_MS: parsePositiveInt(process.env.RPC_MAX_HEAD_AGE_MS, 300000),
+    MAX_HEAD_FUTURE_MS: parsePositiveInt(process.env.RPC_MAX_HEAD_FUTURE_MS, 60000),
+    MAX_LAG_BLOCKS: parseNonNegativeInt(process.env.RPC_MAX_LAG_BLOCKS, 8),
   },
 
   RPC_RATE_LIMIT_PER_MINUTE: parsePositiveInt(process.env.RPC_RATE_LIMIT_PER_MINUTE, 1000),
