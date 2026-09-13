@@ -7,6 +7,19 @@ import { healthMonitor, HEALTH_STATES } from '../../src/services/rpc/healthMonit
 
 const { expect } = chai;
 
+function setReadyEndpoints(network, urls) {
+  healthMonitor.__setEndpointsForTesting(network, urls);
+  for (const endpoint of healthMonitor.networks.get(network)) {
+    Object.assign(endpoint, {
+      state: HEALTH_STATES.STATE_UP,
+      lastHeight: 100,
+      syncing: false,
+      headTimestamp: Date.now(),
+      lastVerifiedPollAt: Date.now(),
+    });
+  }
+}
+
 function buildRpcResponse({ ok = true, status = 200, contentLength, chunks } = {}) {
   const body = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 1, result: '0x1' }));
   const queue = [...(chunks ?? [body])];
@@ -44,6 +57,7 @@ describe('RPC Service', () => {
   let originalRpcLimits;
 
   beforeEach(() => {
+    setReadyEndpoints('testnet', CONFIG.RPC_ENDPOINTS.testnet);
     originalRpcLimits = {
       RPC_MAX_RESPONSE_BYTES: CONFIG.RPC_MAX_RESPONSE_BYTES,
       RPC_MAX_CONCURRENT: CONFIG.RPC_MAX_CONCURRENT,
@@ -90,12 +104,83 @@ describe('RPC Service', () => {
   });
 
   describe('caching behavior', () => {
+    for (const method of ['qrl_chainId', 'net_version']) {
+      it(`refuses a cached ${method} response after readiness is revoked`, async () => {
+        const stub = sinon.stub(rpcService, 'makeRPCCall').resolves({
+          jsonrpc: '2.0',
+          id: 1,
+          result: method === 'qrl_chainId' ? '0x11' : '17',
+        });
+        await rpcService.executeRPC('testnet', method, [], 'first');
+        const endpoint = healthMonitor.networks.get('testnet')[0];
+        endpoint.lastVerifiedPollAt = null;
+
+        try {
+          await rpcService.executeRPC('testnet', method, [], 'second');
+          expect.fail('Expected cached identity to fail closed');
+        } catch (error) {
+          expect(error.status).to.equal(503);
+          expect(error.message).to.equal('No ready RPC endpoint for this network');
+        }
+        expect(stub.callCount).to.equal(1);
+      });
+    }
+
+    it('refuses cached identity immediately after an identity-bound poll fails', async () => {
+      const originalIdentity = CONFIG.RPC_EXPECTED_IDENTITIES.testnet;
+      const identity = { chainId: '0x11', genesisHash: `0x${'ab'.repeat(32)}` };
+      CONFIG.RPC_EXPECTED_IDENTITIES.testnet = identity;
+      const endpoint = healthMonitor.networks.get('testnet')[0];
+      endpoint.verifiedIdentity = { ...identity };
+      const stub = sinon.stub(rpcService, 'makeRPCCall').resolves({
+        jsonrpc: '2.0',
+        id: 1,
+        result: identity.chainId,
+      });
+      try {
+        await rpcService.executeRPC('testnet', 'qrl_chainId', []);
+        healthMonitor.applyFailure('testnet', endpoint, new Error('RPC chain identity mismatch'));
+        expect(endpoint.state).to.equal(HEALTH_STATES.STATE_UP);
+        try {
+          await rpcService.executeRPC('testnet', 'qrl_chainId', []);
+          expect.fail('Expected failed identity to fence the cache');
+        } catch (error) {
+          expect(error.status).to.equal(503);
+        }
+        expect(stub.callCount).to.equal(1);
+      } finally {
+        CONFIG.RPC_EXPECTED_IDENTITIES.testnet = originalIdentity;
+      }
+    });
+
+    it('scopes cached invariant responses to the configured identity', async () => {
+      const originalIdentity = CONFIG.RPC_EXPECTED_IDENTITIES.testnet;
+      const firstIdentity = { chainId: '0x11', genesisHash: `0x${'ab'.repeat(32)}` };
+      const secondIdentity = { chainId: '0x12', genesisHash: `0x${'cd'.repeat(32)}` };
+      const endpoint = healthMonitor.networks.get('testnet')[0];
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      stub.onFirstCall().resolves({ jsonrpc: '2.0', id: 1, result: firstIdentity.chainId });
+      stub.onSecondCall().resolves({ jsonrpc: '2.0', id: 2, result: secondIdentity.chainId });
+      try {
+        CONFIG.RPC_EXPECTED_IDENTITIES.testnet = firstIdentity;
+        endpoint.verifiedIdentity = { ...firstIdentity };
+        await rpcService.executeRPC('testnet', 'qrl_chainId', [], 1);
+        CONFIG.RPC_EXPECTED_IDENTITIES.testnet = secondIdentity;
+        endpoint.verifiedIdentity = { ...secondIdentity };
+        const result = await rpcService.executeRPC('testnet', 'qrl_chainId', [], 2);
+        expect(result.result).to.equal(secondIdentity.chainId);
+        expect(stub.callCount).to.equal(2);
+      } finally {
+        CONFIG.RPC_EXPECTED_IDENTITIES.testnet = originalIdentity;
+      }
+    });
+
     it('should NOT cache state-dependent reads (qrl_call)', async () => {
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.onFirstCall().resolves({ jsonrpc: '2.0', id: 1, result: '0xaaa' });
       stub.onSecondCall().resolves({ jsonrpc: '2.0', id: 2, result: '0xbbb' });
 
-      const params = [{ to: 'Q' + 'a'.repeat(40), data: '0x' }, 'latest'];
+      const params = [{ to: 'Q' + 'a'.repeat(128), data: '0x' }, 'latest'];
       const first = await rpcService.executeRPC('testnet', 'qrl_call', params);
       const second = await rpcService.executeRPC('testnet', 'qrl_call', params);
 
@@ -387,27 +472,17 @@ describe('RPC Service', () => {
 
   describe('failover behavior', () => {
     it('never lets client-selected success or failure mutate endpoint health', async () => {
-      healthMonitor.__setEndpointsForTesting('testnet', ['http://primary.test:8545']);
-      healthMonitor.__forceStateForTesting(
-        'testnet',
-        'http://primary.test:8545',
-        HEALTH_STATES.STATE_STALLED
-      );
+      setReadyEndpoints('testnet', ['http://primary.test:8545']);
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.onFirstCall().resolves({ jsonrpc: '2.0', id: 1, result: '0x100' });
       stub.onSecondCall().resolves({ jsonrpc: '2.0', id: 2, result: '0x101' });
       stub.onThirdCall().rejects(new Error('client request failed'));
 
       await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
-      expect(healthMonitor.getSnapshot().testnet[0].state).to.equal(HEALTH_STATES.STATE_STALLED);
+      expect(healthMonitor.getSnapshot().testnet[0].state).to.equal(HEALTH_STATES.STATE_UP);
 
-      healthMonitor.__forceStateForTesting(
-        'testnet',
-        'http://primary.test:8545',
-        HEALTH_STATES.STATE_DOWN
-      );
       await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
-      expect(healthMonitor.getSnapshot().testnet[0].state).to.equal(HEALTH_STATES.STATE_DOWN);
+      expect(healthMonitor.getSnapshot().testnet[0].state).to.equal(HEALTH_STATES.STATE_UP);
 
       try {
         await rpcService.executeRPC('testnet', 'qrl_blockNumber', []);
@@ -415,16 +490,13 @@ describe('RPC Service', () => {
         // The upstream failure is expected; only the poller may record it.
       }
       const endpoint = healthMonitor.getSnapshot().testnet[0];
-      expect(endpoint.state).to.equal(HEALTH_STATES.STATE_DOWN);
+      expect(endpoint.state).to.equal(HEALTH_STATES.STATE_UP);
       expect(endpoint.consecutiveFailures).to.equal(0);
       expect(stub.callCount).to.equal(3);
     });
 
     it('falls back to a second endpoint when the first one fails', async () => {
-      healthMonitor.__setEndpointsForTesting('testnet', [
-        'http://primary.test:8545',
-        'http://secondary.test:8545',
-      ]);
+      setReadyEndpoints('testnet', ['http://primary.test:8545', 'http://secondary.test:8545']);
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.withArgs('http://primary.test:8545').rejects(new Error('primary down'));
       stub
@@ -437,10 +509,7 @@ describe('RPC Service', () => {
     });
 
     it('throws the last error when all endpoints fail within the retry budget', async () => {
-      healthMonitor.__setEndpointsForTesting('testnet', [
-        'http://primary.test:8545',
-        'http://secondary.test:8545',
-      ]);
+      setReadyEndpoints('testnet', ['http://primary.test:8545', 'http://secondary.test:8545']);
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.rejects(new Error('all gone'));
 
@@ -454,10 +523,7 @@ describe('RPC Service', () => {
     });
 
     it('skips down endpoints in favour of healthy ones (orderEndpointsForAttempt)', async () => {
-      healthMonitor.__setEndpointsForTesting('testnet', [
-        'http://primary.test:8545',
-        'http://secondary.test:8545',
-      ]);
+      setReadyEndpoints('testnet', ['http://primary.test:8545', 'http://secondary.test:8545']);
       healthMonitor.__forceStateForTesting(
         'testnet',
         'http://primary.test:8545',
@@ -478,10 +544,10 @@ describe('RPC Service', () => {
     });
 
     it('pins txpool_* methods to the primary endpoint only (no failover)', async () => {
-      healthMonitor.__setEndpointsForTesting('testnet', [
-        'http://primary.test:8545',
-        'http://secondary.test:8545',
-      ]);
+      const primary = CONFIG.RPC_ENDPOINTS.testnet[0];
+      setReadyEndpoints('testnet', [primary, 'http://secondary.test:8545']);
+      healthMonitor.networks.get('testnet')[0].lastLatencyMs = 500;
+      healthMonitor.networks.get('testnet')[1].lastLatencyMs = 1;
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.rejects(new Error('primary down'));
 
@@ -491,9 +557,22 @@ describe('RPC Service', () => {
       } catch (err) {
         expect(err.message).to.equal('primary down');
       }
-      // Only the primary should be tried — txpool_* must not fail over.
+      // Primary-only methods retain the configured origin across health ranking changes.
       expect(stub.callCount).to.equal(1);
-      expect(stub.firstCall.args[0]).to.equal('http://primary.test:8545');
+      expect(stub.firstCall.args[0]).to.equal(primary);
+    });
+
+    it('fails closed without calling an upstream when all verified heads are stale', async () => {
+      const endpoints = healthMonitor.networks.get('testnet');
+      for (const endpoint of endpoints) endpoint.headTimestamp = 0;
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      try {
+        await rpcService.executeRPC('testnet', 'qrl_getBalance', []);
+        expect.fail('Expected readiness failure');
+      } catch (error) {
+        expect(error.status).to.equal(503);
+      }
+      expect(stub.called).to.equal(false);
     });
   });
 });

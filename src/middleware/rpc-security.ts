@@ -3,7 +3,9 @@ import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { CONFIG, isNetworkName } from '../config/index.js';
 import { normalizeRpcId, type RpcId } from '../services/rpc.service.js';
 import { isArray, isRecord } from '../utils/guards.js';
+import { readStringParam } from '../utils/route-params.js';
 import { logger } from '../utils/logger.js';
+import { isQrlAddress, QRL_ADDRESS_FORMAT } from '../utils/qrl-address.js';
 
 const log = logger.child({ module: 'rpc-security' });
 
@@ -46,6 +48,16 @@ const WRITE_METHODS = new Set(['qrl_sendRawTransaction']);
  */
 const MAX_GETLOGS_BLOCK_RANGE = 5000; // ~16-17 hours of QRL Zond blocks
 const MAX_GETLOGS_ADDRESSES = 10;
+const QRL_LOG_TOPIC_PATTERN = /^0x[0-9a-f]{128}$/i;
+
+const isQrlLogTopic = (value: unknown): boolean =>
+  value === null ||
+  (typeof value === 'string' && QRL_LOG_TOPIC_PATTERN.test(value)) ||
+  (isArray(value) &&
+    value.every(
+      (choice) =>
+        choice === null || (typeof choice === 'string' && QRL_LOG_TOPIC_PATTERN.test(choice))
+    ));
 
 /**
  * The request body as parsed by express.json(): typed `any` by Express, so
@@ -147,7 +159,7 @@ export const rpcRateLimitGeneral = rateLimit({
     // Collapse arbitrary path values into one bucket. Valid configured
     // networks retain separate quotas without letting attackers rotate an
     // unbounded `:network` string to bypass admission or grow the store.
-    const requestedNetwork = req.params.network ?? '';
+    const requestedNetwork = readStringParam(req, 'network');
     const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
     return `${ipKeyGenerator(req.ip ?? 'unknown')}-${network}`;
   },
@@ -173,7 +185,7 @@ export const rpcRateLimitWrite = rateLimit({
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => {
-    const requestedNetwork = req.params.network ?? '';
+    const requestedNetwork = readStringParam(req, 'network');
     const network = isNetworkName(requestedNetwork) ? requestedNetwork : 'invalid';
     return `${ipKeyGenerator(req.ip ?? 'unknown')}-write-${network}`;
   },
@@ -212,8 +224,8 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
         sendRpcError(res, 400, id, -32602, 'Invalid params: address required');
         return;
       }
-      // Validate address format (Q + 40 hex chars)
-      if (!/^Q[a-fA-F0-9]{40}$/i.test(address)) {
+      // Validate the native QIP-55 address shape before proxying.
+      if (!isQrlAddress(address)) {
         sendRpcError(res, 400, id, -32602, 'Invalid params: invalid address format');
         return;
       }
@@ -354,8 +366,8 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
         }
       }
 
-      // Address filter: require the canonical QRL v2 form (Q + 40 hex
-      // chars). Also cap array length so a single request can't fan out
+      // Address filter: require the native QIP-55 form. Also cap array
+      // length so a single request can't fan out
       // into N parallel address lookups on the node.
       if (filter.address !== undefined && filter.address !== null) {
         const addrs = isArray(filter.address) ? filter.address : [filter.address];
@@ -370,16 +382,35 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
           return;
         }
         for (const a of addrs) {
-          if (typeof a !== 'string' || !/^Q[a-fA-F0-9]{40}$/i.test(a)) {
+          if (!isQrlAddress(a)) {
             sendRpcError(
               res,
               400,
               id,
               -32602,
-              'Invalid params: QRL addresses must match Q + 40 hex chars'
+              `Invalid params: QRL addresses must match ${QRL_ADDRESS_FORMAT}`
             );
             return;
           }
+        }
+      }
+
+      // QIP-55 log topics are complete 64-byte VM words. Reject shortened
+      // Keccak hashes before they reach a node that requires exact-width topics.
+      if (filter.topics !== undefined && filter.topics !== null) {
+        if (
+          !isArray(filter.topics) ||
+          filter.topics.length > 4 ||
+          !filter.topics.every(isQrlLogTopic)
+        ) {
+          sendRpcError(
+            res,
+            400,
+            id,
+            -32602,
+            'Invalid params: log topics must be null or 0x-prefixed 64-byte values'
+          );
+          return;
         }
       }
       break;

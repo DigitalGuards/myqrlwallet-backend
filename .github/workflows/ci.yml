@@ -46,6 +46,12 @@ jobs:
       - name: Build
         run: npm run build
 
+      # Boot the compiled server the way pm2 does and prove it listens and
+      # routes resolve. Unit tests import src/app.ts under tsx; this is the
+      # only step that runs dist/ and src/server.ts's own routes.
+      - name: Boot smoke test
+        run: npm run smoke:boot
+
   docker:
     needs: test
     runs-on: ubuntu-latest

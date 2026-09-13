@@ -2,6 +2,7 @@ import { Router } from 'express';
 import { CONFIG } from '../config/index.js';
 import { normalizeRpcId, rpcService } from '../services/rpc.service.js';
 import { asyncHandler } from '../utils/async-handler.js';
+import { readStringParam } from '../utils/route-params.js';
 import { isRecord } from '../utils/guards.js';
 import {
   rpcBatchReject,
@@ -53,7 +54,7 @@ router.post(
   rpcRateLimitWrite,
   rpcParamsValidator,
   asyncHandler(async (req, res) => {
-    const network = req.params.network ?? '';
+    const network = readStringParam(req, 'network');
     const body: unknown = req.body;
     const method = isRecord(body) && typeof body.method === 'string' ? body.method : '';
     const params = isRecord(body) ? body.params : undefined;

@@ -4,6 +4,8 @@ import axios from 'axios';
 import { asyncHandler } from '../utils/async-handler.js';
 import { isRecord } from '../utils/guards.js';
 import { logger } from '../utils/logger.js';
+import { isQrlAddress } from '../utils/qrl-address.js';
+import { CONFIG, isNetworkName } from '../config/index.js';
 
 const log = logger.child({ module: 'app-routes' });
 
@@ -33,9 +35,23 @@ appRouter.post(
   asyncHandler(async (req, res) => {
     const body: unknown = req.body;
     const address = isRecord(body) ? body.address : undefined;
+    const network = isRecord(body) ? body.network : undefined;
 
-    // Validate address format (Q + 40 hex chars)
-    if (typeof address !== 'string' || !/^Q[a-fA-F0-9]{40}$/i.test(address)) {
+    if (typeof network !== 'string' || !isNetworkName(network)) {
+      res.status(400).json({ code: 'INVALID_NETWORK', message: 'Select a valid history network' });
+      return;
+    }
+    const explorerOrigin = CONFIG.TX_HISTORY_ORIGINS[network];
+    if (!explorerOrigin) {
+      res.status(501).json({
+        code: 'HISTORY_UNAVAILABLE',
+        message: 'Transaction history is unavailable for this network',
+      });
+      return;
+    }
+
+    // Validate the native QIP-55 address shape before proxying.
+    if (!isQrlAddress(address)) {
       res.status(400).json({ message: 'Invalid address format' });
       return;
     }
@@ -54,7 +70,7 @@ appRouter.post(
     const formattedAddress = 'Q' + address.slice(1).toLowerCase();
     try {
       const response = await axios.get<unknown>(
-        `https://zondscan.com/api/address/${formattedAddress}/transactions`,
+        `${explorerOrigin}/api/address/${formattedAddress}/transactions`,
         {
           params: { page, limit },
           timeout: TX_HISTORY_TIMEOUT_MS,

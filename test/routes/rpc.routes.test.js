@@ -11,6 +11,9 @@ chai.use(chaiHttp);
 const { expect } = chai;
 
 describe('RPC Routes', () => {
+  const qip55Address = `Q${'a'.repeat(128)}`;
+  const secondQip55Address = `Q${'B'.repeat(128)}`;
+
   let rpcServiceStub;
   let originalRateLimits;
 
@@ -101,7 +104,7 @@ describe('RPC Routes', () => {
     const res = await request
       .execute(app)
       .post('/api/qrl-rpc/dev')
-      .send({ method: 'qrl_sendTransaction', params: [{ from: 'Q' + 'a'.repeat(40) }] });
+      .send({ method: 'qrl_sendTransaction', params: [{ from: qip55Address }] });
 
     expect(res).to.have.status(403);
     expect(res.body.error.code).to.equal(-32601);
@@ -140,6 +143,124 @@ describe('RPC Routes', () => {
     expect(rpcServiceStub.calledOnce).to.equal(true);
   });
 
+  it('accepts QIP-55 addresses for account RPC methods', async () => {
+    for (const method of ['qrl_getBalance', 'qrl_getTransactionCount', 'qrl_getCode']) {
+      rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: '0x0' });
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({ id: 1, method, params: [qip55Address, 'latest'] });
+
+      expect(res).to.have.status(200);
+      rpcServiceStub.resetHistory();
+    }
+  });
+
+  it('rejects legacy 20-byte addresses for account RPC methods', async () => {
+    for (const method of ['qrl_getBalance', 'qrl_getTransactionCount', 'qrl_getCode']) {
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({ id: 1, method, params: [`Q${'a'.repeat(40)}`, 'latest'] });
+
+      expect(res).to.have.status(400);
+      expect(res.body.error.code).to.equal(-32602);
+    }
+    expect(rpcServiceStub.called).to.equal(false);
+  });
+
+  it('accepts scalar and array QIP-55 qrl_getLogs address filters', async () => {
+    for (const address of [qip55Address, [qip55Address, secondQip55Address]]) {
+      rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: [] });
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({
+          id: 1,
+          method: 'qrl_getLogs',
+          params: [{ fromBlock: '0x100', toBlock: '0x200', address }],
+        });
+
+      expect(res).to.have.status(200);
+      rpcServiceStub.resetHistory();
+    }
+  });
+
+  it('rejects legacy 20-byte qrl_getLogs address filters', async () => {
+    const res = await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({
+        id: 1,
+        method: 'qrl_getLogs',
+        params: [{ fromBlock: '0x100', toBlock: '0x200', address: `Q${'a'.repeat(40)}` }],
+      });
+
+    expect(res).to.have.status(400);
+    expect(res.body.error.message).to.include('Q + 128 hex chars');
+    expect(rpcServiceStub.called).to.equal(false);
+  });
+
+  it('accepts a null qrl_getLogs topics filter like the node does', async () => {
+    rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: [] });
+
+    const res = await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({
+        id: 1,
+        method: 'qrl_getLogs',
+        params: [{ fromBlock: '0x100', toBlock: '0x200', topics: null }],
+      });
+
+    expect(res).to.have.status(200);
+    expect(rpcServiceStub.calledOnce).to.equal(true);
+  });
+
+  it('accepts exact-width QIP-55 qrl_getLogs topics', async () => {
+    const topic = `0x${'a'.repeat(128)}`;
+    rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: [] });
+
+    const res = await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({
+        id: 1,
+        method: 'qrl_getLogs',
+        params: [
+          {
+            fromBlock: '0x100',
+            toBlock: '0x200',
+            topics: [topic, null, [topic, null]],
+          },
+        ],
+      });
+
+    expect(res).to.have.status(200);
+    expect(rpcServiceStub.calledOnce).to.equal(true);
+  });
+
+  it('rejects shortened event hashes in qrl_getLogs topics', async () => {
+    const res = await request
+      .execute(app)
+      .post('/api/qrl-rpc/dev')
+      .send({
+        id: 1,
+        method: 'qrl_getLogs',
+        params: [
+          {
+            fromBlock: '0x100',
+            toBlock: '0x200',
+            topics: [`0x${'a'.repeat(64)}`],
+          },
+        ],
+      });
+
+    expect(res).to.have.status(400);
+    expect(res.body.error.message).to.include('64-byte values');
+    expect(rpcServiceStub.called).to.equal(false);
+  });
+
   it('enforces the 50KB JSON limit for chunked bodies without Content-Length', async () => {
     const server = createServer(app);
     await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
@@ -147,7 +268,7 @@ describe('RPC Routes', () => {
       const address = server.address();
       const body = JSON.stringify({
         method: 'qrl_call',
-        params: [{ to: 'Q' + 'a'.repeat(40), data: 'x'.repeat(60 * 1024) }],
+        params: [{ to: qip55Address, data: 'x'.repeat(60 * 1024) }],
       });
       const status = await new Promise((resolve, reject) => {
         const req = httpRequest(
