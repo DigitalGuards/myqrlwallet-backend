@@ -15,7 +15,7 @@ The backend provides two main services:
 - CORS handling for browser requests
 
 ### 2. Transaction History (`POST /api/tx-history`)
-- Proxies transaction history requests to Explorer (zondscan.com) API
+- Proxies transaction history requests to the configured explorer for the selected network
 - Pagination support
 
 ## Getting Started
@@ -87,6 +87,27 @@ stricter write quota. Upstream responses are streamed into a bounded parser:
 `RPC_MAX_INFLIGHT_BYTES` cap process-wide admission. Saturation returns 503;
 oversized, invalid, or failed upstream responses return 502.
 
+RPC routing returns 503 until an endpoint has a verified readiness sample. Each
+poll checks the block height, `qrl_syncing`, and the sampled block's timestamp.
+An endpoint must report `qrl_syncing: false`, have a head no older than
+`RPC_MAX_HEAD_AGE_MS` (default 300000 ms), and stay within
+`RPC_MAX_HEAD_FUTURE_MS` (default 60000 ms) of the server clock. Ready endpoints
+must also be within `RPC_MAX_LAG_BLOCKS` (default 8) of the highest fresh head.
+A sample expires after the greater of three poll intervals or two poll timeouts.
+`/health` reports readiness separately from the endpoint's progress state.
+Cached chain identity responses also require a currently ready endpoint.
+
+Each network can additionally pin both `RPC_EXPECTED_CHAIN_ID_<NETWORK>` (a
+positive decimal integer, at most 256 bits) and
+`RPC_EXPECTED_GENESIS_HASH_<NETWORK>` (`0x` followed by exactly 64 hex characters).
+Use the `DEV`, `TESTNET`, or `MAINNET` suffix. Both variables must be absent to
+disable identity binding; partial, blank, or malformed pins stop startup.
+Configured polls verify `qrl_chainId` and block zero's hash within the existing
+poll timeout and response limits. A failed poll immediately revokes that
+endpoint's identity readiness, including cached responses, independently of the
+progress-state failure threshold. A new complete matching poll is required to
+restore readiness. Keep deployment-specific pins and upstream URLs server-side.
+
 Relay payloads use the same byte budgets for offline buffering and live
 transport delivery. A slow counterparty cannot grow Socket.IO's internal
 egress queue without bound; accepted buffered payloads are delivered on its
@@ -97,8 +118,18 @@ next reconnect. Custom relay control events also share a per-IP rate limit.
 ```bash
 curl -X POST https://qrlwallet.com/api/tx-history \
   -H "Content-Type: application/json" \
-  -d '{"address": "Q1234...", "page": 1, "limit": 10}'
+  -d '{"network": "testnet", "address": "Q1234...", "page": 1, "limit": 10}'
 ```
+
+The required `network` field accepts `dev`, `testnet`, or `mainnet`. A missing or
+invalid network returns 400. Configure fixed explorer origins using
+`TX_HISTORY_ORIGIN_DEV`, `TX_HISTORY_ORIGIN_TESTNET`, and
+`TX_HISTORY_ORIGIN_MAINNET`; requests cannot select a destination URL. Testnet
+defaults to `https://zondscan.com`. Dev and mainnet are unconfigured by default,
+and any unconfigured network returns 501 with `HISTORY_UNAVAILABLE`. A blank
+origin disables history for that network. Origins must be credential-free HTTPS
+origins, with HTTP allowed only for explicit loopback origins. History requests
+retain an 8-second timeout, a 2 MiB response limit, and disabled redirects.
 
 ## Docker Deployment
 

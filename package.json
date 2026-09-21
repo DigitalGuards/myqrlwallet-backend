@@ -6,7 +6,10 @@
   "type": "module",
   "overrides": {
     "serialize-javascript": "^7.0.5",
-    "diff": "^8.0.3"
+    "diff": "^8.0.3",
+    "express": {
+      "qs": "^6.16.0"
+    }
   },
   "scripts": {
     "start": "node server.js",
