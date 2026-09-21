@@ -159,8 +159,17 @@ class RPCService {
       throw new Error('Invalid network');
     }
 
+    // Even invariant cached responses require a currently ready endpoint with
+    // any configured identity verified. An old chain ID cannot mask a failed poll.
+    const attemptOrder = healthMonitor.readyEndpointsForAttempt(network);
+    if (attemptOrder.length === 0) {
+      throw new HttpError(503, 'No ready RPC endpoint for this network');
+    }
+
     const isCacheable = CACHEABLE_METHODS.has(method);
-    const cacheKey = `${network}-${method}-${JSON.stringify(params)}`;
+    const identity = CONFIG.RPC_EXPECTED_IDENTITIES[network];
+    const identityKey = identity === null ? '' : `${identity.chainId}-${identity.genesisHash}-`;
+    const cacheKey = `${network}-${identityKey}${method}-${JSON.stringify(params)}`;
 
     if (isCacheable) {
       // Only the upstream `result` value is cached, never the envelope:
@@ -172,20 +181,10 @@ class RPCService {
       }
     }
 
-    // Order endpoints by health; if monitor has no entries (e.g. startup before
-    // first poll, or test setup), fall through to the static config list.
-    let attemptOrder = healthMonitor.orderEndpointsForAttempt(network);
-    if (attemptOrder.length === 0) {
-      attemptOrder = [...CONFIG.RPC_ENDPOINTS[network]];
-    }
-    if (attemptOrder.length === 0) {
-      throw new Error('Invalid network');
-    }
-
-    // Pin primary-only methods to attemptOrder[0]; failing over `txpool_*` to a
-    // node that doesn't expose it surfaces a confusing "method not found"
-    // instead of a clean transport error.
-    const order = isPrimaryOnlyMethod(method) ? attemptOrder.slice(0, 1) : attemptOrder.slice(0, 2);
+    const order = isPrimaryOnlyMethod(method)
+      ? attemptOrder.filter((url) => url === CONFIG.RPC_ENDPOINTS[network][0])
+      : attemptOrder.slice(0, 2);
+    if (order.length === 0) throw new HttpError(503, 'Primary RPC endpoint is not ready');
 
     let lastError: Error | undefined;
     let result: unknown;
