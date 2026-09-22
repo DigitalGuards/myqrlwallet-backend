@@ -187,6 +187,57 @@ describe('RPC Routes', () => {
     });
   });
 
+  describe('qrl_maxPriorityFeePerGas', () => {
+    const method = 'qrl_maxPriorityFeePerGas';
+
+    for (const [name, params] of [
+      ['empty params', []],
+      ['missing params', undefined],
+      ['null params', null],
+    ]) {
+      it(`forwards a suggested-tip request with ${name}`, async () => {
+        const envelope = { jsonrpc: '2.0', id: 'tip', result: '0x3b9aca00' };
+        rpcServiceStub.resolves(envelope);
+
+        const res = await request
+          .execute(app)
+          .post('/api/qrl-rpc/dev')
+          .send({ jsonrpc: '2.0', id: 'tip', method, params });
+
+        expect(res).to.have.status(200);
+        expect(res.body).to.deep.equal(envelope);
+        expect(rpcServiceStub.calledOnce).to.equal(true);
+        expect(rpcServiceStub.firstCall.args[1]).to.equal(method);
+      });
+    }
+
+    for (const [name, params] of [
+      ['a block tag', ['latest']],
+      ['an object', [{}]],
+      ['string params', 'latest'],
+    ]) {
+      it(`rejects ${name} before forwarding`, async () => {
+        const res = await request
+          .execute(app)
+          .post('/api/qrl-rpc/dev')
+          .send({ jsonrpc: '2.0', id: 'bad-tip', method, params });
+
+        expect(res).to.have.status(400);
+        expect(res.body.id).to.equal('bad-tip');
+        expect(res.body.error.code).to.equal(-32602);
+        expect(rpcServiceStub.called).to.equal(false);
+      });
+    }
+
+    it('lists the method in public method documentation', async () => {
+      const res = await request.execute(app).get('/api/qrl-rpc/dev');
+
+      expect(res).to.have.status(200);
+      expect(res.body.allowed_methods).to.include(method);
+      expect(res.body.allowed_methods).not.to.include('qrl_feeHistory');
+    });
+  });
+
   for (const method of [
     'qrl_getBlockReceipts',
     'qrl_getTransactionByBlockHashAndIndex',
