@@ -11,7 +11,7 @@ const log = logger.child({ module: 'rpc-security' });
 
 /**
  * Whitelist of allowed RPC methods.
- * These are the only methods actually used by the frontend.
+ * Supports wallet operations and individual transaction lookups.
  */
 const ALLOWED_RPC_METHODS = new Set([
   // Account/Balance Operations
@@ -24,6 +24,7 @@ const ALLOWED_RPC_METHODS = new Set([
   'qrl_estimateGas',
   'qrl_sendRawTransaction',
   'qrl_getTransactionReceipt',
+  'qrl_getTransactionByHash',
 
   // Contract Operations
   'qrl_getCode',
@@ -248,7 +249,12 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
       break;
     }
 
-    case 'qrl_getTransactionReceipt': {
+    case 'qrl_getTransactionReceipt':
+    case 'qrl_getTransactionByHash': {
+      if (method === 'qrl_getTransactionByHash' && params?.length !== 1) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: exactly one transaction hash required');
+        return;
+      }
       // Requires a transaction hash
       const txHash = params?.[0];
       if (typeof txHash !== 'string') {

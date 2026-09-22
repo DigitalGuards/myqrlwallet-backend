@@ -65,6 +65,149 @@ describe('RPC Routes', () => {
     expect(rpcServiceStub.firstCall.args[3]).to.equal(null);
   });
 
+  describe('qrl_getTransactionByHash', () => {
+    const method = 'qrl_getTransactionByHash';
+    const hash = `0x${'ab'.repeat(32)}`;
+
+    for (const [name, txHash, id] of [
+      ['lowercase', hash, 'tx-lookup'],
+      ['uppercase digits', `0x${'AB'.repeat(32)}`, 42],
+      ['mixed-case digits', `0x${'aB'.repeat(32)}`, null],
+    ]) {
+      it(`forwards a ${name} hash and the caller id unchanged`, async () => {
+        const result = { hash: txHash, value: '0x64', blockNumber: '0x10' };
+        const envelope = { jsonrpc: '2.0', id, result };
+        rpcServiceStub.resolves(envelope);
+
+        const res = await request
+          .execute(app)
+          .post('/api/qrl-rpc/dev')
+          .send({ jsonrpc: '2.0', id, method, params: [txHash] });
+
+        expect(res).to.have.status(200);
+        expect(res.body).to.deep.equal(envelope);
+        expect(rpcServiceStub.calledOnceWithExactly('dev', method, [txHash], id)).to.equal(true);
+      });
+    }
+
+    it('preserves a null result for an unknown transaction', async () => {
+      const envelope = { jsonrpc: '2.0', id: 'unknown-tx', result: null };
+      rpcServiceStub.resolves(envelope);
+
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({ jsonrpc: '2.0', id: envelope.id, method, params: [hash] });
+
+      expect(res).to.have.status(200);
+      expect(res.body).to.deep.equal(envelope);
+      expect(rpcServiceStub.calledOnce).to.equal(true);
+    });
+
+    for (const [name, params] of [
+      ['missing params', undefined],
+      ['null params', null],
+      ['empty params', []],
+      ['extra params', [hash, true]],
+      ['string params', hash],
+      ['object params', { hash }],
+      ['null hash', [null]],
+      ['numeric hash', [1]],
+      ['object hash', [{ hash }]],
+      ['nested hash', [[hash]]],
+      ['empty hash', ['']],
+      ['missing prefix', ['ab'.repeat(32)]],
+      ['uppercase prefix', [`0X${'ab'.repeat(32)}`]],
+      ['short hash', [`0x${'a'.repeat(63)}`]],
+      ['long hash', [`0x${'a'.repeat(65)}`]],
+      ['non-hex hash', [`0x${'g'.repeat(64)}`]],
+      ['QRL address', [qip55Address]],
+      ['64-byte value', [`0x${'a'.repeat(128)}`]],
+      ['padded hash', [` ${hash}`]],
+      ['trailing newline', [`${hash}\n`]],
+    ]) {
+      it(`rejects ${name} before forwarding`, async () => {
+        const res = await request
+          .execute(app)
+          .post('/api/qrl-rpc/dev')
+          .send({ jsonrpc: '2.0', id: 'invalid-lookup', method, params });
+
+        expect(res).to.have.status(400);
+        expect(res.body.jsonrpc).to.equal('2.0');
+        expect(res.body.id).to.equal('invalid-lookup');
+        expect(res.body.error.code).to.equal(-32602);
+        expect(rpcServiceStub.called).to.equal(false);
+      });
+    }
+
+    it('rejects batched transaction lookups before forwarding', async () => {
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send([{ jsonrpc: '2.0', id: 'batch-lookup', method, params: [hash] }]);
+
+      expect(res).to.have.status(400);
+      expect(res.body.error.code).to.equal(-32600);
+      expect(rpcServiceStub.called).to.equal(false);
+    });
+
+    it('lists the lookup in public method documentation', async () => {
+      const res = await request.execute(app).get('/api/qrl-rpc/dev');
+
+      expect(res).to.have.status(200);
+      expect(res.body.allowed_methods).to.include(method);
+      expect(res.body.allowed_methods).not.to.include('qrl_getBlockReceipts');
+    });
+
+    it('charges valid and malformed lookups to the general admission limit', async () => {
+      CONFIG.RPC_RATE_LIMIT_PER_MINUTE = 2;
+      const originalTrustedProxies = [...CONFIG.TRUSTED_PROXY_CIDRS];
+      CONFIG.TRUSTED_PROXY_CIDRS = ['loopback'];
+      rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: null });
+
+      try {
+        const lookup = (params, id) =>
+          request
+            .execute(app)
+            .post('/api/qrl-rpc/dev')
+            .set('X-Forwarded-For', '198.51.100.243')
+            .send({ jsonrpc: '2.0', id, method, params });
+
+        expect(await lookup([hash], 1)).to.have.status(200);
+        expect(await lookup([], 2)).to.have.status(400);
+        const limited = await lookup([hash], 3);
+        expect(limited).to.have.status(429);
+        // Admission runs before JSON parsing, so the caller id is unavailable here.
+        expect(limited.body.id).to.equal(null);
+        expect(limited.body.error.code).to.equal(-32005);
+        expect(rpcServiceStub.calledOnce).to.equal(true);
+      } finally {
+        CONFIG.TRUSTED_PROXY_CIDRS = originalTrustedProxies;
+      }
+    });
+  });
+
+  for (const method of [
+    'qrl_getBlockReceipts',
+    'qrl_getTransactionByBlockHashAndIndex',
+    'debug_traceTransaction',
+    'admin_peers',
+    'txpool_content',
+    'eth_getTransactionByHash',
+  ]) {
+    it(`keeps ${method} blocked`, async () => {
+      const res = await request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({ jsonrpc: '2.0', id: 'blocked-method', method, params: [`0x${'a'.repeat(64)}`] });
+
+      expect(res).to.have.status(403);
+      expect(res.body.id).to.equal('blocked-method');
+      expect(res.body.error.code).to.equal(-32601);
+      expect(rpcServiceStub.called).to.equal(false);
+    });
+  }
+
   it('should handle errors from RPC service', async () => {
     rpcServiceStub.rejects(new Error('RPC Error'));
 
