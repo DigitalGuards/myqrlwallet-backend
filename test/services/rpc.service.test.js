@@ -220,6 +220,40 @@ describe('RPC Service', () => {
       expect(second.result).to.deep.equal({ status: '0x1', blockNumber: '0x10' });
     });
 
+    it('keeps transaction-by-hash lookups fresh from unknown to pending to mined', async () => {
+      const hash = `0x${'a'.repeat(64)}`;
+      const pending = { hash, value: '0x64', blockHash: null, blockNumber: null };
+      const mined = { ...pending, blockHash: `0x${'b'.repeat(64)}`, blockNumber: '0x10' };
+      const stub = sinon.stub(rpcService, 'makeRPCCall');
+      const cacheRead = sinon.spy(cache, 'get');
+      const cacheWrite = sinon.spy(cache, 'set');
+      const states = [null, pending, mined];
+
+      for (const [index, result] of states.entries()) {
+        const id = `lookup-${index}`;
+        const envelope = { jsonrpc: '2.0', id, result };
+        stub.onCall(index).resolves(envelope);
+
+        const response = await rpcService.executeRPC(
+          'testnet',
+          'qrl_getTransactionByHash',
+          [hash],
+          id
+        );
+
+        expect(response).to.deep.equal(envelope);
+        expect(stub.getCall(index).args.slice(1)).to.deep.equal([
+          'qrl_getTransactionByHash',
+          [hash],
+          id,
+        ]);
+      }
+
+      expect(stub.callCount).to.equal(3);
+      expect(cacheRead.called).to.equal(false);
+      expect(cacheWrite.called).to.equal(false);
+    });
+
     it('should NOT cache qrl_sendRawTransaction', async () => {
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.resolves({ jsonrpc: '2.0', id: 1, result: '0x' + '1'.repeat(64) });
@@ -283,6 +317,30 @@ describe('RPC Service', () => {
   });
 
   describe('JSON-RPC id passthrough', () => {
+    it('serializes the exact transaction lookup and caller id upstream', async () => {
+      const hash = `0x${'aB'.repeat(32)}`;
+      const id = 'transaction-lookup';
+      const encoded = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id, result: null }));
+      const fetchStub = sinon
+        .stub(globalThis, 'fetch')
+        .resolves(buildRpcResponse({ chunks: [encoded] }));
+
+      const result = await rpcService.makeRPCCall(
+        'http://upstream.test:8545',
+        'qrl_getTransactionByHash',
+        [hash],
+        id
+      );
+
+      expect(JSON.parse(fetchStub.firstCall.args[1].body)).to.deep.equal({
+        jsonrpc: '2.0',
+        id,
+        method: 'qrl_getTransactionByHash',
+        params: [hash],
+      });
+      expect(result).to.deep.equal({ jsonrpc: '2.0', id, result: null });
+    });
+
     it('forwards the client id upstream', async () => {
       const stub = sinon.stub(rpcService, 'makeRPCCall');
       stub.resolves({ jsonrpc: '2.0', id: 'client-id-9', result: '0x100' });
@@ -294,6 +352,35 @@ describe('RPC Service', () => {
   });
 
   describe('upstream response admission', () => {
+    it('times out a transaction lookup and releases its concurrency reservation', async () => {
+      CONFIG.RPC_MAX_CONCURRENT = 1;
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout'] });
+      const fetchStub = sinon.stub(globalThis, 'fetch');
+      fetchStub.onFirstCall().callsFake(
+        (_url, { signal }) =>
+          new Promise((_resolve, reject) => {
+            signal.addEventListener('abort', () =>
+              reject(new DOMException('Aborted', 'AbortError'))
+            );
+          })
+      );
+      fetchStub.onSecondCall().resolves(buildRpcResponse());
+
+      const result = rpcService
+        .makeRPCCall('http://upstream.test:8545', 'qrl_getTransactionByHash', [
+          `0x${'a'.repeat(64)}`,
+        ])
+        .catch((error) => error);
+      await clock.tickAsync(CONFIG.RPC_HEALTH.REQUEST_TIMEOUT_MS);
+
+      expect(await result).to.include({ status: 502, message: 'RPC upstream timeout' });
+      expect(fetchStub.firstCall.args[1].signal.aborted).to.equal(true);
+
+      await rpcService.makeRPCCall('http://upstream.test:8545', 'qrl_blockNumber', []);
+      expect(fetchStub.callCount).to.equal(2);
+      expect(clock.countTimers()).to.equal(0);
+    });
+
     it('parses a valid response from bounded chunks', async () => {
       const encoded = Buffer.from(JSON.stringify({ jsonrpc: '2.0', id: 7, result: '0x77' }));
       sinon.stub(globalThis, 'fetch').resolves(
