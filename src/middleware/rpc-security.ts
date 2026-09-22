@@ -21,6 +21,7 @@ const ALLOWED_RPC_METHODS = new Set([
 
   // Transaction Operations
   'qrl_gasPrice',
+  'qrl_maxPriorityFeePerGas', // Suggested EIP-1559 tip; web3 libraries call it when fees are unset
   'qrl_estimateGas',
   'qrl_sendRawTransaction',
   'qrl_getTransactionReceipt',
@@ -244,6 +245,15 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
       // text that happens to carry a 0x prefix.
       if (!/^0x(?:[a-fA-F0-9]{2})+$/.test(rawTx)) {
         sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
+        return;
+      }
+      break;
+    }
+
+    case 'qrl_maxPriorityFeePerGas': {
+      // Parameterless on the node; reject anything else rather than forward it.
+      if (params !== undefined && params !== null && params.length !== 0) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: no params expected');
         return;
       }
       break;
