@@ -95,6 +95,7 @@ export interface AppConfig {
   RELAY_MAX_ACTIVE_SOCKETS: number;
   RELAY_MAX_SOCKETS_PER_IP: number;
   RELAY_MAX_ACTIVE_CHANNELS: number;
+  RELAY_MAX_CHANNELS_PER_IP: number;
   RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: number;
   RELAY_MAX_BUFFERED_BYTES_PER_IP: number;
   RELAY_MAX_BUFFERED_BYTES_GLOBAL: number;
@@ -111,6 +112,7 @@ export interface AppConfig {
   RPC_WRITE_RATE_LIMIT_PER_MINUTE: number;
   RPC_MAX_RESPONSE_BYTES: number;
   RPC_MAX_CONCURRENT: number;
+  RPC_MAX_CONCURRENT_PER_CLIENT: number;
   RPC_MAX_INFLIGHT_BYTES: number;
   IPFS_FETCH_TIMEOUT_MS: number;
   IPFS_MAX_SIZE_BYTES: number;
@@ -155,6 +157,9 @@ function parseRequiredNetworks(value: string | undefined): NetworkName[] {
   return Array.from(new Set(requested));
 }
 
+const rpcMaxConcurrent = parsePositiveInt(process.env.RPC_MAX_CONCURRENT, 16);
+const rpcMaxResponseBytes = parsePositiveInt(process.env.RPC_MAX_RESPONSE_BYTES, 8 * 1024 * 1024);
+
 export const CONFIG: AppConfig = {
   PORT: parsePositiveInt(process.env.PORT, 3000),
   // Binding to loopback is the safe default for the PM2 + local-nginx
@@ -168,6 +173,7 @@ export const CONFIG: AppConfig = {
   RELAY_MAX_ACTIVE_SOCKETS: parsePositiveInt(process.env.RELAY_MAX_ACTIVE_SOCKETS, 5000),
   RELAY_MAX_SOCKETS_PER_IP: parsePositiveInt(process.env.RELAY_MAX_SOCKETS_PER_IP, 25),
   RELAY_MAX_ACTIVE_CHANNELS: parsePositiveInt(process.env.RELAY_MAX_ACTIVE_CHANNELS, 20000),
+  RELAY_MAX_CHANNELS_PER_IP: parsePositiveInt(process.env.RELAY_MAX_CHANNELS_PER_IP, 25),
   RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL: parsePositiveInt(
     process.env.RELAY_MAX_BUFFERED_BYTES_PER_CHANNEL,
     2 * 1024 * 1024
@@ -244,9 +250,15 @@ export const CONFIG: AppConfig = {
     process.env.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
     10
   ),
-  RPC_MAX_RESPONSE_BYTES: parsePositiveInt(process.env.RPC_MAX_RESPONSE_BYTES, 8 * 1024 * 1024),
-  RPC_MAX_CONCURRENT: parsePositiveInt(process.env.RPC_MAX_CONCURRENT, 16),
-  RPC_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.RPC_MAX_INFLIGHT_BYTES, 64 * 1024 * 1024),
+  RPC_MAX_RESPONSE_BYTES: rpcMaxResponseBytes,
+  RPC_MAX_CONCURRENT: rpcMaxConcurrent,
+  RPC_MAX_CONCURRENT_PER_CLIENT: parsePositiveInt(process.env.RPC_MAX_CONCURRENT_PER_CLIENT, 4),
+  // Defaults to CONCURRENT x RESPONSE so RPC_MAX_CONCURRENT is the binding
+  // limit; an explicit smaller value lowers the effective concurrency.
+  RPC_MAX_INFLIGHT_BYTES: parsePositiveInt(
+    process.env.RPC_MAX_INFLIGHT_BYTES,
+    rpcMaxConcurrent * rpcMaxResponseBytes
+  ),
 
   IPFS_FETCH_TIMEOUT_MS: parsePositiveInt(process.env.IPFS_FETCH_TIMEOUT_MS, 8000),
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),

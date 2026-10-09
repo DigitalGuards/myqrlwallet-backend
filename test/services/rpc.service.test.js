@@ -61,6 +61,7 @@ describe('RPC Service', () => {
     originalRpcLimits = {
       RPC_MAX_RESPONSE_BYTES: CONFIG.RPC_MAX_RESPONSE_BYTES,
       RPC_MAX_CONCURRENT: CONFIG.RPC_MAX_CONCURRENT,
+      RPC_MAX_CONCURRENT_PER_CLIENT: CONFIG.RPC_MAX_CONCURRENT_PER_CLIENT,
       RPC_MAX_INFLIGHT_BYTES: CONFIG.RPC_MAX_INFLIGHT_BYTES,
     };
   });
@@ -72,12 +73,12 @@ describe('RPC Service', () => {
     healthMonitor.__resetForTesting();
   });
 
-  it('should validate network parameter', async () => {
+  it('rejects an unknown network with a 404 HttpError', async () => {
     try {
       await rpcService.executeRPC('invalid-network', 'qrl_blockNumber', []);
       expect.fail('Should have thrown an error');
     } catch (error) {
-      expect(error.message).to.equal('Invalid network');
+      expect(error).to.include({ status: 404, message: 'Unknown network' });
     }
   });
 
@@ -242,7 +243,7 @@ describe('RPC Service', () => {
         );
 
         expect(response).to.deep.equal(envelope);
-        expect(stub.getCall(index).args.slice(1)).to.deep.equal([
+        expect(stub.getCall(index).args.slice(1, 4)).to.deep.equal([
           'qrl_getTransactionByHash',
           [hash],
           id,
@@ -348,6 +349,46 @@ describe('RPC Service', () => {
       await rpcService.executeRPC('testnet', 'qrl_blockNumber', [], 'client-id-9');
 
       expect(stub.firstCall.args[3]).to.equal('client-id-9');
+    });
+  });
+
+  describe('per-client upstream concurrency', () => {
+    it('caps one client below the global limit and leaves other clients unaffected', async () => {
+      CONFIG.RPC_MAX_CONCURRENT = 8;
+      CONFIG.RPC_MAX_INFLIGHT_BYTES = 8 * CONFIG.RPC_MAX_RESPONSE_BYTES;
+      CONFIG.RPC_MAX_CONCURRENT_PER_CLIENT = 2;
+      const releases = [];
+      sinon.stub(globalThis, 'fetch').callsFake(
+        () =>
+          new Promise((resolve) => {
+            releases.push(() => resolve(buildRpcResponse()));
+          })
+      );
+      const call = (client) =>
+        rpcService
+          .makeRPCCall('http://upstream.test:8545', 'qrl_call', [{}], 1, client)
+          .catch((error) => error);
+
+      const held = [call('192.0.2.1'), call('192.0.2.1')];
+      const blocked = await call('192.0.2.1');
+      expect(blocked).to.include({ status: 429 });
+
+      const other = call('192.0.2.2');
+      expect(releases).to.have.length(3);
+      for (const release of releases) release();
+      expect((await other).result).to.equal('0x1');
+      await Promise.all(held);
+
+      // Slots return once the calls finish.
+      const again = call('192.0.2.1');
+      releases[releases.length - 1]();
+      expect((await again).result).to.equal('0x1');
+    });
+
+    it('sizes the default in-flight budget so RPC_MAX_CONCURRENT binds', () => {
+      expect(CONFIG.RPC_MAX_INFLIGHT_BYTES).to.be.at.least(
+        CONFIG.RPC_MAX_CONCURRENT * CONFIG.RPC_MAX_RESPONSE_BYTES
+      );
     });
   });
 

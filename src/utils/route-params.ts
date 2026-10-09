@@ -1,4 +1,5 @@
 import type { Request } from 'express';
+import { isArray } from './guards.js';
 
 /**
  * Route parameter readers for Express 5.
@@ -32,7 +33,7 @@ export function readStringParam(req: Request, name: string): string {
 export function readWildcardParam(req: Request, name: string): string {
   const raw: unknown = req.params[name];
   if (typeof raw === 'string') return raw;
-  if (!Array.isArray(raw)) return '';
+  if (!isArray(raw)) return '';
   const segments: string[] = [];
   for (const segment of raw) {
     if (typeof segment !== 'string') return '';
