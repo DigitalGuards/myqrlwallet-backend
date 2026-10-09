@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { isIP } from 'node:net';
 
 // Load environment variables from .env file
 dotenv.config({ quiet: true });
@@ -46,6 +47,65 @@ export function parsePositiveInt(value: string | undefined, fallback: number): n
 export function parseNonNegativeInt(value: string | undefined, fallback: number): number {
   const n = parseInt(value ?? '', 10);
   return Number.isInteger(n) && n >= 0 ? n : fallback;
+}
+
+/** Gateway configuration is validated before the application can listen. */
+export function parseIpfsGateways(list: unknown, legacy: unknown): string[] {
+  if (list === undefined && legacy === undefined) {
+    // ipfs.io and dweb.link retired HTTP serving in September 2026. Filebase
+    // leads after fast responses with correct content types in gateway probes.
+    // Pinata is a slow late fallback and returns a Cloudflare JS challenge under
+    // load. A self-hosted gateway configured through IPFS_GATEWAYS is the durable option.
+    return ['https://ipfs.filebase.io/ipfs/', 'https://gateway.pinata.cloud/ipfs/'];
+  }
+
+  const name = list === undefined ? 'IPFS_GATEWAY' : 'IPFS_GATEWAYS';
+  const value = list === undefined ? legacy : list;
+  if (typeof value !== 'string') throw new Error(`${name} must contain HTTPS gateway URLs`);
+  const entries = list === undefined ? [value] : value.split(',');
+  return Array.from(
+    new Set(
+      entries.map((entry, index) => {
+        const input = entry.trim();
+        try {
+          const url = new URL(input);
+          const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+          url.pathname = url.pathname.replace(/\/+$/, '') + '/';
+          if (
+            !/^https:\/\/[^/]/i.test(input) ||
+            /[\\\s@?#,]/.test(input) ||
+            url.protocol !== 'https:' ||
+            url.hostname.length === 0 ||
+            isIP(hostname) !== 0 ||
+            url.port === '0' ||
+            url.pathname !== '/ipfs/' ||
+            url.username ||
+            url.password
+          ) {
+            throw new Error('invalid gateway');
+          }
+          return url.href;
+        } catch {
+          throw new Error(
+            `${name} entry ${index + 1} must be an absolute HTTPS URL with a DNS hostname, a nonzero port, and base path /ipfs/ without credentials, query, or fragment`
+          );
+        }
+      })
+    )
+  );
+}
+
+function loadIpfsGateways(): string[] {
+  try {
+    return parseIpfsGateways(process.env.IPFS_GATEWAYS, process.env.IPFS_GATEWAY);
+  } catch (error) {
+    // Configuration initializes before the structured logger is available.
+    console.error(
+      'Invalid IPFS gateway configuration:',
+      error instanceof Error ? error.message : 'invalid value'
+    );
+    throw error;
+  }
 }
 
 export interface RpcHealthConfig {
@@ -114,7 +174,12 @@ export interface AppConfig {
   RPC_MAX_CONCURRENT: number;
   RPC_MAX_CONCURRENT_PER_CLIENT: number;
   RPC_MAX_INFLIGHT_BYTES: number;
+  IPFS_GATEWAYS: string[];
   IPFS_FETCH_TIMEOUT_MS: number;
+  IPFS_FALLBACK_RESERVE_MS: number;
+  IPFS_MAX_COOLDOWN_MS: number;
+  IPFS_SERVER_ERROR_MIN_CIDS: number;
+  IPFS_SERVER_ERROR_WINDOW_MS: number;
   IPFS_MAX_SIZE_BYTES: number;
   IPFS_MAX_CONCURRENT: number;
   IPFS_MAX_INFLIGHT_BYTES: number;
@@ -260,7 +325,21 @@ export const CONFIG: AppConfig = {
     rpcMaxConcurrent * rpcMaxResponseBytes
   ),
 
+  IPFS_GATEWAYS: loadIpfsGateways(),
   IPFS_FETCH_TIMEOUT_MS: parsePositiveInt(process.env.IPFS_FETCH_TIMEOUT_MS, 8000),
+  IPFS_FALLBACK_RESERVE_MS: Math.max(
+    250,
+    parsePositiveInt(process.env.IPFS_FALLBACK_RESERVE_MS, 1000)
+  ),
+  IPFS_MAX_COOLDOWN_MS: Math.max(
+    900_000,
+    parsePositiveInt(process.env.IPFS_MAX_COOLDOWN_MS, 900_000)
+  ),
+  IPFS_SERVER_ERROR_MIN_CIDS: Math.max(
+    3,
+    parsePositiveInt(process.env.IPFS_SERVER_ERROR_MIN_CIDS, 3)
+  ),
+  IPFS_SERVER_ERROR_WINDOW_MS: parsePositiveInt(process.env.IPFS_SERVER_ERROR_WINDOW_MS, 60_000),
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),
