@@ -1,9 +1,124 @@
 import * as chai from 'chai';
 import { spawnSync } from 'node:child_process';
-import { parseHistoryOrigin, parseRpcIdentity, resolveListenHost } from '../src/config/index.js';
+import {
+  parseHistoryOrigin,
+  parseIpfsGateways,
+  parseRpcIdentity,
+  resolveListenHost,
+} from '../src/config/index.js';
 import { normalizeClientIpForLimits } from '../src/utils/client-ip.js';
 
 const { expect } = chai;
+
+describe('IPFS gateway configuration', () => {
+  it('defaults to the ordered public gateway list', () => {
+    expect(parseIpfsGateways(undefined, undefined)).to.deep.equal([
+      'https://ipfs.io/ipfs/',
+      'https://gateway.pinata.cloud/ipfs/',
+      'https://dweb.link/ipfs/',
+    ]);
+  });
+
+  it('trims, normalizes, and deduplicates an ordered list ahead of the legacy value', () => {
+    expect(
+      parseIpfsGateways(
+        ' https://first.example/ipfs, https://second.example/ipfs///, https://first.example/ipfs/ ',
+        'invalid legacy value'
+      )
+    ).to.deep.equal(['https://first.example/ipfs/', 'https://second.example/ipfs/']);
+  });
+
+  it('preserves a single legacy HTTPS gateway when the list is absent', () => {
+    expect(parseIpfsGateways(undefined, ' https://legacy.example/ipfs ')).to.deep.equal([
+      'https://legacy.example/ipfs/',
+    ]);
+  });
+
+  it('rejects malformed, blank, unsafe, and non-string entries without disclosing their values', () => {
+    for (const value of [
+      '',
+      ' ',
+      'https://valid.example/ipfs,',
+      ',https://valid.example/ipfs',
+      'https://valid.example/ipfs,,https://other.example/ipfs',
+      'http://gateway.example/ipfs',
+      '//gateway.example/ipfs',
+      '/ipfs/',
+      'gateway.example/ipfs',
+      'https:gateway.example/ipfs',
+      'https:///gateway.example/ipfs',
+      'https://gateway.example/white space',
+      'https://gateway.example/line\nbreak',
+      'https://gateway.example\\ipfs',
+      'https://gateway.example:invalid/ipfs',
+      'https://secret-user:secret-password@gateway.example/ipfs',
+      'https://gateway.example/ipfs?token=secret-token',
+      'https://gateway.example/ipfs#secret-fragment',
+      'https://gateway.example/ipfs?',
+      null,
+      42,
+      ['https://gateway.example/ipfs'],
+    ]) {
+      expect(() => parseIpfsGateways(value, 'https://legacy.example/ipfs')).to.throw(
+        'IPFS_GATEWAYS'
+      );
+    }
+    expect(() => parseIpfsGateways(undefined, 'http://legacy.example/ipfs')).to.throw(
+      'IPFS_GATEWAY entry 1'
+    );
+    expect(() =>
+      parseIpfsGateways(undefined, 'https://first.example,https://second.example')
+    ).to.throw('IPFS_GATEWAY entry 1');
+  });
+
+  function importConfig(env) {
+    return spawnSync(
+      process.execPath,
+      [
+        '--import',
+        'tsx',
+        '--input-type=module',
+        '--eval',
+        "import { CONFIG } from './src/config/index.ts'; console.log(JSON.stringify(CONFIG.IPFS_GATEWAYS));",
+      ],
+      { encoding: 'utf8', timeout: 5000, env: { ...process.env, ...env } }
+    );
+  }
+
+  it('loads the list from the environment ahead of the legacy single gateway', () => {
+    const child = importConfig({
+      IPFS_GATEWAYS: ' https://first.example/ipfs, https://second.example/ipfs ',
+      IPFS_GATEWAY: 'https://legacy.example/ipfs',
+    });
+    expect(child.status, child.stderr).to.equal(0);
+    expect(JSON.parse(child.stdout.trim())).to.deep.equal([
+      'https://first.example/ipfs/',
+      'https://second.example/ipfs/',
+    ]);
+  });
+
+  it('loads the legacy single gateway from the environment', () => {
+    const child = importConfig({
+      IPFS_GATEWAYS: undefined,
+      IPFS_GATEWAY: 'https://legacy.example/ipfs',
+    });
+    expect(child.status, child.stderr).to.equal(0);
+    expect(JSON.parse(child.stdout.trim())).to.deep.equal(['https://legacy.example/ipfs/']);
+  });
+
+  it('fails startup with a clear sanitized log for an invalid list or legacy value', () => {
+    for (const env of [
+      { IPFS_GATEWAYS: 'https://valid.example/ipfs,http://invalid.example/private-token' },
+      { IPFS_GATEWAYS: undefined, IPFS_GATEWAY: 'http://invalid.example/private-token' },
+    ]) {
+      const child = importConfig(env);
+      expect(child.status).to.equal(1);
+      expect(child.stderr).to.include('Invalid IPFS gateway configuration: IPFS_GATEWAY');
+      expect(child.stderr).to.include('must be an absolute HTTPS URL');
+      expect(child.stderr).not.to.include('private-token');
+    }
+  });
+});
 
 describe('server configuration', () => {
   it('leaves RPC identity binding optional only when both pins are absent', () => {

@@ -69,6 +69,7 @@ npm run lint       # eslint (strict-type-checked)
 |--------|----------|-------------|
 | POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet) |
 | POST | `/api/tx-history` | Get transaction history for address |
+| GET | `/api/ipfs/:cid[/path]` | Fetch IPFS content through ordered gateways |
 | GET | `/health` | RPC readiness check |
 | GET | `/health/live` | Process liveness check |
 
@@ -130,6 +131,30 @@ and any unconfigured network returns 501 with `HISTORY_UNAVAILABLE`. A blank
 origin disables history for that network. Origins must be credential-free HTTPS
 origins, with HTTP allowed only for explicit loopback origins. History requests
 retain an 8-second timeout, a 2 MiB response limit, and disabled redirects.
+
+### IPFS Gateway Configuration
+
+`IPFS_GATEWAYS` is an ordered, comma-separated list of absolute HTTPS gateway
+base URLs. Each URL is normalized to a trailing slash. Blank entries, malformed
+URLs, credentials, query strings, and fragments stop startup with a configuration
+error. When the list is absent, `IPFS_GATEWAY` supplies a single legacy gateway.
+When both variables are absent, the order is `https://ipfs.io/ipfs/`,
+`https://gateway.pinata.cloud/ipfs/`, then `https://dweb.link/ipfs/`.
+
+Requests advance to the next gateway on 429, 5xx, timeout, or network failure
+before streaming starts. Other 4xx responses stop the search; 404 is returned to
+the client. Each gateway request refuses redirects. A gateway that returns 429
+is skipped across requests for 60 seconds, or for its `Retry-After` delta in
+seconds or HTTP date, capped at five minutes. Invalid `Retry-After` values use
+60 seconds. Cooldowns are local to each backend process and reset on restart.
+When every gateway is cooling down, requests return 503 with `Retry-After`.
+
+`IPFS_FETCH_TIMEOUT_MS` (default 8000 ms) covers every attempt and the response
+stream. Time before the first body chunk is shared across the remaining eligible
+gateways. A stream that begins delivering bytes uses the remaining overall
+budget. Failed partial streams terminate the response. Size, memory admission,
+CID/path validation, and media handling limits apply to every gateway. Logs
+identify the gateway origin and CID without including the requested path.
 
 ## Docker Deployment
 

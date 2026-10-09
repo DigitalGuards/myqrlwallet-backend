@@ -23,8 +23,7 @@ import { setTimeout as sleep } from 'node:timers/promises';
 const BOOT_TIMEOUT_MS = 20_000;
 const POLL_INTERVAL_MS = 250;
 
-// A syntactically valid CIDv0 so the wildcard probe reaches the route handler
-// instead of being rejected as malformed before routing matters.
+// A syntactically valid CIDv0 lets the wildcard probe reach the route handler.
 const PROBE_CID = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
 
 const PROBES = ['/health', `/api/ipfs/${PROBE_CID}/path/to/asset.png`];
@@ -61,11 +60,11 @@ async function main() {
       PORT: String(port),
       LISTEN_HOST: '127.0.0.1',
       // Point every upstream at a closed local port so the health monitor
-      // fails fast instead of hanging on a real network in CI.
+      // fails fast and keeps the smoke test local.
       RPC_ENDPOINTS_TESTNET: 'http://127.0.0.1:9',
       RPC_ENDPOINTS_DEV: 'http://127.0.0.1:9',
       RPC_ENDPOINTS_MAINNET: 'http://127.0.0.1:9',
-      IPFS_GATEWAY: 'http://127.0.0.1:9/ipfs/',
+      IPFS_GATEWAYS: 'https://localhost:9/ipfs/',
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });

@@ -48,6 +48,61 @@ export function parseNonNegativeInt(value: string | undefined, fallback: number)
   return Number.isInteger(n) && n >= 0 ? n : fallback;
 }
 
+/** Gateway configuration is validated before the application can listen. */
+export function parseIpfsGateways(list: unknown, legacy: unknown): string[] {
+  if (list === undefined && legacy === undefined) {
+    return [
+      'https://ipfs.io/ipfs/',
+      'https://gateway.pinata.cloud/ipfs/',
+      'https://dweb.link/ipfs/',
+    ];
+  }
+
+  const name = list === undefined ? 'IPFS_GATEWAY' : 'IPFS_GATEWAYS';
+  const value = list === undefined ? legacy : list;
+  if (typeof value !== 'string') throw new Error(`${name} must contain HTTPS gateway URLs`);
+  const entries = list === undefined ? [value] : value.split(',');
+  return Array.from(
+    new Set(
+      entries.map((entry, index) => {
+        const input = entry.trim();
+        try {
+          const url = new URL(input);
+          if (
+            !/^https:\/\/[^/]/i.test(input) ||
+            /[\\\s?#,]/.test(input) ||
+            url.protocol !== 'https:' ||
+            url.hostname.length === 0 ||
+            url.username ||
+            url.password
+          ) {
+            throw new Error('invalid gateway');
+          }
+          url.pathname = url.pathname.replace(/\/+$/, '') + '/';
+          return url.href;
+        } catch {
+          throw new Error(
+            `${name} entry ${index + 1} must be an absolute HTTPS URL without credentials, query, or fragment`
+          );
+        }
+      })
+    )
+  );
+}
+
+function loadIpfsGateways(): string[] {
+  try {
+    return parseIpfsGateways(process.env.IPFS_GATEWAYS, process.env.IPFS_GATEWAY);
+  } catch (error) {
+    // Configuration initializes before the structured logger is available.
+    console.error(
+      'Invalid IPFS gateway configuration:',
+      error instanceof Error ? error.message : 'invalid value'
+    );
+    throw error;
+  }
+}
+
 export interface RpcHealthConfig {
   POLL_INTERVAL_MS: number;
   POLL_TIMEOUT_MS: number;
@@ -114,6 +169,7 @@ export interface AppConfig {
   RPC_MAX_CONCURRENT: number;
   RPC_MAX_CONCURRENT_PER_CLIENT: number;
   RPC_MAX_INFLIGHT_BYTES: number;
+  IPFS_GATEWAYS: string[];
   IPFS_FETCH_TIMEOUT_MS: number;
   IPFS_MAX_SIZE_BYTES: number;
   IPFS_MAX_CONCURRENT: number;
@@ -260,6 +316,7 @@ export const CONFIG: AppConfig = {
     rpcMaxConcurrent * rpcMaxResponseBytes
   ),
 
+  IPFS_GATEWAYS: loadIpfsGateways(),
   IPFS_FETCH_TIMEOUT_MS: parsePositiveInt(process.env.IPFS_FETCH_TIMEOUT_MS, 8000),
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
