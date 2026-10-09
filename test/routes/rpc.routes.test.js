@@ -86,7 +86,13 @@ describe('RPC Routes', () => {
 
         expect(res).to.have.status(200);
         expect(res.body).to.deep.equal(envelope);
-        expect(rpcServiceStub.calledOnceWithExactly('dev', method, [txHash], id)).to.equal(true);
+        expect(rpcServiceStub.calledOnce).to.equal(true);
+        expect(rpcServiceStub.firstCall.args.slice(0, 4)).to.deep.equal([
+          'dev',
+          method,
+          [txHash],
+          id,
+        ]);
       });
     }
 
@@ -577,5 +583,59 @@ describe('RPC Routes', () => {
 
     expect(res).to.have.status(400);
     expect(res.body.error.code).to.equal(-32602);
+  });
+
+  describe('qrl_getLogs filter canonicalization', () => {
+    const post = (filter, extraParams = []) =>
+      request
+        .execute(app)
+        .post('/api/qrl-rpc/dev')
+        .send({ jsonrpc: '2.0', id: 1, method: 'qrl_getLogs', params: [filter, ...extraParams] });
+
+    it('rejects case-variant block keys that the node would still honour', async () => {
+      const res = await post({ FromBlock: '0x1', TOBLOCK: 'latest' });
+      expect(res).to.have.status(400);
+      expect(res.body.error.code).to.equal(-32602);
+      expect(rpcServiceStub.called).to.equal(false);
+    });
+
+    it('rejects a case-variant key next to a valid canonical range', async () => {
+      const res = await post({ fromBlock: '0x10', toBlock: '0x20', ToBlock: 'latest' });
+      expect(res).to.have.status(400);
+      expect(rpcServiceStub.called).to.equal(false);
+    });
+
+    it('rejects a case-variant address key and unknown keys', async () => {
+      expect(
+        (await post({ fromBlock: '0x10', toBlock: '0x20', Address: ['Qbad'] })).status
+      ).to.equal(400);
+      expect((await post({ fromBlock: '0x10', toBlock: '0x20', extra: 1 })).status).to.equal(400);
+      expect(rpcServiceStub.called).to.equal(false);
+    });
+
+    it('rejects extra positional params', async () => {
+      const res = await post({ fromBlock: '0x10', toBlock: '0x20' }, ['latest']);
+      expect(res).to.have.status(400);
+    });
+
+    it('forwards a filter rebuilt from the validated fields', async () => {
+      rpcServiceStub.resolves({ jsonrpc: '2.0', id: 1, result: [] });
+      const res = await post({ fromBlock: '0x10', toBlock: '0x20', address: null, topics: null });
+      expect(res).to.have.status(200);
+      expect(rpcServiceStub.firstCall.args[2]).to.deep.equal([
+        { fromBlock: '0x10', toBlock: '0x20' },
+      ]);
+    });
+  });
+
+  it('answers an unknown network with 404 and no error-level log', async () => {
+    rpcServiceStub.restore();
+    const res = await request
+      .execute(app)
+      .post('/api/qrl-rpc/nope')
+      .send({ jsonrpc: '2.0', id: 1, method: 'qrl_blockNumber', params: [] });
+    expect(res).to.have.status(404);
+    expect(res.body.error.message).to.equal('Unknown network');
+    rpcServiceStub = sinon.stub(rpcService, 'executeRPC');
   });
 });

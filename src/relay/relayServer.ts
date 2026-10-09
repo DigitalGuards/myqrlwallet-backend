@@ -7,7 +7,7 @@
  * the relay sees only ciphertext.
  */
 
-import type { Server as HttpServer } from 'node:http';
+import type { IncomingMessage, Server as HttpServer } from 'node:http';
 import type { Transport } from 'engine.io';
 import { Server } from 'socket.io';
 import {
@@ -29,6 +29,7 @@ const RATE_LIMIT_MAX_CONTROL_EVENTS = 300; // ping/leave/close per window per IP
 const MAX_CHANNEL_ID_LENGTH = 128;
 const CHANNEL_ID_PATTERN = /^[a-zA-Z0-9_-]+$/;
 const MAX_MESSAGE_BYTES = 256 * 1024;
+const HANDSHAKE_TIMEOUT_MS = 10 * 1000;
 
 interface ParticipantsChange {
   event: 'join' | 'leave' | 'close' | 'disconnect';
@@ -77,6 +78,15 @@ function toAck(value: unknown): Ack | undefined {
   };
 }
 
+/** True when the request carries an Engine.IO session id (not a new handshake). */
+function isExistingEngineSession(req: IncomingMessage): boolean {
+  try {
+    return new URL(req.url ?? '', 'http://relay.invalid').searchParams.has('sid');
+  } catch {
+    return false;
+  }
+}
+
 /**
  * Validate channel identifiers to avoid unbounded relay state growth.
  */
@@ -111,6 +121,12 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
     pingInterval: CONFIG.RELAY_PING_INTERVAL_MS,
     pingTimeout: CONFIG.RELAY_PING_TIMEOUT_MS,
     maxHttpBufferSize: MAX_MESSAGE_BYTES,
+    // A session that never sends the Socket.IO CONNECT packet is dropped
+    // after this long; the default 45 s lets half-open sessions pile up.
+    connectTimeout: HANDSHAKE_TIMEOUT_MS,
+    allowRequest: (req, callback) => {
+      callback(null, admitEngineRequest(req));
+    },
   });
 
   const directTransportListeners = new Map<
@@ -119,6 +135,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
   >();
 
   const channelManager = new ChannelManager({
+    maxChannelsPerIp: CONFIG.RELAY_MAX_CHANNELS_PER_IP,
     isSocketActive: (socketId) => io.sockets.sockets.has(socketId),
     canSocketReceive: (socketId) => {
       const target = io.sockets.sockets.get(socketId);
@@ -199,11 +216,56 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
   }
 
   interface RateLimitEntry {
-    counts: { connect: number; message: number; join: number; control: number };
+    counts: {
+      connect: number;
+      handshake: number;
+      message: number;
+      join: number;
+      control: number;
+    };
     resetAt: number;
   }
   const rateLimits = new Map<string, RateLimitEntry>();
   const activeSocketsByIp = new Map<string, number>();
+  const engineSessionsByIp = new Map<string, number>();
+
+  /**
+   * Engine.IO admission. Runs for every HTTP request and upgrade, before a
+   * session exists, so sessions that never send the Socket.IO CONNECT packet
+   * are counted against the same per-address and global caps as full sockets.
+   * Only requests without a session id open a new session.
+   */
+  function admitEngineRequest(req: IncomingMessage): boolean {
+    if (isExistingEngineSession(req)) return true;
+
+    const ip = normalizeClientIpForLimits(getTrustedClientIp(req));
+    if (!checkRateLimit(ip, 'handshake', RATE_LIMIT_MAX_CONNECTIONS)) {
+      metrics.rateLimitHits.inc({ bucket: 'connect' });
+      return false;
+    }
+    if ((engineSessionsByIp.get(ip) ?? 0) >= CONFIG.RELAY_MAX_SOCKETS_PER_IP) {
+      metrics.rateLimitHits.inc({ bucket: 'per_ip_cap' });
+      return false;
+    }
+    if (io.engine.clientsCount >= CONFIG.RELAY_MAX_ACTIVE_SOCKETS) {
+      metrics.rateLimitHits.inc({ bucket: 'global_cap' });
+      return false;
+    }
+    return true;
+  }
+
+  io.engine.on(
+    'connection',
+    (rawSocket: { request: IncomingMessage; once: (e: 'close', l: () => void) => unknown }) => {
+      const ip = normalizeClientIpForLimits(getTrustedClientIp(rawSocket.request));
+      engineSessionsByIp.set(ip, (engineSessionsByIp.get(ip) ?? 0) + 1);
+      rawSocket.once('close', () => {
+        const count = engineSessionsByIp.get(ip) ?? 0;
+        if (count <= 1) engineSessionsByIp.delete(ip);
+        else engineSessionsByIp.set(ip, count - 1);
+      });
+    }
+  );
 
   /**
    * Check a named rate limit bucket for an IP address. Returns true if allowed.
@@ -218,7 +280,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
 
     if (!entry || now > entry.resetAt) {
       entry = {
-        counts: { connect: 0, message: 0, join: 0, control: 0 },
+        counts: { connect: 0, handshake: 0, message: 0, join: 0, control: 0 },
         resetAt: now + RATE_LIMIT_WINDOW_MS,
       };
       rateLimits.set(ip, entry);
@@ -374,7 +436,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
           joinedRoom = true;
         }
 
-        const result = channelManager.join(channelId, socket.id, clientType, publicKey);
+        const result = channelManager.join(channelId, socket.id, clientType, publicKey, clientIp);
 
         if (!result.success) {
           if (joinedRoom) await socket.leave(channelId);
@@ -653,6 +715,7 @@ export function createRelayServer(httpServer: HttpServer): RelayHandle {
   const destroy = (): void => {
     clearInterval(rateLimitCleanupTimer);
     activeSocketsByIp.clear();
+    engineSessionsByIp.clear();
     rateLimits.clear();
     for (const socketId of directTransportListeners.keys()) releaseDirectDelivery(socketId);
     channelManager.destroy();

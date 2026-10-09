@@ -6,7 +6,7 @@
  */
 
 import * as chai from 'chai';
-import { createServer } from 'http';
+import { createServer, get as httpGet } from 'http';
 import { io as ioc } from 'socket.io-client';
 import { CONFIG } from '../../src/config/index.js';
 import { createRelayServer } from '../../src/relay/relayServer.js';
@@ -368,8 +368,11 @@ describe('Relay Server', function () {
         sockets.push(await connect(relay.port));
       }
 
-      // Release one slot
+      // Release one slot and wait until the server has closed the session
       await disconnect(sockets.pop());
+      while (relay.io.engine.clientsCount >= MAX_PER_IP) {
+        await new Promise((resolve) => setTimeout(resolve, 10));
+      }
 
       // Should now be able to connect again
       const replacement = await connect(relay.port);
@@ -1440,6 +1443,78 @@ describe('Relay Server', function () {
           }
         }
       );
+    });
+  });
+
+  describe('half-open Engine.IO sessions', () => {
+    /** Open an Engine.IO polling handshake and never send the CONNECT packet. */
+    function handshake(port) {
+      return new Promise((resolve, reject) => {
+        httpGet(`http://127.0.0.1:${port}/relay/?EIO=4&transport=polling`, (res) => {
+          res.resume();
+          res.on('end', () => resolve(res.statusCode));
+        }).on('error', reject);
+      });
+    }
+
+    it('counts handshakes against the per-IP cap before the CONNECT packet', async () => {
+      const relay = await startRelay({ RELAY_MAX_SOCKETS_PER_IP: 3 });
+      try {
+        const statuses = [];
+        for (let i = 0; i < 5; i++) statuses.push(await handshake(relay.port));
+        expect(statuses.slice(0, 3)).to.deep.equal([200, 200, 200]);
+        expect(statuses.slice(3).every((status) => status === 403)).to.equal(true);
+        expect(relay.io.of('/').sockets.size).to.equal(0);
+      } finally {
+        relay.cleanup();
+      }
+    });
+
+    it('counts handshakes against the global cap before the CONNECT packet', async () => {
+      const relay = await startRelay({
+        RELAY_MAX_ACTIVE_SOCKETS: 2,
+        RELAY_MAX_SOCKETS_PER_IP: 100,
+      });
+      try {
+        expect(await handshake(relay.port)).to.equal(200);
+        expect(await handshake(relay.port)).to.equal(200);
+        expect(await handshake(relay.port)).to.equal(403);
+      } finally {
+        relay.cleanup();
+      }
+    });
+  });
+
+  describe('dApp public key binding on re-join', () => {
+    it('rejects a dApp join without a key once the channel is bound', () => {
+      const cm = new ChannelManager({ isSocketActive: () => false });
+      try {
+        expect(cm.join('bound-chan', 'dapp-1', 'dapp', TEST_DAPP_PK).success).to.equal(true);
+        const squatter = cm.join('bound-chan', 'squatter', 'dapp');
+        expect(squatter.success).to.equal(false);
+        expect(squatter.error).to.include('public key required');
+        expect(cm.join('bound-chan', 'dapp-2', 'dapp', TEST_DAPP_PK).success).to.equal(true);
+      } finally {
+        cm.destroy();
+      }
+    });
+  });
+
+  describe('per-address channel cap', () => {
+    it('limits live channels created from one address', () => {
+      const cm = new ChannelManager({ maxChannelsPerIp: 2 });
+      try {
+        expect(cm.join('own-1', 's1', 'dapp', TEST_DAPP_PK, '192.0.2.1').success).to.equal(true);
+        expect(cm.join('own-2', 's2', 'dapp', TEST_DAPP_PK, '192.0.2.1').success).to.equal(true);
+        const third = cm.join('own-3', 's3', 'dapp', TEST_DAPP_PK, '192.0.2.1');
+        expect(third.success).to.equal(false);
+        expect(third.error).to.include('Too many open channels');
+        expect(cm.join('own-4', 's4', 'dapp', TEST_DAPP_PK, '192.0.2.2').success).to.equal(true);
+        // Joining an existing channel is not a creation.
+        expect(cm.join('own-1', 's5', 'wallet', undefined, '192.0.2.1').success).to.equal(true);
+      } finally {
+        cm.destroy();
+      }
     });
   });
 });

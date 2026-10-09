@@ -4,6 +4,7 @@ import { normalizeRpcId, rpcService } from '../services/rpc.service.js';
 import { asyncHandler } from '../utils/async-handler.js';
 import { readStringParam } from '../utils/route-params.js';
 import { isRecord } from '../utils/guards.js';
+import { normalizeClientIpForLimits } from '../utils/client-ip.js';
 import {
   rpcBatchReject,
   rpcMethodWhitelist,
@@ -63,7 +64,13 @@ router.post(
     // method and params).
     const id = normalizeRpcId(isRecord(body) ? body.id : null);
 
-    const result = await rpcService.executeRPC(network, method, params, id);
+    const result = await rpcService.executeRPC(
+      network,
+      method,
+      params,
+      id,
+      normalizeClientIpForLimits(req.ip ?? 'unknown')
+    );
     res.json(result);
   })
 );

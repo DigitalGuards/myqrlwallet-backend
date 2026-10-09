@@ -569,4 +569,45 @@ describe('IPFS Routes', () => {
     await aborted;
     await new Promise((resolve) => server.close(resolve));
   });
+
+  describe('inline media allowlist', () => {
+    const cid = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
+
+    it('serves HTML as a download with a generic content type', async () => {
+      fetchStub.resolves(
+        buildFetchResponse({
+          contentType: 'text/html; charset=utf-8',
+          chunks: [Buffer.from('<h1>hi</h1>')],
+        })
+      );
+      const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+      expect(res).to.have.status(200);
+      expect(res).to.have.header('content-type', 'application/octet-stream');
+      expect(res).to.have.header('content-disposition', 'attachment');
+    });
+
+    it('serves a missing content type as a download', async () => {
+      fetchStub.resolves(buildFetchResponse({ contentType: null }));
+      const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+      expect(res).to.have.header('content-type', 'application/octet-stream');
+      expect(res).to.have.header('content-disposition', 'attachment');
+    });
+
+    for (const type of [
+      'image/png',
+      'image/svg+xml',
+      'video/mp4',
+      'audio/mpeg',
+      'application/json',
+    ]) {
+      it(`keeps ${type} inline`, async () => {
+        fetchStub.resolves(
+          buildFetchResponse({ contentType: type, chunks: [Buffer.from('{"a":1}')] })
+        );
+        const res = await request.execute(app).get(`/api/ipfs/${cid}`);
+        expect(res).to.have.header('content-type', new RegExp(`^${type.replace('+', '\\+')}`));
+        expect(res).to.not.have.header('content-disposition');
+      });
+    }
+  });
 });
