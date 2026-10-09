@@ -80,6 +80,19 @@ function readRpcBody(req: Request): RpcRequestBody {
   return { method: body.method, params: body.params, id: normalizeRpcId(body.id) };
 }
 
+const GETLOGS_FILTER_KEYS: ReadonlySet<string> = new Set([
+  'fromBlock',
+  'toBlock',
+  'blockHash',
+  'address',
+  'topics',
+]);
+
+function readBodyRecord(req: Request): Record<string, unknown> {
+  const body: unknown = req.body;
+  return isRecord(body) ? body : {};
+}
+
 /**
  * Parse a canonical hex block tag without losing precision. Named tags and
  * invalid values return null.
@@ -294,8 +307,16 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
       // node to scan from genesis to tip, blocking the RPC for everyone
       // else for seconds. blockHash form (single-block) is always fine.
       const filter = params?.[0];
-      if (!isRecord(filter)) {
-        sendRpcError(res, 400, id, -32602, 'Invalid params: filter object required');
+      if (!isRecord(filter) || params?.length !== 1) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: exactly one filter object required');
+        return;
+      }
+
+      // The node matches JSON keys case-insensitively, so "FromBlock" would
+      // reach it as fromBlock without passing the checks below. Accept only
+      // the exact canonical spellings.
+      if (!Object.keys(filter).every((key) => GETLOGS_FILTER_KEYS.has(key))) {
+        sendRpcError(res, 400, id, -32602, 'Invalid params: unknown or non-canonical filter key');
         return;
       }
 
@@ -429,6 +450,14 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
           return;
         }
       }
+
+      // Forward a filter built only from the validated fields.
+      const canonicalFilter: Record<string, unknown> = {};
+      for (const key of GETLOGS_FILTER_KEYS) {
+        const value = filter[key];
+        if (value !== undefined && value !== null) canonicalFilter[key] = value;
+      }
+      req.body = { ...readBodyRecord(req), params: [canonicalFilter] };
       break;
     }
   }

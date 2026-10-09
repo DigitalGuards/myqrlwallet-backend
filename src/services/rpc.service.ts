@@ -45,14 +45,24 @@ export function normalizeRpcId(raw: unknown): RpcId {
 
 let activeRpcCalls = 0;
 let reservedRpcResponseBytes = 0;
+const activeRpcCallsByClient = new Map<string, number>();
+
+/** Thrown when a single client already holds its share of upstream slots. */
+const CLIENT_BUSY_MESSAGE = 'Too many concurrent RPC requests from this client';
 
 /**
  * Reserve the full per-response allowance before starting an upstream call.
  * This keeps worst-case concurrent response buffering within a deterministic
  * process-wide budget even when every upstream omits Content-Length.
  */
-function acquireRpcCallSlot(): (() => void) | null {
+function acquireRpcCallSlot(clientKey: string | undefined): (() => void) | null {
   const reservation = CONFIG.RPC_MAX_RESPONSE_BYTES;
+  if (
+    clientKey !== undefined &&
+    (activeRpcCallsByClient.get(clientKey) ?? 0) >= CONFIG.RPC_MAX_CONCURRENT_PER_CLIENT
+  ) {
+    throw new HttpError(429, CLIENT_BUSY_MESSAGE);
+  }
   if (
     activeRpcCalls >= CONFIG.RPC_MAX_CONCURRENT ||
     reservedRpcResponseBytes + reservation > CONFIG.RPC_MAX_INFLIGHT_BYTES
@@ -62,12 +72,20 @@ function acquireRpcCallSlot(): (() => void) | null {
 
   activeRpcCalls += 1;
   reservedRpcResponseBytes += reservation;
+  if (clientKey !== undefined) {
+    activeRpcCallsByClient.set(clientKey, (activeRpcCallsByClient.get(clientKey) ?? 0) + 1);
+  }
   let released = false;
   return () => {
     if (released) return;
     released = true;
     activeRpcCalls -= 1;
     reservedRpcResponseBytes -= reservation;
+    if (clientKey !== undefined) {
+      const remaining = (activeRpcCallsByClient.get(clientKey) ?? 1) - 1;
+      if (remaining <= 0) activeRpcCallsByClient.delete(clientKey);
+      else activeRpcCallsByClient.set(clientKey, remaining);
+    }
   };
 }
 
@@ -100,9 +118,10 @@ class RPCService {
     endpoint: string,
     method: string,
     params: unknown,
-    id: RpcId = null
+    id: RpcId = null,
+    clientKey?: string
   ): Promise<unknown> {
-    const releaseRpcCallSlot = acquireRpcCallSlot();
+    const releaseRpcCallSlot = acquireRpcCallSlot(clientKey);
     if (!releaseRpcCallSlot) {
       throw new HttpError(503, 'RPC proxy busy');
     }
@@ -153,10 +172,11 @@ class RPCService {
     network: string,
     method: string,
     params: unknown,
-    id: RpcId = null
+    id: RpcId = null,
+    clientKey?: string
   ): Promise<unknown> {
     if (!isNetworkName(network)) {
-      throw new Error('Invalid network');
+      throw new HttpError(404, 'Unknown network');
     }
 
     // Even invariant cached responses require a currently ready endpoint with
@@ -191,13 +211,13 @@ class RPCService {
     let chosenUrl: string | undefined;
     for (const url of order) {
       try {
-        result = await this.makeRPCCall(url, method, params, id);
+        result = await this.makeRPCCall(url, method, params, id, clientKey);
         chosenUrl = url;
         break;
       } catch (err) {
         // Admission is process-wide, so retrying another endpoint cannot help
         // and would only add work while the proxy is saturated.
-        if (err instanceof HttpError && err.status === 503) throw err;
+        if (err instanceof HttpError && (err.status === 503 || err.status === 429)) throw err;
         lastError = toError(err);
       }
     }

@@ -191,7 +191,9 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const contentType = response.headers.get('content-type') ?? 'application/octet-stream';
+    const upstreamContentType = response.headers.get('content-type');
+    const inlineAllowed = upstreamContentType !== null && isInlineMediaType(upstreamContentType);
+    const contentType = inlineAllowed ? upstreamContentType : 'application/octet-stream';
 
     // Fetch API allows response.body to be null (e.g. 204 No Content). Without
     // an explicit check, the .getReader() call below would throw a TypeError
@@ -219,6 +221,9 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
         // as the wallet's own scripts.
         'X-Content-Type-Options': 'nosniff',
         'Content-Security-Policy': "default-src 'none'; img-src 'self' data: blob:; sandbox",
+        // Anything outside the media allowlist downloads instead of rendering
+        // under the wallet origin.
+        ...(inlineAllowed ? {} : { 'Content-Disposition': 'attachment' }),
       });
     };
     try {
@@ -295,5 +300,17 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
 
 ipfsRouter.get('/:cid', asyncHandler(ipfsHandler));
 ipfsRouter.get('/:cid/*splat', asyncHandler(ipfsHandler));
+
+/**
+ * Media types the NFT feature renders inline: raster and SVG images, video,
+ * audio and JSON metadata. Everything else is served as a download.
+ */
+const INLINE_MEDIA_TYPES =
+  /^(image\/(png|jpe?g|gif|webp|avif|bmp|svg\+xml)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp3|ogg|wav|x-wav|webm|mp4|aac|flac)|application\/json)$/;
+
+function isInlineMediaType(contentType: string): boolean {
+  const mediaType = (contentType.split(';')[0] ?? '').trim().toLowerCase();
+  return INLINE_MEDIA_TYPES.test(mediaType);
+}
 
 export { ipfsRouter };

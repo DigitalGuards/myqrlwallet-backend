@@ -71,6 +71,8 @@ interface Channel {
   terminated: boolean;
   /** When the channel was terminated (for tombstone TTL). */
   terminatedAt: number;
+  /** Normalized address of the client whose join created the channel. */
+  creatorIp: string | null;
 }
 
 export interface JoinSuccess {
@@ -106,6 +108,8 @@ export interface ChannelStats {
 export interface ChannelManagerOptions {
   isSocketActive?: (socketId: string) => boolean;
   canSocketReceive?: (socketId: string) => boolean;
+  /** Live channels one creator address may hold. Unset means no per-address cap. */
+  maxChannelsPerIp?: number;
 }
 
 interface DirectDeliveryReservation {
@@ -120,6 +124,7 @@ class ChannelManager {
   terminatedOrder: string[] = [];
   isSocketActive: (socketId: string) => boolean;
   canSocketReceive: (socketId: string) => boolean;
+  maxChannelsPerIp: number;
   totalBufferedBytes = 0;
   totalDirectInflightBytes = 0;
   directDeliveries = new Map<string, DirectDeliveryReservation>();
@@ -130,6 +135,7 @@ class ChannelManager {
   constructor(options: ChannelManagerOptions = {}) {
     this.isSocketActive = options.isSocketActive ?? (() => false);
     this.canSocketReceive = options.canSocketReceive ?? (() => true);
+    this.maxChannelsPerIp = options.maxChannelsPerIp ?? Number.POSITIVE_INFINITY;
     this.cleanupTimer = setInterval(() => {
       this.cleanup();
     }, CLEANUP_INTERVAL_MS);
@@ -155,7 +161,8 @@ class ChannelManager {
     channelId: string,
     socketId: string,
     clientType: ClientType,
-    publicKeyBase64?: string
+    publicKeyBase64?: string,
+    creatorIp?: string
   ): JoinResult {
     let canonicalPublicKey: string | undefined;
     if (
@@ -196,6 +203,12 @@ class ChannelManager {
     }
 
     if (!channel) {
+      if (
+        creatorIp !== undefined &&
+        this.countLiveChannelsCreatedBy(creatorIp) >= this.maxChannelsPerIp
+      ) {
+        return { success: false, error: 'Too many open channels from this address' };
+      }
       channel = {
         participants: new Map<string, Participant>(),
         lastActivity: Date.now(),
@@ -206,8 +219,16 @@ class ChannelManager {
         publicKey: null,
         terminated: false,
         terminatedAt: 0,
+        creatorIp: creatorIp ?? null,
       };
       this.channels.set(channelId, channel);
+    }
+
+    // Once a dApp key is bound, every dApp join must present it. Without
+    // this check a join that omits the key would skip the binding comparison
+    // below and could claim the dApp slot.
+    if (clientType === 'dapp' && channel.publicKey !== null && canonicalPublicKey === undefined) {
+      return { success: false, error: 'dApp public key required for this channel' };
     }
 
     const existingParticipant = channel.participants.get(socketId);
@@ -294,6 +315,14 @@ class ChannelManager {
       participants: counterpartyTypes,
       terminated: channel.terminated,
     };
+  }
+
+  private countLiveChannelsCreatedBy(ip: string): number {
+    let count = 0;
+    for (const channel of this.channels.values()) {
+      if (!channel.terminated && channel.creatorIp === ip) count += 1;
+    }
+    return count;
   }
 
   /**
