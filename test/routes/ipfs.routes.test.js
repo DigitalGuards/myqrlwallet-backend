@@ -24,6 +24,20 @@ function waitForAbort(signal) {
   });
 }
 
+function delayUntilResponse(ms, signal) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(resolve, ms);
+    signal.addEventListener(
+      'abort',
+      () => {
+        clearTimeout(timer);
+        reject(Object.assign(new Error('aborted'), { name: 'AbortError' }));
+      },
+      { once: true }
+    );
+  });
+}
+
 /**
  * Build a stand-in for the Fetch API Response object that lets us drive
  * the streaming read loop in ipfs.routes.js. `chunks` is an array of
@@ -140,6 +154,8 @@ describe('IPFS Routes', () => {
     originalLimits = {
       IPFS_GATEWAYS: CONFIG.IPFS_GATEWAYS,
       IPFS_FETCH_TIMEOUT_MS: CONFIG.IPFS_FETCH_TIMEOUT_MS,
+      IPFS_FALLBACK_RESERVE_MS: CONFIG.IPFS_FALLBACK_RESERVE_MS,
+      IPFS_MAX_COOLDOWN_MS: CONFIG.IPFS_MAX_COOLDOWN_MS,
       IPFS_MAX_CONCURRENT: CONFIG.IPFS_MAX_CONCURRENT,
       IPFS_MAX_INFLIGHT_BYTES: CONFIG.IPFS_MAX_INFLIGHT_BYTES,
       IPFS_MAX_SIZE_BYTES: CONFIG.IPFS_MAX_SIZE_BYTES,
@@ -475,6 +491,113 @@ describe('IPFS Routes', () => {
   });
 
   describe('gateway fallback', () => {
+    for (const delay of [4000, 4500, 5000]) {
+      it(`serves the first request after a fast 429 and a ${delay} ms success`, async () => {
+        CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+        const clock = sinon.useFakeTimers({
+          toFake: ['setTimeout', 'clearTimeout', 'performance'],
+        });
+        let started;
+        const fetchStarted = new Promise((resolve) => {
+          started = resolve;
+        });
+        fetchStub.callsFake(async (url, { signal }) => {
+          started();
+          const limited = url.startsWith(gateways[0]) || url.startsWith(gateways[2]);
+          await delayUntilResponse(limited ? 50 : delay, signal);
+          return limited
+            ? new globalThis.Response('rate limited', {
+                status: 429,
+                headers: { 'retry-after': '900' },
+              })
+            : new globalThis.Response(new Uint8Array([1, 2, 3]), {
+                headers: { 'content-type': 'image/png' },
+              });
+        });
+        const pending = request
+          .execute(app)
+          .get(`/api/ipfs/${testCid}`)
+          .then((res) => res);
+        await fetchStarted;
+        await clock.tickAsync(8000);
+        const res = await pending;
+        expect(res).to.have.status(200);
+        expect([...res.body]).to.deep.equal([1, 2, 3]);
+        expect(fetchStub.getCalls().map((call) => call.args[0])).to.deep.equal([
+          `${gateways[0]}${testCid}`,
+          `${gateways[1]}${testCid}`,
+        ]);
+      });
+    }
+
+    it('serves a 4 second healthy head gateway within an 8 second budget', async () => {
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+      let started;
+      const fetchStarted = new Promise((resolve) => {
+        started = resolve;
+      });
+      fetchStub.callsFake(async (_url, { signal }) => {
+        started();
+        await delayUntilResponse(4000, signal);
+        return new globalThis.Response(new Uint8Array([1, 2, 3]), {
+          headers: { 'content-type': 'image/png' },
+        });
+      });
+      const pending = request
+        .execute(app)
+        .get(`/api/ipfs/${testCid}`)
+        .then((res) => res);
+      await fetchStarted;
+      await clock.tickAsync(8000);
+      expect(await pending).to.have.status(200);
+      expect(fetchStub.callCount).to.equal(1);
+    });
+
+    for (const admitted of [4, 6]) {
+      it(`serves all ${admitted} admitted requests in a six request burst after fast 429s`, async () => {
+        CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+        CONFIG.IPFS_MAX_CONCURRENT = 6;
+        CONFIG.IPFS_MAX_INFLIGHT_BYTES = CONFIG.IPFS_MAX_SIZE_BYTES * admitted;
+        const clock = sinon.useFakeTimers({
+          toFake: ['setTimeout', 'clearTimeout', 'performance'],
+        });
+        let started;
+        const allStarted = new Promise((resolve) => {
+          started = resolve;
+        });
+        fetchStub.callsFake(async (url, { signal }) => {
+          if (fetchStub.callCount === admitted) started();
+          const limited = url.startsWith(gateways[0]) || url.startsWith(gateways[2]);
+          await delayUntilResponse(limited ? 50 : 4500, signal);
+          return limited
+            ? new globalThis.Response('rate limited', {
+                status: 429,
+                headers: { 'retry-after': '900' },
+              })
+            : new globalThis.Response(new Uint8Array([1, 2, 3]), {
+                headers: { 'content-type': 'image/png' },
+              });
+        });
+        const pending = Promise.all(
+          Array.from({ length: 6 }, () =>
+            request
+              .execute(app)
+              .get(`/api/ipfs/${testCid}`)
+              .then((res) => res)
+          )
+        );
+        await allStarted;
+        await clock.tickAsync(8000);
+        const responses = await pending;
+        expect(responses.filter((res) => res.status === 200)).to.have.length(admitted);
+        const busy = responses.filter((res) => res.status === 503);
+        expect(busy).to.have.length(6 - admitted);
+        for (const res of busy) expect(res.body.error).to.equal('IPFS proxy busy');
+        expect(fetchStub.callCount).to.equal(admitted * 2);
+      });
+    }
+
     for (const status of [429, 500, 502, 503, 504, 599]) {
       it(`advances in order after ${status} and aborts the failed attempt`, async () => {
         fetchStub.callsFake(() => buildFetchResponse());
@@ -503,25 +626,61 @@ describe('IPFS Routes', () => {
       expect(fetchStub.callCount).to.equal(2);
     });
 
-    it('falls back when a gateway exceeds its share of the deadline', async () => {
-      CONFIG.IPFS_FETCH_TIMEOUT_MS = 120;
+    it('falls back after reserving one second for each eligible later gateway', async () => {
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+      let started;
+      const fetchStarted = new Promise((resolve) => {
+        started = resolve;
+      });
       fetchStub.callsFake(() => buildFetchResponse());
-      fetchStub.onFirstCall().callsFake((_url, { signal }) => waitForAbort(signal));
-      const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+      fetchStub.onFirstCall().callsFake((_url, { signal }) => {
+        started();
+        return waitForAbort(signal);
+      });
+      const pending = request
+        .execute(app)
+        .get(`/api/ipfs/${testCid}`)
+        .then((res) => res);
+      await fetchStarted;
+      await clock.tickAsync(5999);
+      expect(fetchStub.callCount).to.equal(1);
+      expect(fetchStub.firstCall.args[1].signal.aborted).to.equal(false);
+      await clock.tickAsync(1);
+      const res = await pending;
       expect(res).to.have.status(200);
       expect(fetchStub.callCount).to.equal(2);
       expect(fetchStub.firstCall.args[1].signal.aborted).to.equal(true);
     });
 
     it('falls back when response headers arrive but the first body chunk times out', async () => {
-      CONFIG.IPFS_FETCH_TIMEOUT_MS = 120;
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+      let started;
+      const bodyWaiting = new Promise((resolve) => {
+        started = resolve;
+      });
       const cancel = sinon.stub().resolves();
       fetchStub.callsFake(() => buildFetchResponse());
       fetchStub.onFirstCall().callsFake((_url, { signal }) => ({
         ...buildFetchResponse(),
-        body: { getReader: () => ({ read: () => waitForAbort(signal), cancel }) },
+        body: {
+          getReader: () => ({
+            read: () => {
+              started();
+              return waitForAbort(signal);
+            },
+            cancel,
+          }),
+        },
       }));
-      const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+      const pending = request
+        .execute(app)
+        .get(`/api/ipfs/${testCid}`)
+        .then((res) => res);
+      await bodyWaiting;
+      await clock.tickAsync(6000);
+      const res = await pending;
       expect(res).to.have.status(200);
       expect(fetchStub.callCount).to.equal(2);
       expect(cancel.calledOnce).to.equal(true);
@@ -553,13 +712,153 @@ describe('IPFS Routes', () => {
       });
     }
 
-    it('returns the final upstream failure when every gateway fails', async () => {
+    it('returns an upstream failure when every gateway fails', async () => {
       fetchStub.resolves(buildFetchResponse({ ok: false, status: 503 }));
       const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
       expect(res).to.have.status(502);
       expect(res.body).to.deep.equal({ error: 'gateway error', status: 503 });
       expect(fetchStub.callCount).to.equal(3);
       expect(fetchStub.getCalls().every((call) => call.args[1].signal.aborted)).to.equal(true);
+    });
+
+    for (const upstreamStatus of [500, 502, 503, 504, 599]) {
+      for (const index of [0, 1]) {
+        it(`preserves upstream ${upstreamStatus} at position ${index + 1} across later 429s`, async () => {
+          fetchStub.resolves(buildFetchResponse({ ok: false, status: 429 }));
+          fetchStub
+            .onCall(index)
+            .resolves(buildFetchResponse({ ok: false, status: upstreamStatus }));
+          const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+          expect(res).to.have.status(502);
+          expect(res.body).to.deep.equal({ error: 'gateway error', status: upstreamStatus });
+          expect(fetchStub.callCount).to.equal(3);
+        });
+      }
+    }
+
+    for (const timedOut of [false, true]) {
+      it(`preserves an earlier ${timedOut ? 'timeout' : 'network failure'} across later 429s`, async () => {
+        const error = new Error('fetch failed');
+        if (timedOut) error.name = 'AbortError';
+        fetchStub.resolves(buildFetchResponse({ ok: false, status: 429 }));
+        fetchStub.onFirstCall().rejects(error);
+        const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+        expect(res).to.have.status(timedOut ? 504 : 502);
+        expect(res.body).to.deep.equal({
+          error: timedOut ? 'gateway timeout' : 'gateway unreachable',
+        });
+        expect(fetchStub.callCount).to.equal(3);
+      });
+    }
+
+    it('returns 504 when a final 429 arrives after the overall deadline', async () => {
+      const now = sinon.stub(performance, 'now').returns(0);
+      fetchStub.resolves(buildFetchResponse({ ok: false, status: 503 }));
+      fetchStub.onThirdCall().callsFake(() => {
+        now.returns(CONFIG.IPFS_FETCH_TIMEOUT_MS);
+        return buildFetchResponse({ ok: false, status: 429 });
+      });
+      const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+      expect(res).to.have.status(504);
+      expect(res.body).to.deep.equal({ error: 'gateway timeout' });
+      expect(fetchStub.callCount).to.equal(3);
+    });
+
+    it('returns a terminal 404 after an earlier retryable failure', async () => {
+      fetchStub.onFirstCall().resolves(buildFetchResponse({ ok: false, status: 503 }));
+      fetchStub.onSecondCall().resolves(buildFetchResponse({ ok: false, status: 404 }));
+      const res = await request.execute(app).get(`/api/ipfs/${testCid}`);
+      expect(res).to.have.status(404);
+      expect(res.body.status).to.equal(404);
+      expect(fetchStub.callCount).to.equal(2);
+    });
+
+    for (const cooledLater of [1, 2]) {
+      it(`reserves no time for ${cooledLater} cooling later gateways`, async () => {
+        CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+        const clock = sinon.useFakeTimers({
+          toFake: ['Date', 'setTimeout', 'clearTimeout', 'performance'],
+        });
+        fetchStub.onFirstCall().resolves(buildFetchResponse({ ok: false, status: 503 }));
+        fetchStub
+          .onSecondCall()
+          .resolves(buildFetchResponse({ ok: false, status: cooledLater === 1 ? 503 : 429 }));
+        fetchStub.onThirdCall().resolves(buildFetchResponse({ ok: false, status: 429 }));
+        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(502);
+        await clock.tickAsync(30_000);
+        fetchStub.reset();
+        let started;
+        const fetchStarted = new Promise((resolve) => {
+          started = resolve;
+        });
+        fetchStub.callsFake(async (_url, { signal }) => {
+          started();
+          await delayUntilResponse(cooledLater === 1 ? 6500 : 7500, signal);
+          return buildFetchResponse();
+        });
+        const pending = request
+          .execute(app)
+          .get(`/api/ipfs/${testCid}`)
+          .then((res) => res);
+        await fetchStarted;
+        await clock.tickAsync(8000);
+        expect(await pending).to.have.status(200);
+        expect(fetchStub.callCount).to.equal(1);
+      });
+    }
+
+    for (const { reserve, attemptMs } of [
+      { reserve: 2000, attemptMs: 4000 },
+      { reserve: 5000, attemptMs: 1000 },
+    ]) {
+      it(`honors a ${reserve} ms reserve with a bounded minimum attempt window`, async () => {
+        CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
+        CONFIG.IPFS_FALLBACK_RESERVE_MS = reserve;
+        const clock = sinon.useFakeTimers({
+          toFake: ['setTimeout', 'clearTimeout', 'performance'],
+        });
+        let started;
+        const fetchStarted = new Promise((resolve) => {
+          started = resolve;
+        });
+        fetchStub.callsFake(() => buildFetchResponse());
+        fetchStub.onFirstCall().callsFake((_url, { signal }) => {
+          started();
+          return waitForAbort(signal);
+        });
+        const pending = request
+          .execute(app)
+          .get(`/api/ipfs/${testCid}`)
+          .then((res) => res);
+        await fetchStarted;
+        await clock.tickAsync(attemptMs - 1);
+        expect(fetchStub.firstCall.args[1].signal.aborted).to.equal(false);
+        await clock.tickAsync(1);
+        expect(await pending).to.have.status(200);
+        expect(fetchStub.callCount).to.equal(2);
+      });
+    }
+
+    it('bounds the minimum attempt window by a shorter overall deadline', async () => {
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 250;
+      const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
+      let started;
+      const fetchStarted = new Promise((resolve) => {
+        started = resolve;
+      });
+      fetchStub.callsFake((_url, { signal }) => {
+        started();
+        return waitForAbort(signal);
+      });
+      const pending = request
+        .execute(app)
+        .get(`/api/ipfs/${testCid}`)
+        .then((res) => res);
+      await fetchStarted;
+      await clock.tickAsync(250);
+      expect(await pending).to.have.status(504);
+      expect(fetchStub.callCount).to.equal(1);
+      expect(fetchStub.firstCall.args[1].signal.aborted).to.equal(true);
     });
 
     it('refuses redirect following at each gateway while trying the next configured origin', async () => {
@@ -590,7 +889,7 @@ describe('IPFS Routes', () => {
     }
 
     it('keeps all timed-out attempts within one overall budget and releases admission', async () => {
-      CONFIG.IPFS_FETCH_TIMEOUT_MS = 240;
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
       CONFIG.IPFS_MAX_CONCURRENT = 1;
       const clock = sinon.useFakeTimers({ toFake: ['setTimeout', 'clearTimeout', 'performance'] });
       let started;
@@ -610,13 +909,13 @@ describe('IPFS Routes', () => {
           return res;
         });
       await fetchStarted;
-      await clock.tickAsync(239);
+      await clock.tickAsync(7999);
       expect(settled).to.equal(false);
       expect(fetchStub.callCount).to.equal(3);
       await clock.tickAsync(1);
       const res = await pending;
       expect(res).to.have.status(504);
-      expect(performance.now()).to.equal(240);
+      expect(performance.now()).to.equal(8000);
       expect(fetchStub.getCalls().every((call) => call.args[1].signal.aborted)).to.equal(true);
       clock.restore();
       fetchStub.callsFake(() => buildFetchResponse());
@@ -624,7 +923,7 @@ describe('IPFS Routes', () => {
     });
 
     it('keeps a partial fallback stream within the original deadline and then releases admission', async () => {
-      CONFIG.IPFS_FETCH_TIMEOUT_MS = 240;
+      CONFIG.IPFS_FETCH_TIMEOUT_MS = 8000;
       CONFIG.IPFS_MAX_CONCURRENT = 1;
       const server = createServer(app);
       await new Promise((resolve) => server.listen(0, CONFIG.LISTEN_HOST, resolve));
@@ -664,13 +963,13 @@ describe('IPFS Routes', () => {
       try {
         const pending = getFromServerExpectDisconnect(address.port, `/api/ipfs/${testCid}`);
         await fetchStarted;
-        await clock.tickAsync(80);
+        await clock.tickAsync(6000);
         await bodyWaiting;
-        await clock.tickAsync(159);
+        await clock.tickAsync(1999);
         expect(fetchStub.secondCall.args[1].signal.aborted).to.equal(false);
         await clock.tickAsync(1);
         const result = await pending;
-        expect(performance.now()).to.equal(240);
+        expect(performance.now()).to.equal(8000);
         expect(result.disconnected).to.equal(true);
         expect(result.body.toString()).to.equal('partial');
         expect(fetchStub.callCount).to.equal(2);
@@ -777,16 +1076,17 @@ describe('IPFS Routes', () => {
     for (const { label, retryAfter, duration } of [
       { label: 'missing Retry-After', retryAfter: null, duration: 60_000 },
       { label: 'delta-seconds Retry-After', retryAfter: '120', duration: 120_000 },
+      { label: 'fifteen minute Retry-After', retryAfter: '900', duration: 900_000 },
       {
         label: 'HTTP-date Retry-After',
         retryAfter: new Date(now + 90_000).toUTCString(),
         duration: 90_000,
       },
-      { label: 'capped delta-seconds', retryAfter: '999999999999999999999', duration: 300_000 },
+      { label: 'capped delta-seconds', retryAfter: '999999999999999999999', duration: 900_000 },
       {
         label: 'capped HTTP date',
-        retryAfter: new Date(now + 900_000).toUTCString(),
-        duration: 300_000,
+        retryAfter: new Date(now + 1_800_000).toUTCString(),
+        duration: 900_000,
       },
       { label: 'malformed Retry-After', retryAfter: 'later', duration: 60_000 },
       { label: 'negative Retry-After', retryAfter: '-1', duration: 60_000 },
@@ -811,6 +1111,41 @@ describe('IPFS Routes', () => {
         expect(fetchStub.callCount).to.equal(4);
       });
     }
+
+    for (const status of [500, 502, 503, 504, 599]) {
+      it(`skips a ${status} gateway for thirty seconds and retries it on expiry`, async () => {
+        let current = now;
+        sinon.stub(Date, 'now').callsFake(() => current);
+        fetchStub.callsFake(() => buildFetchResponse());
+        fetchStub
+          .onFirstCall()
+          .resolves(buildFetchResponse({ ok: false, status, retryAfter: '900' }));
+        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+        current += 29_999;
+        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+        expect(fetchStub.thirdCall.args[0]).to.equal(`${gateways[1]}${testCid}`);
+        current += 1;
+        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+        expect(fetchStub.getCall(3).args[0]).to.equal(`${gateways[0]}${testCid}`);
+      });
+    }
+
+    it('honors a configured cooldown cap above fifteen minutes', async () => {
+      CONFIG.IPFS_MAX_COOLDOWN_MS = 1_800_000;
+      let current = now;
+      sinon.stub(Date, 'now').callsFake(() => current);
+      fetchStub.callsFake(() => buildFetchResponse());
+      fetchStub
+        .onFirstCall()
+        .resolves(buildFetchResponse({ ok: false, status: 429, retryAfter: '3600' }));
+      expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+      current += 1_799_999;
+      expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+      expect(fetchStub.thirdCall.args[0]).to.equal(`${gateways[1]}${testCid}`);
+      current += 1;
+      expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+      expect(fetchStub.getCall(3).args[0]).to.equal(`${gateways[0]}${testCid}`);
+    });
 
     for (const retryAfter of ['0', new Date(now - 60_000).toUTCString()]) {
       it(`permits the next request immediately for expired Retry-After ${retryAfter}`, async () => {

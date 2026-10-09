@@ -135,26 +135,36 @@ retain an 8-second timeout, a 2 MiB response limit, and disabled redirects.
 ### IPFS Gateway Configuration
 
 `IPFS_GATEWAYS` is an ordered, comma-separated list of absolute HTTPS gateway
-base URLs. Each URL is normalized to a trailing slash. Blank entries, malformed
-URLs, credentials, query strings, and fragments stop startup with a configuration
-error. When the list is absent, `IPFS_GATEWAY` supplies a single legacy gateway.
+base URLs. Each URL requires a DNS hostname and the exact `/ipfs/` base path
+after URL and trailing-slash normalization. IP literals, port zero, blank entries,
+malformed URLs, credentials, query strings, and fragments stop startup with a
+configuration error. When the list is absent, `IPFS_GATEWAY` supplies a single
+legacy gateway.
 When both variables are absent, the order is `https://ipfs.io/ipfs/`,
 `https://gateway.pinata.cloud/ipfs/`, then `https://dweb.link/ipfs/`.
+ipfs.io and dweb.link share an operator and rate limit, so Pinata provides the
+first independent fallback.
 
 Requests advance to the next gateway on 429, 5xx, timeout, or network failure
 before streaming starts. Other 4xx responses stop the search; 404 is returned to
 the client. Each gateway request refuses redirects. A gateway that returns 429
 is skipped across requests for 60 seconds, or for its `Retry-After` delta in
-seconds or HTTP date, capped at five minutes. Invalid `Retry-After` values use
-60 seconds. Cooldowns are local to each backend process and reset on restart.
+seconds or HTTP date, capped by `IPFS_MAX_COOLDOWN_MS` (default and minimum
+900000 ms, or 15 minutes). Invalid `Retry-After` values use 60 seconds. Upstream
+5xx responses trigger a 30-second cooldown. Cooldowns are local to each backend
+process and reset on restart.
 When every gateway is cooling down, requests return 503 with `Retry-After`.
 
 `IPFS_FETCH_TIMEOUT_MS` (default 8000 ms) covers every attempt and the response
-stream. Time before the first body chunk is shared across the remaining eligible
-gateways. A stream that begins delivering bytes uses the remaining overall
-budget. Failed partial streams terminate the response. Size, memory admission,
+stream. Each attempt gets the remaining budget minus `IPFS_FALLBACK_RESERVE_MS`
+(default 1000 ms, minimum 250 ms) for each eligible later gateway. Cooling
+gateways reserve no time. Each attempt gets at least 1000 ms, bounded by the
+remaining overall deadline. A stream that begins delivering bytes uses the
+remaining overall budget. Failed partial streams terminate the response. Size, memory admission,
 CID/path validation, and media handling limits apply to every gateway. Logs
 identify the gateway origin and CID without including the requested path.
+When fallback attempts fail, timeouts take priority, followed by upstream 5xx,
+transport or stream errors, and 429. An exhausted overall deadline returns 504.
 
 ## Docker Deployment
 

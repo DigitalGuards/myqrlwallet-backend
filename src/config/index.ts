@@ -1,4 +1,5 @@
 import dotenv from 'dotenv';
+import { isIP } from 'node:net';
 
 // Load environment variables from .env file
 dotenv.config({ quiet: true });
@@ -51,6 +52,8 @@ export function parseNonNegativeInt(value: string | undefined, fallback: number)
 /** Gateway configuration is validated before the application can listen. */
 export function parseIpfsGateways(list: unknown, legacy: unknown): string[] {
   if (list === undefined && legacy === undefined) {
+    // ipfs.io and dweb.link share an operator and rate limit. Pinata gives
+    // the first fallback an independent capacity pool.
     return [
       'https://ipfs.io/ipfs/',
       'https://gateway.pinata.cloud/ipfs/',
@@ -68,21 +71,25 @@ export function parseIpfsGateways(list: unknown, legacy: unknown): string[] {
         const input = entry.trim();
         try {
           const url = new URL(input);
+          const hostname = url.hostname.startsWith('[') ? url.hostname.slice(1, -1) : url.hostname;
+          url.pathname = url.pathname.replace(/\/+$/, '') + '/';
           if (
             !/^https:\/\/[^/]/i.test(input) ||
-            /[\\\s?#,]/.test(input) ||
+            /[\\\s@?#,]/.test(input) ||
             url.protocol !== 'https:' ||
             url.hostname.length === 0 ||
+            isIP(hostname) !== 0 ||
+            url.port === '0' ||
+            url.pathname !== '/ipfs/' ||
             url.username ||
             url.password
           ) {
             throw new Error('invalid gateway');
           }
-          url.pathname = url.pathname.replace(/\/+$/, '') + '/';
           return url.href;
         } catch {
           throw new Error(
-            `${name} entry ${index + 1} must be an absolute HTTPS URL without credentials, query, or fragment`
+            `${name} entry ${index + 1} must be an absolute HTTPS URL with a DNS hostname, a nonzero port, and base path /ipfs/ without credentials, query, or fragment`
           );
         }
       })
@@ -171,6 +178,8 @@ export interface AppConfig {
   RPC_MAX_INFLIGHT_BYTES: number;
   IPFS_GATEWAYS: string[];
   IPFS_FETCH_TIMEOUT_MS: number;
+  IPFS_FALLBACK_RESERVE_MS: number;
+  IPFS_MAX_COOLDOWN_MS: number;
   IPFS_MAX_SIZE_BYTES: number;
   IPFS_MAX_CONCURRENT: number;
   IPFS_MAX_INFLIGHT_BYTES: number;
@@ -318,6 +327,14 @@ export const CONFIG: AppConfig = {
 
   IPFS_GATEWAYS: loadIpfsGateways(),
   IPFS_FETCH_TIMEOUT_MS: parsePositiveInt(process.env.IPFS_FETCH_TIMEOUT_MS, 8000),
+  IPFS_FALLBACK_RESERVE_MS: Math.max(
+    250,
+    parsePositiveInt(process.env.IPFS_FALLBACK_RESERVE_MS, 1000)
+  ),
+  IPFS_MAX_COOLDOWN_MS: Math.max(
+    900_000,
+    parsePositiveInt(process.env.IPFS_MAX_COOLDOWN_MS, 900_000)
+  ),
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),

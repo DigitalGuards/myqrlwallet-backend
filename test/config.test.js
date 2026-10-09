@@ -34,6 +34,68 @@ describe('IPFS gateway configuration', () => {
     ]);
   });
 
+  it('accepts a DNS hostname with a normalized IPFS base path and valid port', () => {
+    expect(parseIpfsGateways('HTTPS://GATEWAY.EXAMPLE:443/a/../ipfs///', undefined)).to.deep.equal([
+      'https://gateway.example/ipfs/',
+    ]);
+    expect(parseIpfsGateways('https://gateway.example:8443/ipfs', undefined)).to.deep.equal([
+      'https://gateway.example:8443/ipfs/',
+    ]);
+  });
+
+  const loopbackV4 = [127, 0, 0, 1].join('.');
+  const invalidGateways = [
+    ...[
+      { label: 'IPv4 loopback', host: loopbackV4 },
+      { label: 'IPv4 link-local', host: [169, 254, 169, 254].join('.') },
+      { label: 'IPv4 documentation address', host: [192, 0, 2, 1].join('.') },
+      { label: 'short IPv4', host: [127, 1].join('.') },
+      { label: 'decimal IPv4', host: String(0x7f000001) },
+      { label: 'hexadecimal IPv4', host: `0x${(0x7f000001).toString(16)}` },
+      { label: 'octal IPv4', host: [127, 0, 0, 1].map((part) => `0${part.toString(8)}`).join('.') },
+      { label: 'encoded IPv4', host: loopbackV4.replaceAll('.', '%2e') },
+      { label: 'IPv4 with a trailing dot', host: `${loopbackV4}.` },
+      { label: 'IPv6 loopback', host: `[${['', '', '1'].join(':')}]` },
+      { label: 'IPv6 link-local', host: `[${['fe80', '', '1'].join(':')}]` },
+      { label: 'IPv6 documentation address', host: `[${['2001', 'db8', '', '1'].join(':')}]` },
+      { label: 'IPv6 mapped IPv4', host: `[${['', '', 'ffff', loopbackV4].join(':')}]` },
+    ].map(({ label, host }) => ({ label, value: `https://${host}/ipfs/` })),
+    { label: 'port zero', value: 'https://gateway.example:0/ipfs/' },
+    { label: 'zero-padded port zero', value: 'https://gateway.example:000/ipfs/' },
+    { label: 'empty userinfo', value: 'https://@gateway.example/ipfs/' },
+    ...[
+      '',
+      '/',
+      '/a/../../',
+      '/%2e%2e/',
+      '/ipfs/../',
+      '/ipfs/%2e%2e/',
+      '/x',
+      '/api/ipfs/',
+      '/ipfs/child/',
+      '/IPFS/',
+      '/%69pfs/',
+      '/ipfs%2f',
+    ].map((path) => ({
+      label: `base path ${JSON.stringify(path)}`,
+      value: `https://gateway.example${path}`,
+    })),
+  ];
+
+  for (const { label, value } of invalidGateways) {
+    it(`rejects ${label} through both configuration variables`, () => {
+      expect(() => parseIpfsGateways(value, undefined)).to.throw('IPFS_GATEWAYS entry 1');
+      expect(() => parseIpfsGateways(undefined, value)).to.throw('IPFS_GATEWAY entry 1');
+    });
+
+    it(`fails startup for ${label} with a sanitized configuration error`, () => {
+      const child = importConfig({ IPFS_GATEWAYS: value });
+      expect(child.status, child.stderr).to.equal(1);
+      expect(child.stderr).to.include('Invalid IPFS gateway configuration: IPFS_GATEWAYS');
+      expect(child.stderr).not.to.include(value);
+    });
+  }
+
   it('rejects malformed, blank, unsafe, and non-string entries without disclosing their values', () => {
     for (const value of [
       '',
@@ -71,7 +133,7 @@ describe('IPFS gateway configuration', () => {
     ).to.throw('IPFS_GATEWAY entry 1');
   });
 
-  function importConfig(env) {
+  function importConfig(env, expression = 'CONFIG.IPFS_GATEWAYS') {
     return spawnSync(
       process.execPath,
       [
@@ -79,10 +141,39 @@ describe('IPFS gateway configuration', () => {
         'tsx',
         '--input-type=module',
         '--eval',
-        "import { CONFIG } from './src/config/index.ts'; console.log(JSON.stringify(CONFIG.IPFS_GATEWAYS));",
+        `import { CONFIG } from './src/config/index.ts'; console.log(JSON.stringify(${expression}));`,
       ],
       { encoding: 'utf8', timeout: 5000, env: { ...process.env, ...env } }
     );
+  }
+
+  for (const { label, reserve, cooldown, expected } of [
+    { label: 'defaults', reserve: undefined, cooldown: undefined, expected: [1000, 900_000] },
+    {
+      label: 'configured values',
+      reserve: '2000',
+      cooldown: '1800000',
+      expected: [2000, 1_800_000],
+    },
+    { label: 'minimum values', reserve: '1', cooldown: '1', expected: [250, 900_000] },
+    ...['0', '-1', 'invalid'].map((value) => ({
+      label: `invalid value ${value}`,
+      reserve: value,
+      cooldown: value,
+      expected: [1000, 900_000],
+    })),
+  ]) {
+    it(`loads bounded fallback and cooldown settings with ${label}`, () => {
+      const child = importConfig(
+        {
+          IPFS_FALLBACK_RESERVE_MS: reserve,
+          IPFS_MAX_COOLDOWN_MS: cooldown,
+        },
+        '[CONFIG.IPFS_FALLBACK_RESERVE_MS, CONFIG.IPFS_MAX_COOLDOWN_MS]'
+      );
+      expect(child.status, child.stderr).to.equal(0);
+      expect(JSON.parse(child.stdout.trim())).to.deep.equal(expected);
+    });
   }
 
   it('loads the list from the environment ahead of the legacy single gateway', () => {

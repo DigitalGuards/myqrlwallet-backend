@@ -25,15 +25,29 @@ interface GatewayFailure {
 }
 
 const DEFAULT_COOLDOWN_MS = 60_000;
-const MAX_COOLDOWN_MS = 300_000;
+const SERVER_ERROR_COOLDOWN_MS = 30_000;
+const MIN_ATTEMPT_MS = 1000;
 
 function retryAfterMs(value: unknown, now: number): number {
   if (typeof value !== 'string') return DEFAULT_COOLDOWN_MS;
   const input = value.trim();
-  if (/^[0-9]+$/.test(input)) return Math.min(Number(input) * 1000, MAX_COOLDOWN_MS);
+  if (/^[0-9]+$/.test(input)) return Math.min(Number(input) * 1000, CONFIG.IPFS_MAX_COOLDOWN_MS);
   const retryAt = /^[A-Za-z]{3}, /.test(input) ? Date.parse(input) : NaN;
-  if (Number.isFinite(retryAt)) return Math.min(Math.max(0, retryAt - now), MAX_COOLDOWN_MS);
+  if (Number.isFinite(retryAt))
+    return Math.min(Math.max(0, retryAt - now), CONFIG.IPFS_MAX_COOLDOWN_MS);
   return DEFAULT_COOLDOWN_MS;
+}
+
+function failurePriority(failure: GatewayFailure): number {
+  if (failure.status === 504) return 4;
+  if (failure.upstreamStatus !== undefined && failure.upstreamStatus >= 500) return 3;
+  if (failure.status === 503) return 0;
+  if (failure.upstreamStatus === 429) return 1;
+  return 2;
+}
+
+function preferFailure(current: GatewayFailure, next: GatewayFailure): GatewayFailure {
+  return failurePriority(next) > failurePriority(current) ? next : current;
 }
 
 let activeFetches = 0;
@@ -183,17 +197,23 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
         continue;
       }
 
-      const available = gateways.slice(index).filter((entry) => entry.cooldownUntil <= Date.now());
+      const now = Date.now();
+      const laterGateways = gateways
+        .slice(index + 1)
+        .filter((entry) => entry.cooldownUntil <= now).length;
       const attempt = new AbortController();
       const abortAttempt = (): void => {
         attempt.abort();
       };
       controller.signal.addEventListener('abort', abortAttempt, { once: true });
-      // Reserve time for remaining gateways until this attempt starts delivering
-      // bytes. Streaming then uses the remaining overall request budget.
+      // Give cold content most of the budget, reserving a fixed window for each
+      // eligible fallback. The minimum attempt window stays within the deadline.
       const attemptTimeout = setTimeout(
         abortAttempt,
-        Math.max(1, Math.floor(remaining / available.length))
+        Math.min(
+          remaining,
+          Math.max(MIN_ATTEMPT_MS, remaining - laterGateways * CONFIG.IPFS_FALLBACK_RESERVE_MS)
+        )
       );
       let streamingStarted = false;
       let readingBody = false;
@@ -208,19 +228,23 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
             { cid, gateway: gateway.origin, status: response.status },
             'IPFS gateway returned non-2xx'
           );
-          failure = {
+          const upstreamFailure = {
             status: response.status === 404 ? 404 : 502,
             error: 'gateway error',
             upstreamStatus: response.status,
           };
-          if (response.status === 429) {
+          const serverError = response.status >= 500 && response.status < 600;
+          if (response.status === 429 || serverError) {
+            failure = preferFailure(failure, upstreamFailure);
             const now = Date.now();
-            const cooldownMs = retryAfterMs(response.headers.get('retry-after'), now);
+            const cooldownMs = serverError
+              ? SERVER_ERROR_COOLDOWN_MS
+              : retryAfterMs(response.headers.get('retry-after'), now);
             gateway.cooldownUntil = Math.max(gateway.cooldownUntil, now + cooldownMs);
             log.warn({ cid, gateway: gateway.origin, cooldownMs }, 'IPFS gateway cooling down');
-          }
-          if (response.status === 429 || (response.status >= 500 && response.status < 600))
             continue;
+          }
+          failure = upstreamFailure;
           break;
         }
 
@@ -233,7 +257,7 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
       } catch (error) {
         if (clientDisconnected) return;
         const timedOut = attempt.signal.aborted || (isRecord(error) && error.name === 'AbortError');
-        failure = {
+        const attemptFailure = {
           status: timedOut ? 504 : 502,
           error: timedOut
             ? 'gateway timeout'
@@ -241,6 +265,7 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
               ? 'gateway stream error'
               : 'gateway unreachable',
         };
+        failure = preferFailure(failure, attemptFailure);
         log.warn(
           {
             cid,
@@ -251,7 +276,7 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
           'IPFS gateway attempt failed'
         );
         if (streamingStarted || res.headersSent) {
-          sendStreamError(res, failure.status, failure.error);
+          sendStreamError(res, attemptFailure.status, attemptFailure.error);
           return;
         }
       } finally {
@@ -261,6 +286,10 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
       }
     }
 
+    if (clientDisconnected) return;
+    if (controller.signal.aborted || performance.now() >= deadline) {
+      failure = { status: 504, error: 'gateway timeout' };
+    }
     if (failure.status === 503) {
       const retryAt = Math.min(...gateways.map((gateway) => gateway.cooldownUntil));
       res.set('Retry-After', String(Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))));
