@@ -12,12 +12,65 @@ const fetchImpl: typeof fetch = (...args) => globalThis.fetch(...args);
 
 const log = logger.child({ module: 'ipfs-routes' });
 
-/**
- * Public IPFS gateway used to resolve user-supplied CIDs.
- * Overridable for self-hosted gateways or staging; defaults to ipfs.io
- * which is widely available + Cloudflare-fronted.
- */
-const IPFS_GATEWAY = (process.env.IPFS_GATEWAY ?? 'https://ipfs.io/ipfs/').replace(/\/?$/, '/');
+interface GatewayState {
+  url: string;
+  origin: string;
+  cooldownUntil: number;
+  serverErrorCids: Map<string, number>;
+}
+
+interface GatewayFailure {
+  status: number;
+  error: string;
+  upstreamStatus?: number;
+}
+
+const DEFAULT_COOLDOWN_MS = 60_000;
+const SERVER_ERROR_COOLDOWN_MS = 30_000;
+const MIN_ATTEMPT_MS = 1000;
+
+function shouldCoolDownForServerError(
+  gateway: GatewayState,
+  cid: string,
+  status: number,
+  now: number
+): boolean {
+  if (status !== 502 && status !== 503 && status !== 504) return false;
+  for (const [failedCid, failedAt] of gateway.serverErrorCids) {
+    if (now - failedAt >= CONFIG.IPFS_SERVER_ERROR_WINDOW_MS) {
+      gateway.serverErrorCids.delete(failedCid);
+    }
+  }
+  // Count the root CID across paths and accepted base32 letter-case variants.
+  const key = cid.startsWith('b') ? cid.toLowerCase() : cid;
+  gateway.serverErrorCids.set(key, now);
+  if (gateway.serverErrorCids.size < CONFIG.IPFS_SERVER_ERROR_MIN_CIDS) return false;
+  // Each cooldown starts a fresh observation set, bounded by the CID threshold.
+  gateway.serverErrorCids.clear();
+  return true;
+}
+
+function retryAfterMs(value: unknown, now: number): number {
+  if (typeof value !== 'string') return DEFAULT_COOLDOWN_MS;
+  const input = value.trim();
+  if (/^[0-9]+$/.test(input)) return Math.min(Number(input) * 1000, CONFIG.IPFS_MAX_COOLDOWN_MS);
+  const retryAt = /^[A-Za-z]{3}, /.test(input) ? Date.parse(input) : NaN;
+  if (Number.isFinite(retryAt))
+    return Math.min(Math.max(0, retryAt - now), CONFIG.IPFS_MAX_COOLDOWN_MS);
+  return DEFAULT_COOLDOWN_MS;
+}
+
+function failurePriority(failure: GatewayFailure): number {
+  if (failure.status === 504) return 4;
+  if (failure.upstreamStatus !== undefined && failure.upstreamStatus >= 500) return 3;
+  if (failure.status === 503) return 0;
+  if (failure.upstreamStatus === 429) return 1;
+  return 2;
+}
+
+function preferFailure(current: GatewayFailure, next: GatewayFailure): GatewayFailure {
+  return failurePriority(next) > failurePriority(current) ? next : current;
+}
 
 let activeFetches = 0;
 let reservedInflightBytes = 0;
@@ -89,14 +142,6 @@ const CIDV1_RE = /^b[A-Za-z2-7]{58,}$/;
 // segments may not contain `..`, `\\`, or whitespace.
 const PATH_SEGMENT_RE = /^[A-Za-z0-9._-]+$/;
 
-const ipfsRateLimit = rateLimit({
-  windowMs: 60 * 1000,
-  max: 60, // 60 requests/min/IP - well above expected normal NFT browsing
-  standardHeaders: true,
-  legacyHeaders: false,
-  message: { error: 'rate-limited' },
-});
-
 function isValidCid(cid: string): boolean {
   return CIDV0_RE.test(cid) || CIDV1_RE.test(cid);
 }
@@ -107,9 +152,6 @@ function isSafePath(rest: string): boolean {
   const segments = rest.split('/').filter(Boolean);
   return segments.every((s) => PATH_SEGMENT_RE.test(s));
 }
-
-const ipfsRouter = Router();
-ipfsRouter.use(ipfsRateLimit);
 
 /**
  * GET /api/ipfs/:cid             → fetches gateway/<cid>
@@ -122,13 +164,13 @@ ipfsRouter.use(ipfsRateLimit);
  *
  * The route does NOT accept arbitrary URLs (no `?url=` style proxying);
  * that would be a giant SSRF surface. Only well-formed IPFS CIDs are
- * dereferenced through the configured `IPFS_GATEWAY`.
+ * dereferenced through the configured `IPFS_GATEWAYS`.
  *
  * Two route patterns share a handler because a wildcard cannot also match the
  * bare `/:cid` form: the separator it needs is absent when only the CID is
  * supplied.
  */
-async function ipfsHandler(req: Request, res: Response): Promise<void> {
+async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]): Promise<void> {
   const cid = readStringParam(req, 'cid');
   const rest = readWildcardParam(req, 'splat');
 
@@ -147,8 +189,8 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
     return;
   }
 
-  const url = `${IPFS_GATEWAY}${cid}${rest ? '/' + rest : ''}`;
   const controller = new AbortController();
+  const deadline = performance.now() + CONFIG.IPFS_FETCH_TIMEOUT_MS;
   const timeout = setTimeout(() => {
     controller.abort();
   }, CONFIG.IPFS_FETCH_TIMEOUT_MS);
@@ -164,142 +206,241 @@ async function ipfsHandler(req: Request, res: Response): Promise<void> {
   res.once('close', abortForEarlyClose);
 
   try {
-    // Keep the request pinned to the configured gateway origin. Following an
-    // upstream redirect would turn a compromised gateway into an SSRF hop to
-    // loopback, cloud metadata, or another private service.
-    const response = await fetchImpl(url, { signal: controller.signal, redirect: 'error' });
-    if (!response.ok) {
-      controller.abort();
-      log.warn({ cid, status: response.status }, 'IPFS gateway returned non-2xx');
-      res
-        .status(response.status === 404 ? 404 : 502)
-        .json({ error: 'gateway error', status: response.status });
-      return;
-    }
-
-    // Reject oversize responses up front if the gateway is honest about
-    // Content-Length. A malicious or buggy gateway can still under-declare
-    // (or omit) the header and stream arbitrarily many bytes, so we ALSO
-    // enforce the cap incrementally as we read the body; never let an
-    // attacker buffer >MAX_SIZE into our heap.
-    const declaredSize = parseInt(response.headers.get('content-length') ?? '0', 10);
-    if (declaredSize > CONFIG.IPFS_MAX_SIZE_BYTES) {
-      controller.abort();
-      res
-        .status(413)
-        .json({ error: 'too large', size: declaredSize, max: CONFIG.IPFS_MAX_SIZE_BYTES });
-      return;
-    }
-
-    const upstreamContentType = response.headers.get('content-type');
-    const inlineAllowed = upstreamContentType !== null && isInlineMediaType(upstreamContentType);
-    const contentType = inlineAllowed ? upstreamContentType : 'application/octet-stream';
-
-    // Fetch API allows response.body to be null (e.g. 204 No Content). Without
-    // an explicit check, the .getReader() call below would throw a TypeError
-    // that we'd report as "gateway unreachable"; misleading.
-    if (!response.body) {
-      log.warn({ cid, status: response.status }, 'IPFS gateway returned empty body');
-      res.status(502).json({ error: 'gateway error' });
-      return;
-    }
-
-    // undici types the body as ReadableStream<any>; declare the chunk type
-    // here and verify it at runtime (instanceof below) instead of trusting it.
-    const stream: ReadableStream<unknown> = response.body;
-    const reader = stream.getReader();
-    let received = 0;
-    let proxyHeadersSet = false;
-    const setProxyHeaders = (): void => {
-      if (proxyHeadersSet) return;
-      proxyHeadersSet = true;
-      res.set({
-        'Content-Type': contentType,
-        // IPFS content is content-addressed, so caching for an hour is safe.
-        'Cache-Control': 'public, max-age=3600, immutable',
-        // Sane defaults; never let user-supplied content advertise itself
-        // as the wallet's own scripts.
-        'X-Content-Type-Options': 'nosniff',
-        'Content-Security-Policy': "default-src 'none'; img-src 'self' data: blob:; sandbox",
-        // Anything outside the media allowlist downloads instead of rendering
-        // under the wallet origin.
-        ...(inlineAllowed ? {} : { 'Content-Disposition': 'attachment' }),
-      });
-    };
-    try {
-      for (;;) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        if (!(value instanceof Uint8Array)) {
-          log.error({ cid, rest }, 'IPFS gateway stream yielded a non-binary chunk');
-          controller.abort();
-          void reader.cancel().catch(() => undefined);
-          sendStreamError(res, 502, 'gateway stream error');
-          return;
-        }
-        if (received + value.byteLength > CONFIG.IPFS_MAX_SIZE_BYTES) {
-          // Never write a byte beyond the cap. Once streaming has started an
-          // HTTP status cannot be changed, so terminate that partial response.
-          try {
-            await reader.cancel();
-          } catch {
-            /* noop */
-          }
-          controller.abort();
-          if (!res.headersSent) {
-            res.status(413).json({
-              error: 'too large',
-              size: received + value.byteLength,
-              max: CONFIG.IPFS_MAX_SIZE_BYTES,
-            });
-          } else {
-            res.destroy();
-          }
-          return;
-        }
-        received += value.byteLength;
-        setProxyHeaders();
-        await writeChunkWithAbort(res, value, controller.signal);
-      }
-    } catch (streamErr) {
-      // An AbortError mid-stream is the FETCH_TIMEOUT_MS controller firing,
-      // not a stream-specific failure. Re-throw so the outer catch maps it
-      // to 504 like the pre-streaming code did. Anything else stays a 502.
-      if (isRecord(streamErr) && streamErr.name === 'AbortError') throw streamErr;
+    let failure: GatewayFailure = { status: 503, error: 'IPFS gateways cooling down' };
+    for (const [index, gateway] of gateways.entries()) {
       if (clientDisconnected) return;
-      controller.abort();
-      void reader.cancel().catch(() => undefined);
-      log.error(
-        { cid, rest, errorName: streamErr instanceof Error ? streamErr.name : typeof streamErr },
-        'IPFS proxy stream read failed'
+      const remaining = deadline - performance.now();
+      if (controller.signal.aborted || remaining <= 0) {
+        failure = { status: 504, error: 'gateway timeout' };
+        break;
+      }
+      if (gateway.cooldownUntil > Date.now()) {
+        log.debug({ cid, gateway: gateway.origin }, 'IPFS gateway skipped during cooldown');
+        continue;
+      }
+
+      const now = Date.now();
+      const laterGateways = gateways
+        .slice(index + 1)
+        .filter((entry) => entry.cooldownUntil <= now).length;
+      const attempt = new AbortController();
+      const abortAttempt = (): void => {
+        attempt.abort();
+      };
+      controller.signal.addEventListener('abort', abortAttempt, { once: true });
+      // Give cold content most of the budget, reserving a fixed window for each
+      // eligible fallback. The minimum attempt window stays within the deadline.
+      const attemptTimeout = setTimeout(
+        abortAttempt,
+        Math.min(
+          remaining,
+          Math.max(MIN_ATTEMPT_MS, remaining - laterGateways * CONFIG.IPFS_FALLBACK_RESERVE_MS)
+        )
       );
-      sendStreamError(res, 502, 'gateway stream error');
-      return;
+      let streamingStarted = false;
+      let readingBody = false;
+      try {
+        const url = `${gateway.url}${cid}${rest ? '/' + rest : ''}`;
+        // Each attempt stays pinned to its configured origin. Redirects fail
+        // before a request can reach a destination supplied by an upstream.
+        const response = await fetchImpl(url, { signal: attempt.signal, redirect: 'error' });
+        attempt.signal.throwIfAborted();
+        if (!response.ok) {
+          log.warn(
+            { cid, gateway: gateway.origin, status: response.status },
+            'IPFS gateway returned non-2xx'
+          );
+          const upstreamFailure = {
+            status: response.status === 404 ? 404 : 502,
+            error: 'gateway error',
+            upstreamStatus: response.status,
+          };
+          const serverError = response.status >= 500 && response.status < 600;
+          if (response.status === 429 || serverError) {
+            failure = preferFailure(failure, upstreamFailure);
+            const now = Date.now();
+            if (
+              response.status === 429 ||
+              shouldCoolDownForServerError(gateway, cid, response.status, now)
+            ) {
+              const cooldownMs = serverError
+                ? SERVER_ERROR_COOLDOWN_MS
+                : retryAfterMs(response.headers.get('retry-after'), now);
+              gateway.cooldownUntil = Math.max(gateway.cooldownUntil, now + cooldownMs);
+              log.warn({ cid, gateway: gateway.origin, cooldownMs }, 'IPFS gateway cooling down');
+            }
+            continue;
+          }
+          failure = upstreamFailure;
+          break;
+        }
+
+        readingBody = true;
+        await streamGatewayResponse(response, res, attempt, cid, gateway.origin, () => {
+          streamingStarted = true;
+          clearTimeout(attemptTimeout);
+        });
+        return;
+      } catch (error) {
+        if (clientDisconnected) return;
+        const timedOut = attempt.signal.aborted || (isRecord(error) && error.name === 'AbortError');
+        const attemptFailure = {
+          status: timedOut ? 504 : 502,
+          error: timedOut
+            ? 'gateway timeout'
+            : readingBody
+              ? 'gateway stream error'
+              : 'gateway unreachable',
+        };
+        failure = preferFailure(failure, attemptFailure);
+        log.warn(
+          {
+            cid,
+            gateway: gateway.origin,
+            timedOut,
+            errorName: error instanceof Error ? error.name : typeof error,
+          },
+          'IPFS gateway attempt failed'
+        );
+        if (streamingStarted || res.headersSent) {
+          sendStreamError(res, attemptFailure.status, attemptFailure.error);
+          return;
+        }
+      } finally {
+        clearTimeout(attemptTimeout);
+        controller.signal.removeEventListener('abort', abortAttempt);
+        attempt.abort();
+      }
     }
-    setProxyHeaders();
-    res.end();
-  } catch (err) {
+
     if (clientDisconnected) return;
-    if (isRecord(err) && err.name === 'AbortError') {
-      log.warn({ cid, rest }, 'IPFS proxy timeout');
-      sendStreamError(res, 504, 'gateway timeout');
-      return;
+    if (controller.signal.aborted || performance.now() >= deadline) {
+      failure = { status: 504, error: 'gateway timeout' };
     }
-    log.error(
-      { cid, rest, errorName: err instanceof Error ? err.name : typeof err },
-      'IPFS proxy failed'
-    );
-    sendStreamError(res, 502, 'gateway unreachable');
+    if (failure.status === 503) {
+      const retryAt = Math.min(...gateways.map((gateway) => gateway.cooldownUntil));
+      res.set('Retry-After', String(Math.max(1, Math.ceil((retryAt - Date.now()) / 1000))));
+    }
+    res.status(failure.status).json({ error: failure.error, status: failure.upstreamStatus });
   } finally {
     clearTimeout(timeout);
+    controller.abort();
     req.off('aborted', abortForDisconnect);
     res.off('close', abortForEarlyClose);
     releaseFetchSlot();
   }
 }
 
-ipfsRouter.get('/:cid', asyncHandler(ipfsHandler));
-ipfsRouter.get('/:cid/*splat', asyncHandler(ipfsHandler));
+async function streamGatewayResponse(
+  response: globalThis.Response,
+  res: Response,
+  controller: AbortController,
+  cid: string,
+  gateway: string,
+  onFirstChunk: () => void
+): Promise<void> {
+  // Check both declared and actual sizes, including bodies with missing or
+  // understated Content-Length. Every attempt shares the same admission slot.
+  const declaredSize = parseInt(response.headers.get('content-length') ?? '0', 10);
+  if (declaredSize > CONFIG.IPFS_MAX_SIZE_BYTES) {
+    log.warn({ cid, gateway, size: declaredSize }, 'IPFS gateway response too large');
+    res
+      .status(413)
+      .json({ error: 'too large', size: declaredSize, max: CONFIG.IPFS_MAX_SIZE_BYTES });
+    return;
+  }
+
+  const upstreamContentType = response.headers.get('content-type');
+  const inlineAllowed = upstreamContentType !== null && isInlineMediaType(upstreamContentType);
+  const contentType = inlineAllowed ? upstreamContentType : 'application/octet-stream';
+  if (!response.body) {
+    log.warn({ cid, gateway, status: response.status }, 'IPFS gateway returned empty body');
+    res.status(502).json({ error: 'gateway error' });
+    return;
+  }
+
+  // Fetch body chunks enter as unknown and pass a runtime binary check.
+  const stream: ReadableStream<unknown> = response.body;
+  const reader = stream.getReader();
+  let received = 0;
+  let proxyHeadersSet = false;
+  const setProxyHeaders = (): void => {
+    if (proxyHeadersSet) return;
+    proxyHeadersSet = true;
+    res.set({
+      'Content-Type': contentType,
+      // IPFS content is content-addressed, so caching for an hour is safe.
+      'Cache-Control': 'public, max-age=3600, immutable',
+      'X-Content-Type-Options': 'nosniff',
+      'Content-Security-Policy': "default-src 'none'; img-src 'self' data: blob:; sandbox",
+      // Media outside the allowlist is downloaded under the wallet origin.
+      ...(inlineAllowed ? {} : { 'Content-Disposition': 'attachment' }),
+    });
+  };
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      controller.signal.throwIfAborted();
+      if (done) break;
+      if (!(value instanceof Uint8Array)) {
+        log.error({ cid, gateway }, 'IPFS gateway stream yielded a non-binary chunk');
+        sendStreamError(res, 502, 'gateway stream error');
+        return;
+      }
+      if (received + value.byteLength > CONFIG.IPFS_MAX_SIZE_BYTES) {
+        log.warn(
+          { cid, gateway, size: received + value.byteLength },
+          'IPFS gateway response too large'
+        );
+        // Terminate a partial response as soon as its size reaches the cap.
+        if (res.headersSent) res.destroy();
+        else
+          res.status(413).json({
+            error: 'too large',
+            size: received + value.byteLength,
+            max: CONFIG.IPFS_MAX_SIZE_BYTES,
+          });
+        return;
+      }
+      if (value.byteLength === 0) continue;
+      if (received === 0) onFirstChunk();
+      received += value.byteLength;
+      setProxyHeaders();
+      await writeChunkWithAbort(res, value, controller.signal);
+    }
+    setProxyHeaders();
+    res.end();
+    log.info({ cid, gateway, bytes: received }, 'IPFS gateway served content');
+  } finally {
+    // Cancel without waiting so upstream cleanup cannot extend the deadline.
+    void reader.cancel().catch(() => undefined);
+  }
+}
+
+export function createIpfsRouter(): Router {
+  const gateways = CONFIG.IPFS_GATEWAYS.map((url) => ({
+    url,
+    origin: new URL(url).origin,
+    cooldownUntil: 0,
+    serverErrorCids: new Map<string, number>(),
+  }));
+  const router = Router();
+  router.use(
+    rateLimit({
+      windowMs: 60 * 1000,
+      max: 60,
+      standardHeaders: true,
+      legacyHeaders: false,
+      message: { error: 'rate-limited' },
+    })
+  );
+  const handler = asyncHandler((req, res) => ipfsHandler(req, res, gateways));
+  router.get('/:cid', handler);
+  router.get('/:cid/*splat', handler);
+  return router;
+}
+
+const ipfsRouter = createIpfsRouter();
 
 /**
  * Media types the NFT feature renders inline: raster and SVG images, video,
