@@ -156,11 +156,15 @@ describe('IPFS Routes', () => {
       IPFS_FETCH_TIMEOUT_MS: CONFIG.IPFS_FETCH_TIMEOUT_MS,
       IPFS_FALLBACK_RESERVE_MS: CONFIG.IPFS_FALLBACK_RESERVE_MS,
       IPFS_MAX_COOLDOWN_MS: CONFIG.IPFS_MAX_COOLDOWN_MS,
+      IPFS_SERVER_ERROR_MIN_CIDS: CONFIG.IPFS_SERVER_ERROR_MIN_CIDS,
+      IPFS_SERVER_ERROR_WINDOW_MS: CONFIG.IPFS_SERVER_ERROR_WINDOW_MS,
       IPFS_MAX_CONCURRENT: CONFIG.IPFS_MAX_CONCURRENT,
       IPFS_MAX_INFLIGHT_BYTES: CONFIG.IPFS_MAX_INFLIGHT_BYTES,
       IPFS_MAX_SIZE_BYTES: CONFIG.IPFS_MAX_SIZE_BYTES,
     };
     CONFIG.IPFS_GATEWAYS = gateways;
+    CONFIG.IPFS_SERVER_ERROR_MIN_CIDS = 3;
+    CONFIG.IPFS_SERVER_ERROR_WINDOW_MS = 60_000;
     app = express();
     app.use('/api/ipfs', createIpfsRouter());
     fetchStub = sinon.stub(globalThis, 'fetch');
@@ -1073,6 +1077,7 @@ describe('IPFS Routes', () => {
 
   describe('gateway cooldown', () => {
     const now = Date.parse('2026-10-09T12:00:00Z');
+    const cids = ['G', 'H', 'J', 'K'].map((suffix) => `${testCid.slice(0, -1)}${suffix}`);
     for (const { label, retryAfter, duration } of [
       { label: 'missing Retry-After', retryAfter: null, duration: 60_000 },
       { label: 'delta-seconds Retry-After', retryAfter: '120', duration: 120_000 },
@@ -1112,23 +1117,148 @@ describe('IPFS Routes', () => {
       });
     }
 
-    for (const status of [500, 502, 503, 504, 599]) {
-      it(`skips a ${status} gateway for thirty seconds and retries it on expiry`, async () => {
+    for (const status of [502, 503, 504]) {
+      it(`keeps a gateway available for other CIDs after repeated ${status} for one CID`, async () => {
+        sinon.stub(Date, 'now').returns(now);
+        fetchStub.callsFake((url) =>
+          url.startsWith(`${gateways[0]}${testCid}`)
+            ? buildFetchResponse({ ok: false, status })
+            : buildFetchResponse()
+        );
+
+        const paths = ['', '/image.png', '/metadata.json', '/image.png'];
+        for (const path of paths) {
+          expect(await request.execute(app).get(`/api/ipfs/${testCid}${path}`)).to.have.status(200);
+        }
+        expect(await request.execute(app).get(`/api/ipfs/${cids[1]}`)).to.have.status(200);
+        expect(fetchStub.getCalls().map((call) => call.args[0])).to.deep.equal([
+          ...paths.flatMap((path) => [
+            `${gateways[0]}${testCid}${path}`,
+            `${gateways[1]}${testCid}${path}`,
+          ]),
+          `${gateways[0]}${cids[1]}`,
+        ]);
+      });
+
+      it(`cools down after three distinct CIDs return ${status} and retries after thirty seconds`, async () => {
         let current = now;
         sinon.stub(Date, 'now').callsFake(() => current);
-        fetchStub.callsFake(() => buildFetchResponse());
-        fetchStub
-          .onFirstCall()
-          .resolves(buildFetchResponse({ ok: false, status, retryAfter: '900' }));
-        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+        fetchStub.callsFake((url) =>
+          url.startsWith(gateways[0])
+            ? buildFetchResponse({ ok: false, status, retryAfter: '900' })
+            : buildFetchResponse()
+        );
+        for (const cid of cids.slice(0, 3)) {
+          expect(await request.execute(app).get(`/api/ipfs/${cid}`)).to.have.status(200);
+        }
+        expect(fetchStub.getCalls().map((call) => call.args[0])).to.deep.equal(
+          cids.slice(0, 3).flatMap((cid) => [`${gateways[0]}${cid}`, `${gateways[1]}${cid}`])
+        );
+
         current += 29_999;
-        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
-        expect(fetchStub.thirdCall.args[0]).to.equal(`${gateways[1]}${testCid}`);
+        expect(await request.execute(app).get(`/api/ipfs/${cids[3]}`)).to.have.status(200);
+        expect(fetchStub.getCall(6).args[0]).to.equal(`${gateways[1]}${cids[3]}`);
         current += 1;
-        expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
-        expect(fetchStub.getCall(3).args[0]).to.equal(`${gateways[0]}${testCid}`);
+        expect(await request.execute(app).get(`/api/ipfs/${cids[3]}`)).to.have.status(200);
+        expect(fetchStub.getCall(7).args[0]).to.equal(`${gateways[0]}${cids[3]}`);
+        // A fresh cooldown needs fresh failures after the previous one starts.
+        expect(await request.execute(app).get(`/api/ipfs/${cids[0]}`)).to.have.status(200);
+        expect(fetchStub.getCall(9).args[0]).to.equal(`${gateways[0]}${cids[0]}`);
+        expect(fetchStub.callCount).to.equal(11);
       });
     }
+
+    for (const status of [500, 501, 505, 599]) {
+      it(`falls back after ${status} for distinct CIDs while keeping the gateway eligible`, async () => {
+        sinon.stub(Date, 'now').returns(now);
+        fetchStub.callsFake((url) =>
+          url.startsWith(gateways[0])
+            ? buildFetchResponse({ ok: false, status })
+            : buildFetchResponse()
+        );
+        for (const cid of cids) {
+          expect(await request.execute(app).get(`/api/ipfs/${cid}`)).to.have.status(200);
+        }
+        expect(fetchStub.getCalls().map((call) => call.args[0])).to.deep.equal(
+          cids.flatMap((cid) => [`${gateways[0]}${cid}`, `${gateways[1]}${cid}`])
+        );
+      });
+    }
+
+    it('counts a mix of 502, 503 and 504 across distinct CIDs', async () => {
+      sinon.stub(Date, 'now').returns(now);
+      fetchStub.callsFake(() => buildFetchResponse());
+      for (const [index, status] of [502, 503, 504].entries()) {
+        fetchStub.onCall(index * 2).resolves(buildFetchResponse({ ok: false, status }));
+        expect(await request.execute(app).get(`/api/ipfs/${cids[index]}`)).to.have.status(200);
+      }
+      expect(await request.execute(app).get(`/api/ipfs/${cids[3]}`)).to.have.status(200);
+      expect(fetchStub.lastCall.args[0]).to.equal(`${gateways[1]}${cids[3]}`);
+      expect(fetchStub.callCount).to.equal(7);
+    });
+
+    for (const windowMs of [60_000, 120_000]) {
+      it(`expires individual CID failures at the ${windowMs} ms window boundary`, async () => {
+        CONFIG.IPFS_SERVER_ERROR_WINDOW_MS = windowMs;
+        let current = now;
+        sinon.stub(Date, 'now').callsFake(() => current);
+        fetchStub.callsFake((url) =>
+          url.startsWith(gateways[0]) && url !== `${gateways[0]}${cids[3]}`
+            ? buildFetchResponse({ ok: false, status: 503 })
+            : buildFetchResponse()
+        );
+
+        expect(await request.execute(app).get(`/api/ipfs/${cids[0]}`)).to.have.status(200);
+        current += windowMs / 2;
+        expect(await request.execute(app).get(`/api/ipfs/${cids[1]}`)).to.have.status(200);
+        current += windowMs / 2;
+        expect(await request.execute(app).get(`/api/ipfs/${cids[2]}`)).to.have.status(200);
+        expect(await request.execute(app).get(`/api/ipfs/${cids[3]}`)).to.have.status(200);
+        expect(fetchStub.getCall(6).args[0]).to.equal(`${gateways[0]}${cids[3]}`);
+
+        // The two recent failures remain eligible when the expired CID fails again.
+        expect(await request.execute(app).get(`/api/ipfs/${cids[0]}`)).to.have.status(200);
+        expect(await request.execute(app).get(`/api/ipfs/${cids[3]}`)).to.have.status(200);
+        expect(fetchStub.lastCall.args[0]).to.equal(`${gateways[1]}${cids[3]}`);
+        expect(fetchStub.callCount).to.equal(10);
+      });
+    }
+
+    it('honors a configured threshold of four distinct CIDs', async () => {
+      CONFIG.IPFS_SERVER_ERROR_MIN_CIDS = 4;
+      sinon.stub(Date, 'now').returns(now);
+      fetchStub.callsFake((url) =>
+        url.startsWith(gateways[0])
+          ? buildFetchResponse({ ok: false, status: 503 })
+          : buildFetchResponse()
+      );
+      for (const cid of cids) {
+        expect(await request.execute(app).get(`/api/ipfs/${cid}`)).to.have.status(200);
+      }
+      expect(fetchStub.getCalls().map((call) => call.args[0])).to.deep.equal(
+        cids.flatMap((cid) => [`${gateways[0]}${cid}`, `${gateways[1]}${cid}`])
+      );
+      expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+      expect(fetchStub.lastCall.args[0]).to.equal(`${gateways[1]}${testCid}`);
+      expect(fetchStub.callCount).to.equal(9);
+    });
+
+    it('counts base32 CID letter-case variants as one failing CID', async () => {
+      sinon.stub(Date, 'now').returns(now);
+      const cid = 'bafybeib2gp4f5suijuyxbcfhi7lvjzvskyciye5n4ihfrn5pcwhrcq45ru';
+      const variants = [cid, `b${cid.slice(1).toUpperCase()}`, cid.replace('a', 'A')];
+      fetchStub.callsFake((url) =>
+        url.startsWith(`${gateways[0]}b`)
+          ? buildFetchResponse({ ok: false, status: 503 })
+          : buildFetchResponse()
+      );
+      for (const variant of variants) {
+        expect(await request.execute(app).get(`/api/ipfs/${variant}`)).to.have.status(200);
+      }
+      expect(await request.execute(app).get(`/api/ipfs/${testCid}`)).to.have.status(200);
+      expect(fetchStub.lastCall.args[0]).to.equal(`${gateways[0]}${testCid}`);
+      expect(fetchStub.callCount).to.equal(7);
+    });
 
     it('honors a configured cooldown cap above fifteen minutes', async () => {
       CONFIG.IPFS_MAX_COOLDOWN_MS = 1_800_000;

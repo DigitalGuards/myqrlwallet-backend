@@ -16,6 +16,7 @@ interface GatewayState {
   url: string;
   origin: string;
   cooldownUntil: number;
+  serverErrorCids: Map<string, number>;
 }
 
 interface GatewayFailure {
@@ -27,6 +28,27 @@ interface GatewayFailure {
 const DEFAULT_COOLDOWN_MS = 60_000;
 const SERVER_ERROR_COOLDOWN_MS = 30_000;
 const MIN_ATTEMPT_MS = 1000;
+
+function shouldCoolDownForServerError(
+  gateway: GatewayState,
+  cid: string,
+  status: number,
+  now: number
+): boolean {
+  if (status !== 502 && status !== 503 && status !== 504) return false;
+  for (const [failedCid, failedAt] of gateway.serverErrorCids) {
+    if (now - failedAt >= CONFIG.IPFS_SERVER_ERROR_WINDOW_MS) {
+      gateway.serverErrorCids.delete(failedCid);
+    }
+  }
+  // Count the root CID across paths and accepted base32 letter-case variants.
+  const key = cid.startsWith('b') ? cid.toLowerCase() : cid;
+  gateway.serverErrorCids.set(key, now);
+  if (gateway.serverErrorCids.size < CONFIG.IPFS_SERVER_ERROR_MIN_CIDS) return false;
+  // Each cooldown starts a fresh observation set, bounded by the CID threshold.
+  gateway.serverErrorCids.clear();
+  return true;
+}
 
 function retryAfterMs(value: unknown, now: number): number {
   if (typeof value !== 'string') return DEFAULT_COOLDOWN_MS;
@@ -237,11 +259,16 @@ async function ipfsHandler(req: Request, res: Response, gateways: GatewayState[]
           if (response.status === 429 || serverError) {
             failure = preferFailure(failure, upstreamFailure);
             const now = Date.now();
-            const cooldownMs = serverError
-              ? SERVER_ERROR_COOLDOWN_MS
-              : retryAfterMs(response.headers.get('retry-after'), now);
-            gateway.cooldownUntil = Math.max(gateway.cooldownUntil, now + cooldownMs);
-            log.warn({ cid, gateway: gateway.origin, cooldownMs }, 'IPFS gateway cooling down');
+            if (
+              response.status === 429 ||
+              shouldCoolDownForServerError(gateway, cid, response.status, now)
+            ) {
+              const cooldownMs = serverError
+                ? SERVER_ERROR_COOLDOWN_MS
+                : retryAfterMs(response.headers.get('retry-after'), now);
+              gateway.cooldownUntil = Math.max(gateway.cooldownUntil, now + cooldownMs);
+              log.warn({ cid, gateway: gateway.origin, cooldownMs }, 'IPFS gateway cooling down');
+            }
             continue;
           }
           failure = upstreamFailure;
@@ -395,6 +422,7 @@ export function createIpfsRouter(): Router {
     url,
     origin: new URL(url).origin,
     cooldownUntil: 0,
+    serverErrorCids: new Map<string, number>(),
   }));
   const router = Router();
   router.use(

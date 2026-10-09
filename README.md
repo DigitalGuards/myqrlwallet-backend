@@ -140,19 +140,30 @@ after URL and trailing-slash normalization. IP literals, port zero, blank entrie
 malformed URLs, credentials, query strings, and fragments stop startup with a
 configuration error. When the list is absent, `IPFS_GATEWAY` supplies a single
 legacy gateway.
-When both variables are absent, the order is `https://ipfs.io/ipfs/`,
-`https://gateway.pinata.cloud/ipfs/`, then `https://dweb.link/ipfs/`.
-ipfs.io and dweb.link share an operator and rate limit, so Pinata provides the
-first independent fallback.
+When both variables are absent, the order is `https://ipfs.filebase.io/ipfs/`,
+then `https://gateway.pinata.cloud/ipfs/`. ipfs.io and dweb.link permanently
+retired HTTP serving in September 2026, completing the change on 21 September.
+Filebase leads because gateway probes with real content returned 200 responses
+in 0.04 to 0.16 seconds with correct content types. Pinata is a slow late
+fallback: observed responses took 3.7 to 5.4 seconds, and under load it returns
+a Cloudflare JavaScript challenge page with status 429 and no `Retry-After`.
+A self-hosted gateway is the durable option; operators can point `IPFS_GATEWAYS`
+at its HTTPS `/ipfs/` base URL.
 
 Requests advance to the next gateway on 429, 5xx, timeout, or network failure
 before streaming starts. Other 4xx responses stop the search; 404 is returned to
 the client. Each gateway request refuses redirects. A gateway that returns 429
 is skipped across requests for 60 seconds, or for its `Retry-After` delta in
 seconds or HTTP date, capped by `IPFS_MAX_COOLDOWN_MS` (default and minimum
-900000 ms, or 15 minutes). Invalid `Retry-After` values use 60 seconds. Upstream
-5xx responses trigger a 30-second cooldown. Cooldowns are local to each backend
-process and reset on restart.
+900000 ms, or 15 minutes). Invalid `Retry-After` values use 60 seconds.
+Upstream 502, 503, and 504 responses trigger a 30-second cooldown only after
+`IPFS_SERVER_ERROR_MIN_CIDS` distinct root CIDs (default and minimum 3) fail on
+that gateway within `IPFS_SERVER_ERROR_WINDOW_MS` (default 60000 ms). Repeated
+failures and different paths for one CID count once, using its most recent
+failure time. Failures expire when they reach the window length, and starting
+a 5xx cooldown clears the accumulated failures. A 500 response and other 5xx
+statuses fall through to the next gateway without contributing to a cooldown.
+Cooldowns and failure tracking are local to each backend process and reset on restart.
 When every gateway is cooling down, requests return 503 with `Retry-After`.
 
 `IPFS_FETCH_TIMEOUT_MS` (default 8000 ms) covers every attempt and the response

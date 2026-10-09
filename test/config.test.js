@@ -13,9 +13,8 @@ const { expect } = chai;
 describe('IPFS gateway configuration', () => {
   it('defaults to the ordered public gateway list', () => {
     expect(parseIpfsGateways(undefined, undefined)).to.deep.equal([
-      'https://ipfs.io/ipfs/',
+      'https://ipfs.filebase.io/ipfs/',
       'https://gateway.pinata.cloud/ipfs/',
-      'https://dweb.link/ipfs/',
     ]);
   });
 
@@ -170,6 +169,30 @@ describe('IPFS gateway configuration', () => {
           IPFS_MAX_COOLDOWN_MS: cooldown,
         },
         '[CONFIG.IPFS_FALLBACK_RESERVE_MS, CONFIG.IPFS_MAX_COOLDOWN_MS]'
+      );
+      expect(child.status, child.stderr).to.equal(0);
+      expect(JSON.parse(child.stdout.trim())).to.deep.equal(expected);
+    });
+  }
+
+  for (const { label, minCids, windowMs, expected } of [
+    { label: 'defaults', minCids: undefined, windowMs: undefined, expected: [3, 60_000] },
+    { label: 'configured values', minCids: '5', windowMs: '120000', expected: [5, 120_000] },
+    { label: 'minimum CID count', minCids: '1', windowMs: '1000', expected: [3, 1000] },
+    ...['0', '-1', 'invalid'].map((value) => ({
+      label: `invalid value ${value}`,
+      minCids: value,
+      windowMs: value,
+      expected: [3, 60_000],
+    })),
+  ]) {
+    it(`loads server error tracking settings with ${label}`, () => {
+      const child = importConfig(
+        {
+          IPFS_SERVER_ERROR_MIN_CIDS: minCids,
+          IPFS_SERVER_ERROR_WINDOW_MS: windowMs,
+        },
+        '[CONFIG.IPFS_SERVER_ERROR_MIN_CIDS, CONFIG.IPFS_SERVER_ERROR_WINDOW_MS]'
       );
       expect(child.status, child.stderr).to.equal(0);
       expect(JSON.parse(child.stdout.trim())).to.deep.equal(expected);

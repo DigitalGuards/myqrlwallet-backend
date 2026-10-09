@@ -52,13 +52,11 @@ export function parseNonNegativeInt(value: string | undefined, fallback: number)
 /** Gateway configuration is validated before the application can listen. */
 export function parseIpfsGateways(list: unknown, legacy: unknown): string[] {
   if (list === undefined && legacy === undefined) {
-    // ipfs.io and dweb.link share an operator and rate limit. Pinata gives
-    // the first fallback an independent capacity pool.
-    return [
-      'https://ipfs.io/ipfs/',
-      'https://gateway.pinata.cloud/ipfs/',
-      'https://dweb.link/ipfs/',
-    ];
+    // ipfs.io and dweb.link retired HTTP serving in September 2026. Filebase
+    // leads after fast responses with correct content types in gateway probes.
+    // Pinata is a slow late fallback and returns a Cloudflare JS challenge under
+    // load. A self-hosted gateway configured through IPFS_GATEWAYS is the durable option.
+    return ['https://ipfs.filebase.io/ipfs/', 'https://gateway.pinata.cloud/ipfs/'];
   }
 
   const name = list === undefined ? 'IPFS_GATEWAY' : 'IPFS_GATEWAYS';
@@ -180,6 +178,8 @@ export interface AppConfig {
   IPFS_FETCH_TIMEOUT_MS: number;
   IPFS_FALLBACK_RESERVE_MS: number;
   IPFS_MAX_COOLDOWN_MS: number;
+  IPFS_SERVER_ERROR_MIN_CIDS: number;
+  IPFS_SERVER_ERROR_WINDOW_MS: number;
   IPFS_MAX_SIZE_BYTES: number;
   IPFS_MAX_CONCURRENT: number;
   IPFS_MAX_INFLIGHT_BYTES: number;
@@ -335,6 +335,11 @@ export const CONFIG: AppConfig = {
     900_000,
     parsePositiveInt(process.env.IPFS_MAX_COOLDOWN_MS, 900_000)
   ),
+  IPFS_SERVER_ERROR_MIN_CIDS: Math.max(
+    3,
+    parsePositiveInt(process.env.IPFS_SERVER_ERROR_MIN_CIDS, 3)
+  ),
+  IPFS_SERVER_ERROR_WINDOW_MS: parsePositiveInt(process.env.IPFS_SERVER_ERROR_WINDOW_MS, 60_000),
   IPFS_MAX_SIZE_BYTES: parsePositiveInt(process.env.IPFS_MAX_SIZE_BYTES, 10 * 1024 * 1024),
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),
