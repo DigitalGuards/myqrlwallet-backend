@@ -11,7 +11,8 @@ const app = express();
 // Admit RPC traffic before parsing JSON so malformed and oversized bodies
 // consume the same per-IP quota as valid and application-rejected requests.
 app.use('/api/qrl-rpc/:network', rpcRateLimitGeneral);
-app.use(express.json({ limit: '50kb' }));
+// API clients send plain JSON. Reject encodings before creating a decoder.
+app.use(express.json({ limit: '50kb', inflate: false }));
 app.use(corsMiddleware);
 app.set('trust proxy', isTrustedProxy);
 
