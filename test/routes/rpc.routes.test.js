@@ -1,5 +1,6 @@
 import * as chai from 'chai';
 import { createServer, request as httpRequest } from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { default as chaiHttp, request } from 'chai-http';
 import sinon from 'sinon';
 import { app } from '../../src/app.js';
@@ -499,6 +500,60 @@ describe('RPC Routes', () => {
       await new Promise((resolve) => server.close(resolve));
     }
   });
+
+  for (const trailingBytes of [false, true]) {
+    it(`rejects gzip JSON${trailingBytes ? ' with trailing bytes' : ''} and keeps serving plain JSON`, async () => {
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'qrl_blockNumber',
+        params: [],
+        id: 'plain-json',
+      });
+      const compressed = gzipSync(body);
+      const payload = trailingBytes
+        ? Buffer.concat([compressed, Buffer.from('trailing-bytes')])
+        : compressed;
+      const result = { jsonrpc: '2.0', id: 'plain-json', result: '0x1234' };
+      rpcServiceStub.resolves(result);
+
+      const server = createServer(app);
+      await new Promise((resolve) => server.listen(0, 'localhost', resolve));
+      try {
+        const url = `http://localhost:${server.address().port}/api/qrl-rpc/dev`;
+        const rejected = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+          body: payload,
+          signal: AbortSignal.timeout(1000),
+        });
+
+        expect(rejected.status).to.equal(415);
+        expect(await rejected.json()).to.deep.equal({
+          error: { message: 'Invalid request body' },
+        });
+        expect(rpcServiceStub.called).to.equal(false);
+
+        const accepted = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: AbortSignal.timeout(1000),
+        });
+
+        expect(accepted.status).to.equal(200);
+        expect(await accepted.json()).to.deep.equal(result);
+        expect(rpcServiceStub.calledOnce).to.equal(true);
+        expect(rpcServiceStub.firstCall.args.slice(0, 4)).to.deep.equal([
+          'dev',
+          'qrl_blockNumber',
+          [],
+          'plain-json',
+        ]);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+  }
 
   it('does not let spoofed forwarding headers evade write rate limits', async () => {
     const originalTrustedProxies = [...CONFIG.TRUSTED_PROXY_CIDRS];
