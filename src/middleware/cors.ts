@@ -9,11 +9,17 @@ import { HttpError } from '../utils/guards.js';
 // Web pages remain gated by the ALLOWED_ORIGINS allowlist.
 const EXTENSION_SCHEMES = ['chrome-extension://', 'moz-extension://', 'safari-web-extension://'];
 
+// MyQRLWallet Desktop 1.4.6 and later serves its wallet window from this
+// origin. A web page cannot claim it, and a native client can already omit
+// Origin, so allowing it grants nothing a headerless client lacks.
+const DESKTOP_ORIGINS = ['app://wallet'];
+
 export const corsMiddleware = cors({
   origin: (origin, callback) => {
     if (
       !origin ||
       CONFIG.ALLOWED_ORIGINS.includes(origin) ||
+      DESKTOP_ORIGINS.includes(origin.toLowerCase()) ||
       // Schemes are case-insensitive (RFC 6454); browsers normalize the
       // Origin header to lowercase, but custom clients may not.
       EXTENSION_SCHEMES.some((scheme) => origin.toLowerCase().startsWith(scheme))
