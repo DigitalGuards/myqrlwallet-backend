@@ -48,6 +48,24 @@ describe('corsMiddleware origin policy', () => {
     expect(await decide('CHROME-EXTENSION://abcdefghijklmnop')).to.equal(null);
   });
 
+  it('allows the MyQRLWallet desktop wallet origin', async () => {
+    expect(await decide('app://wallet')).to.equal(null);
+    expect(await decide('APP://WALLET')).to.equal(null);
+  });
+
+  it('rejects other app-scheme origins and lookalikes', async () => {
+    for (const origin of [
+      'app://evil',
+      'app://wallet.example',
+      'https://wallet',
+      'app://walletx',
+    ]) {
+      const err = await decide(origin);
+      expect(err, origin).to.not.equal(null);
+      expect(err.status ?? err.statusCode).to.equal(403);
+    }
+  });
+
   it('allows an absent Origin header (curl, native clients)', async () => {
     expect(await decide(undefined)).to.equal(null);
   });
