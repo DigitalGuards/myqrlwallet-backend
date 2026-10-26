@@ -5,7 +5,7 @@
   "main": "server.js",
   "type": "module",
   "overrides": {
-    "serialize-javascript": "^7.0.5",
+    "serialize-javascript": "^7.1.4",
     "diff": "^8.0.3",
     "express": {
       "qs": "^6.16.0"
