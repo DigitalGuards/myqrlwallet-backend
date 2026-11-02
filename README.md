@@ -44,13 +44,38 @@ Edit `.env` with your settings:
 PORT=3000
 LISTEN_HOST=127.0.0.1
 
-# RPC Endpoints
+# RPC Endpoints (testnet node; mainnet stays dormant until launch)
 RPC_ENDPOINT_TESTNET=http://localhost:8545
-RPC_ENDPOINT_MAINNET=http://localhost:8545
 
 # CORS Origins
 ALLOWED_ORIGINS=http://localhost:5173,https://qrlwallet.com
 ```
+
+Testnet falls back to `http://localhost:8545` when `RPC_ENDPOINTS_TESTNET` and
+`RPC_ENDPOINT_TESTNET` are both unset or blank. Dev and mainnet are dormant by
+default: with both variables unset the network has no endpoints, nothing polls
+it, and `POST /api/qrl-rpc/<network>` answers 503 without an upstream call. For
+these two networks `RPC_ENDPOINTS_<NETWORK>` takes precedence over
+`RPC_ENDPOINT_<NETWORK>` whenever it is set, and a blank value in the variable
+that takes effect keeps the network dormant. Dev turned dormant together with
+mainnet because no shipped client calls it; local development sets
+`RPC_ENDPOINT_DEV` as `.env.example` does.
+
+To launch mainnet, set all three of these together and restart:
+
+```env
+RPC_ENDPOINTS_MAINNET=<trusted-mainnet-node-url>[,<failover-url>]
+RPC_EXPECTED_CHAIN_ID_MAINNET=<positive-decimal-chain-id>
+RPC_EXPECTED_GENESIS_HASH_MAINNET=<0x-prefixed-32-byte-genesis-hash>
+# Optional, once a mainnet explorer indexes the chain:
+TX_HISTORY_ORIGIN_MAINNET=<https-origin-of-a-mainnet-explorer>
+```
+
+Startup stops when mainnet endpoints are set without both pins, when a mainnet
+endpoint matches any testnet or dev endpoint (compared after URL normalization,
+with every loopback spelling treated as one host), or when the mainnet chain ID
+or genesis hash equals the testnet pin. Keep `RPC_REQUIRED_NETWORKS=testnet`
+until `/health` shows mainnet ready.
 
 ### Development
 
@@ -67,7 +92,8 @@ npm run lint       # eslint (strict-type-checked)
 
 | Method | Endpoint | Description |
 |--------|----------|-------------|
-| POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: testnet, mainnet) |
+| POST | `/api/qrl-rpc/:network` | Proxy RPC calls (network: dev, testnet, mainnet) |
+| GET | `/api/qrl-rpc/:network` | Usage, allowed methods, `configured` and `ready` for that network; 404 for an unknown network |
 | POST | `/api/tx-history` | Get transaction history for address |
 | GET | `/api/ipfs/:cid[/path]` | Fetch IPFS content through ordered gateways |
 | GET | `/health` | RPC readiness check |
@@ -80,6 +106,11 @@ curl -X POST https://qrlwallet.com/api/qrl-rpc/testnet \
   -H "Content-Type: application/json" \
   -d '{"method": "qrl_blockNumber", "params": []}'
 ```
+
+`GET /api/qrl-rpc/<network>` reports `configured` (the network has at least one
+endpoint) and `ready` (at least one endpoint currently passes readiness and any
+configured identity pin) next to the usage description, so clients can tell a
+dormant or unready network apart from a live one.
 
 Every RPC POST, including malformed JSON, rejected methods, and batches, consumes
 the general per-IP admission quota. Signed transaction submissions also use a
@@ -103,6 +134,8 @@ positive decimal integer, at most 256 bits) and
 `RPC_EXPECTED_GENESIS_HASH_<NETWORK>` (`0x` followed by exactly 64 hex characters).
 Use the `DEV`, `TESTNET`, or `MAINNET` suffix. Both variables must be absent to
 disable identity binding; partial, blank, or malformed pins stop startup.
+Mainnet endpoints always require both mainnet pins, and both mainnet pins must
+differ from the testnet pins.
 Configured polls verify `qrl_chainId` and block zero's hash within the existing
 poll timeout and response limits. A failed poll immediately revokes that
 endpoint's identity readiness, including cached responses, independently of the
@@ -244,9 +277,10 @@ kubectl apply -f k8s/hpa.yaml
 - No privilege escalation allowed
 
 The example ConfigMap deliberately targets an in-cluster `qrl-node` Service
-and disables mainnet. Replace that Service name with the actual trusted node
-topology before rollout. An RPC endpoint must never point back to the public
-wallet proxy because that creates a recursive request loop.
+and leaves mainnet dormant by omitting its variables. Replace that Service name
+with the actual trusted node topology before rollout. An RPC endpoint must never
+point back to the public wallet proxy because that creates a recursive request
+loop.
 
 ## CI/CD
 
