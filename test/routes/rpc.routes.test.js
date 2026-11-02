@@ -1,10 +1,13 @@
 import * as chai from 'chai';
 import { createServer, request as httpRequest } from 'node:http';
+import { gzipSync } from 'node:zlib';
 import { default as chaiHttp, request } from 'chai-http';
 import sinon from 'sinon';
 import { app } from '../../src/app.js';
 import { CONFIG } from '../../src/config/index.js';
 import { rpcService } from '../../src/services/rpc.service.js';
+import { healthMonitor, HEALTH_STATES } from '../../src/services/rpc/healthMonitor.js';
+import { cache } from '../../src/utils/cache.js';
 import { HttpError } from '../../src/utils/guards.js';
 
 chai.use(chaiHttp);
@@ -500,6 +503,60 @@ describe('RPC Routes', () => {
     }
   });
 
+  for (const trailingBytes of [false, true]) {
+    it(`rejects gzip JSON${trailingBytes ? ' with trailing bytes' : ''} and keeps serving plain JSON`, async () => {
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        method: 'qrl_blockNumber',
+        params: [],
+        id: 'plain-json',
+      });
+      const compressed = gzipSync(body);
+      const payload = trailingBytes
+        ? Buffer.concat([compressed, Buffer.from('trailing-bytes')])
+        : compressed;
+      const result = { jsonrpc: '2.0', id: 'plain-json', result: '0x1234' };
+      rpcServiceStub.resolves(result);
+
+      const server = createServer(app);
+      await new Promise((resolve) => server.listen(0, 'localhost', resolve));
+      try {
+        const url = `http://localhost:${server.address().port}/api/qrl-rpc/dev`;
+        const rejected = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json', 'Content-Encoding': 'gzip' },
+          body: payload,
+          signal: AbortSignal.timeout(1000),
+        });
+
+        expect(rejected.status).to.equal(415);
+        expect(await rejected.json()).to.deep.equal({
+          error: { message: 'Invalid request body' },
+        });
+        expect(rpcServiceStub.called).to.equal(false);
+
+        const accepted = await fetch(url, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body,
+          signal: AbortSignal.timeout(1000),
+        });
+
+        expect(accepted.status).to.equal(200);
+        expect(await accepted.json()).to.deep.equal(result);
+        expect(rpcServiceStub.calledOnce).to.equal(true);
+        expect(rpcServiceStub.firstCall.args.slice(0, 4)).to.deep.equal([
+          'dev',
+          'qrl_blockNumber',
+          [],
+          'plain-json',
+        ]);
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    });
+  }
+
   it('does not let spoofed forwarding headers evade write rate limits', async () => {
     const originalTrustedProxies = [...CONFIG.TRUSTED_PROXY_CIDRS];
     CONFIG.TRUSTED_PROXY_CIDRS = [];
@@ -637,5 +694,131 @@ describe('RPC Routes', () => {
     expect(res).to.have.status(404);
     expect(res.body.error.message).to.equal('Unknown network');
     rpcServiceStub = sinon.stub(rpcService, 'executeRPC');
+  });
+
+  describe('network documentation and state', () => {
+    const MAINNET_URL = 'http://mainnet.test:8545';
+    const mainnetPin = { chainId: '0x17', genesisHash: `0x${'ef'.repeat(32)}` };
+    let originalEndpoints;
+    let originalIdentities;
+
+    beforeEach(() => {
+      originalEndpoints = { ...CONFIG.RPC_ENDPOINTS };
+      originalIdentities = { ...CONFIG.RPC_EXPECTED_IDENTITIES };
+      healthMonitor.__resetForTesting();
+    });
+
+    afterEach(() => {
+      CONFIG.RPC_ENDPOINTS = originalEndpoints;
+      CONFIG.RPC_EXPECTED_IDENTITIES = originalIdentities;
+      healthMonitor.__resetForTesting();
+      cache.flushAll();
+    });
+
+    function markReady(network, identity) {
+      for (const endpoint of healthMonitor.networks.get(network)) {
+        Object.assign(endpoint, {
+          state: HEALTH_STATES.STATE_UP,
+          lastHeight: 100,
+          syncing: false,
+          headTimestamp: Date.now(),
+          lastVerifiedPollAt: Date.now(),
+          verifiedIdentity: identity === undefined ? null : { ...identity },
+        });
+      }
+    }
+
+    function expectDocumentation(body, network) {
+      expect(body).to.include({ name: 'QRL RPC Proxy', network, max_payload: '50KB' });
+      expect(body.description).to.be.a('string');
+      expect(body.usage).to.deep.equal({
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: { jsonrpc: '2.0', method: 'qrl_blockNumber', params: [], id: 1 },
+      });
+      expect(body.allowed_methods).to.include('qrl_blockNumber');
+      expect(body.rate_limits).to.have.keys('admission', 'write');
+    }
+
+    it('reports a dormant mainnet as unconfigured and not ready', async () => {
+      CONFIG.RPC_ENDPOINTS = { ...CONFIG.RPC_ENDPOINTS, mainnet: [] };
+
+      const res = await request.execute(app).get('/api/qrl-rpc/mainnet');
+
+      expect(res).to.have.status(200);
+      expectDocumentation(res.body, 'mainnet');
+      expect(res.body).to.include({ configured: false, ready: false });
+    });
+
+    it('reports a configured mainnet as not ready until a pinned endpoint verifies', async () => {
+      CONFIG.RPC_ENDPOINTS = { ...CONFIG.RPC_ENDPOINTS, mainnet: [MAINNET_URL] };
+      CONFIG.RPC_EXPECTED_IDENTITIES = { ...CONFIG.RPC_EXPECTED_IDENTITIES, mainnet: mainnetPin };
+
+      const unpolled = await request.execute(app).get('/api/qrl-rpc/mainnet');
+      expect(unpolled.body).to.include({ configured: true, ready: false });
+
+      markReady('mainnet', { ...mainnetPin, chainId: '0x18' });
+      const mismatched = await request.execute(app).get('/api/qrl-rpc/mainnet');
+      expect(mismatched.body).to.include({ configured: true, ready: false });
+
+      markReady('mainnet', mainnetPin);
+      const verified = await request.execute(app).get('/api/qrl-rpc/mainnet');
+      expect(verified).to.have.status(200);
+      expectDocumentation(verified.body, 'mainnet');
+      expect(verified.body).to.include({ configured: true, ready: true });
+    });
+
+    it('keeps the testnet documentation and adds its state', async () => {
+      CONFIG.RPC_ENDPOINTS = { ...CONFIG.RPC_ENDPOINTS, testnet: ['http://testnet.test:8545'] };
+
+      const before = await request.execute(app).get('/api/qrl-rpc/testnet');
+      expect(before).to.have.status(200);
+      expectDocumentation(before.body, 'testnet');
+      expect(before.body).to.include({ configured: true, ready: false });
+
+      healthMonitor.init();
+      markReady('testnet');
+      const after = await request.execute(app).get('/api/qrl-rpc/testnet');
+      expect(after.body).to.include({ configured: true, ready: true });
+    });
+
+    for (const network of ['nope', 'Mainnet', 'custom']) {
+      it(`answers GET for the unknown network ${network} with 404`, async () => {
+        const res = await request.execute(app).get(`/api/qrl-rpc/${network}`);
+
+        expect(res).to.have.status(404);
+        expect(res.body.error.message).to.equal('Unknown network');
+        expect(res.body).not.to.have.property('allowed_methods');
+      });
+    }
+
+    it('answers POST to a dormant mainnet with 503 and no upstream fetch', async () => {
+      CONFIG.RPC_ENDPOINTS = { ...CONFIG.RPC_ENDPOINTS, mainnet: [] };
+      // A fresh client address keeps earlier write-limit tests out of this bucket.
+      const originalTrustedProxies = [...CONFIG.TRUSTED_PROXY_CIDRS];
+      CONFIG.TRUSTED_PROXY_CIDRS = ['loopback'];
+      rpcServiceStub.restore();
+      const fetchStub = sinon.stub(globalThis, 'fetch').rejects(new Error('unexpected fetch'));
+      try {
+        for (const [method, params] of [
+          ['qrl_blockNumber', []],
+          ['qrl_chainId', []],
+          ['qrl_sendRawTransaction', ['0x01']],
+        ]) {
+          const res = await request
+            .execute(app)
+            .post('/api/qrl-rpc/mainnet')
+            .set('X-Forwarded-For', '198.51.100.250')
+            .send({ jsonrpc: '2.0', id: 1, method, params });
+          expect(res, method).to.have.status(503);
+        }
+        expect(fetchStub.called).to.equal(false);
+        expect(healthMonitor.networks.has('mainnet')).to.equal(false);
+      } finally {
+        CONFIG.TRUSTED_PROXY_CIDRS = originalTrustedProxies;
+        fetchStub.restore();
+        rpcServiceStub = sinon.stub(rpcService, 'executeRPC');
+      }
+    });
   });
 });

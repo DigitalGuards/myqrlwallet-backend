@@ -1,9 +1,10 @@
 import { Router } from 'express';
-import { CONFIG } from '../config/index.js';
+import { CONFIG, isNetworkName } from '../config/index.js';
 import { normalizeRpcId, rpcService } from '../services/rpc.service.js';
+import { healthMonitor } from '../services/rpc/healthMonitor.js';
 import { asyncHandler } from '../utils/async-handler.js';
 import { readStringParam } from '../utils/route-params.js';
-import { isRecord } from '../utils/guards.js';
+import { HttpError, isRecord } from '../utils/guards.js';
 import { normalizeClientIpForLimits } from '../utils/client-ip.js';
 import {
   rpcBatchReject,
@@ -16,12 +17,18 @@ import {
 
 const router = Router();
 
-// GET handler - return API documentation
+// GET handler - return API documentation plus the network's state.
+// `configured` reports a non-empty endpoint list; `ready` reports that at least
+// one endpoint currently passes readiness and any configured identity pin.
 router.get('/:network', (req, res) => {
+  const network = readStringParam(req, 'network');
+  if (!isNetworkName(network)) throw new HttpError(404, 'Unknown network');
   const methods = getAllowedMethods();
   res.json({
     name: 'QRL RPC Proxy',
-    network: req.params.network,
+    network,
+    configured: CONFIG.RPC_ENDPOINTS[network].length > 0,
+    ready: healthMonitor.hasHealthyForNetwork(network),
     description:
       'JSON-RPC 2.0 proxy for the QRL Zond blockchain. Send POST requests with a JSON-RPC body.',
     usage: {

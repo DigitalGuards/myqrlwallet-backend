@@ -26,7 +26,12 @@ const POLL_INTERVAL_MS = 250;
 // A syntactically valid CIDv0 lets the wildcard probe reach the route handler.
 const PROBE_CID = 'QmYwAPJzv5CZsnA625s3Xf2nemtYgPpHdWEz79ojWnPbdG';
 
-const PROBES = ['/health', `/api/ipfs/${PROBE_CID}/path/to/asset.png`];
+const PROBES = [
+  '/health',
+  `/api/ipfs/${PROBE_CID}/path/to/asset.png`,
+  '/api/qrl-rpc/testnet',
+  '/api/qrl-rpc/mainnet',
+];
 
 async function freePort() {
   return new Promise((resolve, reject) => {
@@ -53,17 +58,26 @@ async function probe(url) {
 async function main() {
   const port = await freePort();
   const base = `http://127.0.0.1:${port}`;
+  // Boot with mainnet dormant, the shipped default: no mainnet endpoint or pin
+  // variables reach the server, whatever the calling shell exports.
+  const inherited = Object.fromEntries(
+    Object.entries(process.env).filter(
+      ([key]) => !/^RPC_(ENDPOINTS?|EXPECTED_CHAIN_ID|EXPECTED_GENESIS_HASH)_MAINNET$/.test(key)
+    )
+  );
   const child = spawn(process.execPath, ['server.js'], {
     env: {
-      ...process.env,
+      ...inherited,
       NODE_ENV: 'test',
       PORT: String(port),
       LISTEN_HOST: '127.0.0.1',
-      // Point every upstream at a closed local port so the health monitor
-      // fails fast and keeps the smoke test local.
+      // Point every configured upstream at a closed local port so the health
+      // monitor fails fast and keeps the smoke test local.
       RPC_ENDPOINTS_TESTNET: 'http://127.0.0.1:9',
       RPC_ENDPOINTS_DEV: 'http://127.0.0.1:9',
-      RPC_ENDPOINTS_MAINNET: 'http://127.0.0.1:9',
+      // dotenv never overrides a variable that is already set, so a blank
+      // value keeps mainnet dormant even when a local .env names an endpoint.
+      RPC_ENDPOINTS_MAINNET: '',
       IPFS_GATEWAYS: 'https://localhost:9/ipfs/',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

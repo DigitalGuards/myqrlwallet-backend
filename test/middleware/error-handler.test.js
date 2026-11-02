@@ -55,6 +55,27 @@ describe('errorHandler', () => {
     expect(response.json.firstCall.args[0].error.message).to.equal('Invalid request body');
   });
 
+  it('preserves the 415 status of an encoding.unsupported parser error', () => {
+    sinon.stub(logger, 'warn');
+    const error = Object.assign(new Error('content encoding unsupported'), {
+      status: 415,
+      type: 'encoding.unsupported',
+      encoding: 'gzip',
+    });
+    const response = {
+      headersSent: false,
+      status: sinon.stub().returnsThis(),
+      json: sinon.stub(),
+    };
+
+    errorHandler(error, {}, response, sinon.stub());
+
+    expect(response.status.calledOnceWithExactly(415)).to.equal(true);
+    expect(response.json.firstCall.args[0]).to.deep.equal({
+      error: { message: 'Invalid request body' },
+    });
+  });
+
   it('delegates errors after response headers have been sent', () => {
     const error = new Error('late stream failure');
     const next = sinon.stub();

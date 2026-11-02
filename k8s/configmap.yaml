@@ -26,8 +26,9 @@ data:
   # Replace qrl-node with the in-cluster node Service name. Never point this
   # back at the public wallet proxy or requests recurse through the backend.
   RPC_ENDPOINT_TESTNET: "http://qrl-node.myqrlwallet.svc.cluster.local:8545"
-  # Mainnet stays explicitly disabled until a separate trusted node is wired.
-  RPC_ENDPOINT_MAINNET: "http://127.0.0.1:9"
+  # Mainnet stays dormant while RPC_ENDPOINTS_MAINNET is absent. Enabling it
+  # requires a separate trusted node plus RPC_EXPECTED_CHAIN_ID_MAINNET and
+  # RPC_EXPECTED_GENESIS_HASH_MAINNET, or the backend refuses to start.
   # CORS allowed origins (comma-separated)
   ALLOWED_ORIGINS: "https://qrlwallet.com,https://www.qrlwallet.com"
   # Cache TTL in seconds
