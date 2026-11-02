@@ -31,6 +31,26 @@ function parseEndpointList(networkKey: string, fallback: string[] = []): string[
 }
 
 /**
+ * Resolve the endpoint list for a network that stays dormant until an operator
+ * configures it (mainnet and dev). With both variables unset the list is empty,
+ * so the health monitor polls nothing and the proxy answers 503 without an
+ * upstream call. A set variable is authoritative: a blank value disables the
+ * network, and `RPC_ENDPOINTS_<NETWORK>` wins over the legacy single URL
+ * whenever it is set.
+ */
+export function parseDormantEndpointList(
+  listVar: string | undefined,
+  singleVar: string | undefined
+): string[] {
+  const value = listVar ?? singleVar;
+  if (value === undefined) return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
  * Parse a positive-integer env var, falling back when unset, non-numeric,
  * zero, or negative. Caps, intervals, and timeouts fed to Socket.IO,
  * node-cache, and the health poller must never be NaN or <= 0; NaN
@@ -143,6 +163,84 @@ export function parseRpcIdentity(
     );
   }
   return { chainId: `0x${BigInt(chainId).toString(16)}`, genesisHash: genesisHash.toLowerCase() };
+}
+
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0', '[::1]', '[::]']);
+
+/**
+ * Comparison key for an RPC endpoint URL. Scheme case, host case, default
+ * ports, credentials, query, fragment and trailing slashes do not change the
+ * key, and every loopback spelling maps to one host, so two spellings of the
+ * same upstream socket compare equal. Unparseable values compare as trimmed
+ * lower-case text.
+ */
+export function rpcEndpointKey(endpoint: string): string {
+  const input = endpoint.trim();
+  try {
+    const url = new URL(input);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      // A trailing dot names the same host; IPv4-mapped IPv6 loopback
+      // ([::ffff:127.x.y.z]) arrives from URL as [::ffff:7fxx:xxxx].
+      const hostname = url.hostname.replace(/\.$/, '');
+      const loopback =
+        LOOPBACK_HOSTNAMES.has(hostname) ||
+        (isIP(hostname) === 4 && hostname.startsWith('127.')) ||
+        /^\[::ffff:7f[0-9a-f]{2}:[0-9a-f]{1,4}\]$/.test(hostname);
+      const host = loopback ? 'loopback' : hostname;
+      const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+      return `${host}:${port}${url.pathname.replace(/\/+$/, '')}`;
+    }
+  } catch {
+    // Fall through to the textual comparison below.
+  }
+  return input.toLowerCase();
+}
+
+/**
+ * Mainnet separation check. Mainnet endpoints need both identity pins, may not
+ * share an upstream with testnet or dev, and the mainnet pins must differ from
+ * the testnet pins in both chain ID and genesis hash. Pins without endpoints
+ * stay valid (a pinned, dormant mainnet). This is defense in depth behind the
+ * identity pins: two different DNS names for one node cannot be detected here.
+ * Messages name list positions only, because endpoint URLs can carry
+ * credentials. Returns the first problem found, or null.
+ */
+export function mainnetSeparationProblem(
+  endpoints: Record<NetworkName, readonly string[]>,
+  identities: Record<NetworkName, RpcIdentity | null>
+): string | null {
+  const mainnetIdentity = identities.mainnet;
+  if (endpoints.mainnet.length > 0 && mainnetIdentity === null) {
+    return 'Mainnet RPC endpoints require RPC_EXPECTED_CHAIN_ID_MAINNET and RPC_EXPECTED_GENESIS_HASH_MAINNET; leave the mainnet endpoint variables unset or blank to keep mainnet dormant';
+  }
+
+  const otherKeys = new Set([...endpoints.testnet, ...endpoints.dev].map(rpcEndpointKey));
+  const overlap = endpoints.mainnet.findIndex((endpoint) =>
+    otherKeys.has(rpcEndpointKey(endpoint))
+  );
+  if (overlap >= 0) {
+    return `Mainnet RPC endpoint ${String(overlap + 1)} must differ from every testnet and dev RPC endpoint`;
+  }
+
+  const testnetIdentity = identities.testnet;
+  if (
+    mainnetIdentity !== null &&
+    testnetIdentity !== null &&
+    (mainnetIdentity.chainId === testnetIdentity.chainId ||
+      mainnetIdentity.genesisHash === testnetIdentity.genesisHash)
+  ) {
+    return 'Mainnet chain ID and genesis hash pins must both differ from the testnet pins';
+  }
+  return null;
+}
+
+/** Throwing form of {@link mainnetSeparationProblem}. */
+export function assertMainnetSeparation(
+  endpoints: Record<NetworkName, readonly string[]>,
+  identities: Record<NetworkName, RpcIdentity | null>
+): void {
+  const problem = mainnetSeparationProblem(endpoints, identities);
+  if (problem !== null) throw new Error(problem);
 }
 
 export interface AppConfig {
@@ -270,9 +368,15 @@ export const CONFIG: AppConfig = {
     .filter((origin) => origin.length > 0),
 
   RPC_ENDPOINTS: {
-    dev: parseEndpointList('DEV', ['http://localhost:8545']),
+    // Dev and mainnet stay dormant until configured. No shipped client calls
+    // the dev network, and an unset mainnet must never reach a local node that
+    // serves some other chain under the mainnet name.
+    dev: parseDormantEndpointList(process.env.RPC_ENDPOINTS_DEV, process.env.RPC_ENDPOINT_DEV),
     testnet: parseEndpointList('TESTNET', ['http://localhost:8545']),
-    mainnet: parseEndpointList('MAINNET', ['http://localhost:8545']),
+    mainnet: parseDormantEndpointList(
+      process.env.RPC_ENDPOINTS_MAINNET,
+      process.env.RPC_ENDPOINT_MAINNET
+    ),
   },
 
   RPC_EXPECTED_IDENTITIES: {
@@ -344,3 +448,30 @@ export const CONFIG: AppConfig = {
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),
 };
+
+// An unpinned or overlapping mainnet stays dormant: the rest of the backend
+// (testnet RPC, the dApp relay, history) keeps serving, and the reason is
+// logged at startup. Mainnet history needs a separated, pinned mainnet and an
+// origin of its own.
+const mainnetProblem = mainnetSeparationProblem(
+  CONFIG.RPC_ENDPOINTS,
+  CONFIG.RPC_EXPECTED_IDENTITIES
+);
+if (mainnetProblem !== null) {
+  // Configuration initializes before the structured logger is available.
+  console.error(`[config] Mainnet stays dormant: ${mainnetProblem}`);
+  CONFIG.RPC_ENDPOINTS.mainnet = [];
+}
+const mainnetHistory = CONFIG.TX_HISTORY_ORIGINS.mainnet;
+if (
+  mainnetHistory !== null &&
+  (mainnetProblem !== null ||
+    CONFIG.RPC_EXPECTED_IDENTITIES.mainnet === null ||
+    mainnetHistory === CONFIG.TX_HISTORY_ORIGINS.testnet ||
+    mainnetHistory === CONFIG.TX_HISTORY_ORIGINS.dev)
+) {
+  console.error(
+    '[config] Mainnet transaction history stays off: it needs both mainnet identity pins and an origin of its own'
+  );
+  CONFIG.TX_HISTORY_ORIGINS.mainnet = null;
+}
