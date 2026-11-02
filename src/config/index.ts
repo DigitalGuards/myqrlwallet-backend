@@ -31,6 +31,26 @@ function parseEndpointList(networkKey: string, fallback: string[] = []): string[
 }
 
 /**
+ * Resolve the endpoint list for a network that stays dormant until an operator
+ * configures it (mainnet and dev). With both variables unset the list is empty,
+ * so the health monitor polls nothing and the proxy answers 503 without an
+ * upstream call. A set variable is authoritative: a blank value disables the
+ * network, and `RPC_ENDPOINTS_<NETWORK>` wins over the legacy single URL
+ * whenever it is set.
+ */
+export function parseDormantEndpointList(
+  listVar: string | undefined,
+  singleVar: string | undefined
+): string[] {
+  const value = listVar ?? singleVar;
+  if (value === undefined) return [];
+  return value
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+/**
  * Parse a positive-integer env var, falling back when unset, non-numeric,
  * zero, or negative. Caps, intervals, and timeouts fed to Socket.IO,
  * node-cache, and the health poller must never be NaN or <= 0; NaN
@@ -143,6 +163,74 @@ export function parseRpcIdentity(
     );
   }
   return { chainId: `0x${BigInt(chainId).toString(16)}`, genesisHash: genesisHash.toLowerCase() };
+}
+
+const LOOPBACK_HOSTNAMES = new Set(['localhost', '0.0.0.0', '[::1]', '[::]']);
+
+/**
+ * Comparison key for an RPC endpoint URL. Scheme case, host case, default
+ * ports, credentials, query, fragment and trailing slashes do not change the
+ * key, and every loopback spelling maps to one host, so two spellings of the
+ * same upstream socket compare equal. Unparseable values compare as trimmed
+ * lower-case text.
+ */
+export function rpcEndpointKey(endpoint: string): string {
+  const input = endpoint.trim();
+  try {
+    const url = new URL(input);
+    if (url.protocol === 'http:' || url.protocol === 'https:') {
+      const loopback =
+        LOOPBACK_HOSTNAMES.has(url.hostname) ||
+        (isIP(url.hostname) === 4 && url.hostname.startsWith('127.'));
+      const host = loopback ? 'loopback' : url.hostname;
+      const port = url.port || (url.protocol === 'https:' ? '443' : '80');
+      return `${host}:${port}${url.pathname.replace(/\/+$/, '')}`;
+    }
+  } catch {
+    // Fall through to the textual comparison below.
+  }
+  return input.toLowerCase();
+}
+
+/**
+ * Startup guard that keeps mainnet separate from the other networks. Mainnet
+ * endpoints need both identity pins, may not share an upstream with testnet or
+ * dev, and the mainnet pins must differ from the testnet pins in both chain ID
+ * and genesis hash. Pins without endpoints stay valid (a pinned, dormant
+ * mainnet). Messages name list positions only, because endpoint URLs can carry
+ * credentials.
+ */
+export function assertMainnetSeparation(
+  endpoints: Record<NetworkName, readonly string[]>,
+  identities: Record<NetworkName, RpcIdentity | null>
+): void {
+  const mainnetIdentity = identities.mainnet;
+  if (endpoints.mainnet.length > 0 && mainnetIdentity === null) {
+    throw new Error(
+      'Mainnet RPC endpoints require RPC_EXPECTED_CHAIN_ID_MAINNET and RPC_EXPECTED_GENESIS_HASH_MAINNET'
+    );
+  }
+
+  const otherKeys = new Set([...endpoints.testnet, ...endpoints.dev].map(rpcEndpointKey));
+  endpoints.mainnet.forEach((endpoint, index) => {
+    if (otherKeys.has(rpcEndpointKey(endpoint))) {
+      throw new Error(
+        `Mainnet RPC endpoint ${String(index + 1)} must differ from every testnet and dev RPC endpoint`
+      );
+    }
+  });
+
+  const testnetIdentity = identities.testnet;
+  if (
+    mainnetIdentity !== null &&
+    testnetIdentity !== null &&
+    (mainnetIdentity.chainId === testnetIdentity.chainId ||
+      mainnetIdentity.genesisHash === testnetIdentity.genesisHash)
+  ) {
+    throw new Error(
+      'Mainnet chain ID and genesis hash pins must both differ from the testnet pins'
+    );
+  }
 }
 
 export interface AppConfig {
@@ -270,9 +358,15 @@ export const CONFIG: AppConfig = {
     .filter((origin) => origin.length > 0),
 
   RPC_ENDPOINTS: {
-    dev: parseEndpointList('DEV', ['http://localhost:8545']),
+    // Dev and mainnet stay dormant until configured. No shipped client calls
+    // the dev network, and an unset mainnet must never reach a local node that
+    // serves some other chain under the mainnet name.
+    dev: parseDormantEndpointList(process.env.RPC_ENDPOINTS_DEV, process.env.RPC_ENDPOINT_DEV),
     testnet: parseEndpointList('TESTNET', ['http://localhost:8545']),
-    mainnet: parseEndpointList('MAINNET', ['http://localhost:8545']),
+    mainnet: parseDormantEndpointList(
+      process.env.RPC_ENDPOINTS_MAINNET,
+      process.env.RPC_ENDPOINT_MAINNET
+    ),
   },
 
   RPC_EXPECTED_IDENTITIES: {
@@ -344,3 +438,7 @@ export const CONFIG: AppConfig = {
   IPFS_MAX_CONCURRENT: parsePositiveInt(process.env.IPFS_MAX_CONCURRENT, 8),
   IPFS_MAX_INFLIGHT_BYTES: parsePositiveInt(process.env.IPFS_MAX_INFLIGHT_BYTES, 40 * 1024 * 1024),
 };
+
+// Refuse to start with an unpinned or overlapping mainnet. Like a partial
+// identity pin, this aborts module initialization before anything listens.
+assertMainnetSeparation(CONFIG.RPC_ENDPOINTS, CONFIG.RPC_EXPECTED_IDENTITIES);

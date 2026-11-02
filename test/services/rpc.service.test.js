@@ -97,6 +97,50 @@ describe('RPC Service', () => {
     }
   });
 
+  describe('dormant mainnet', () => {
+    let originalEndpoints;
+
+    beforeEach(() => {
+      originalEndpoints = { ...CONFIG.RPC_ENDPOINTS };
+      CONFIG.RPC_ENDPOINTS = { ...CONFIG.RPC_ENDPOINTS, mainnet: [] };
+      healthMonitor.__resetForTesting();
+    });
+
+    afterEach(() => {
+      CONFIG.RPC_ENDPOINTS = originalEndpoints;
+    });
+
+    it('answers 503 without an upstream fetch, cached methods included', async () => {
+      const fetchStub = sinon.stub(globalThis, 'fetch').rejects(new Error('unexpected fetch'));
+      cache.set('mainnet-qrl_chainId-[]', '0x1');
+      for (const method of ['qrl_blockNumber', 'qrl_chainId', 'qrl_sendRawTransaction']) {
+        try {
+          await rpcService.executeRPC('mainnet', method, method === 'qrl_chainId' ? [] : ['0x01']);
+          expect.fail(`Expected ${method} to fail closed`);
+        } catch (error) {
+          expect(error, method).to.include({
+            status: 503,
+            message: 'No ready RPC endpoint for this network',
+          });
+        }
+      }
+      expect(fetchStub.called).to.equal(false);
+    });
+
+    it('registers and polls no mainnet endpoint', async () => {
+      const fetchStub = sinon.stub(globalThis, 'fetch').rejects(new Error('offline'));
+      healthMonitor.init();
+      await healthMonitor.pollAll();
+
+      expect(healthMonitor.networks.has('mainnet')).to.equal(false);
+      expect(healthMonitor.getSnapshot()).not.to.have.property('mainnet');
+      expect(healthMonitor.hasHealthyForNetwork('mainnet')).to.equal(false);
+      const polled = new Set(fetchStub.getCalls().map((call) => call.args[0]));
+      const others = new Set([...CONFIG.RPC_ENDPOINTS.testnet, ...CONFIG.RPC_ENDPOINTS.dev]);
+      for (const url of polled) expect(others.has(url), url).to.equal(true);
+    });
+  });
+
   it('should have valid RPC endpoints configured', () => {
     expect(CONFIG.RPC_ENDPOINTS).to.have.property('dev');
     expect(CONFIG.RPC_ENDPOINTS).to.have.property('testnet');
