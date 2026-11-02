@@ -75,6 +75,9 @@ async function main() {
       // monitor fails fast and keeps the smoke test local.
       RPC_ENDPOINTS_TESTNET: 'http://127.0.0.1:9',
       RPC_ENDPOINTS_DEV: 'http://127.0.0.1:9',
+      // dotenv never overrides a variable that is already set, so a blank
+      // value keeps mainnet dormant even when a local .env names an endpoint.
+      RPC_ENDPOINTS_MAINNET: '',
       IPFS_GATEWAYS: 'https://localhost:9/ipfs/',
     },
     stdio: ['ignore', 'pipe', 'pipe'],

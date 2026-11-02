@@ -478,6 +478,8 @@ describe('Dormant mainnet configuration', () => {
         'http://[::1]:8545',
         'http://0.0.0.0:8545',
         'http://LOCALHOST:8545',
+        'http://localhost.:8545',
+        'http://[::ffff:127.0.0.1]:8545',
       ]) {
         expect(rpcEndpointKey(spelling), spelling).to.equal(key);
       }
@@ -657,6 +659,15 @@ describe('Dormant mainnet configuration', () => {
       ]);
     });
 
+    it('refuses to initialize the application with a partial mainnet pin', () => {
+      const child = startApp({
+        RPC_ENDPOINT_MAINNET: 'http://mainnet.example:8545',
+        RPC_EXPECTED_CHAIN_ID_MAINNET: '23',
+      });
+      expect(child.status, child.stderr).to.equal(1);
+      expect(child.stderr).to.include('RPC expected identity requires both');
+    });
+
     for (const [label, env, message] of [
       [
         'mainnet endpoints without pins',
@@ -664,12 +675,14 @@ describe('Dormant mainnet configuration', () => {
         'Mainnet RPC endpoints require RPC_EXPECTED_CHAIN_ID_MAINNET',
       ],
       [
-        'a legacy mainnet endpoint with only a chain ID pin',
+        // The dead-port value hosts used before mainnet could be dormant.
+        'the legacy dead-port mainnet and dev values',
         {
-          RPC_ENDPOINT_MAINNET: 'http://mainnet.example:8545',
-          RPC_EXPECTED_CHAIN_ID_MAINNET: '23',
+          RPC_ENDPOINTS_MAINNET: 'http://127.0.0.1:9',
+          RPC_ENDPOINT_MAINNET: 'http://127.0.0.1:9',
+          RPC_ENDPOINTS_DEV: 'http://127.0.0.1:9',
         },
-        'RPC expected identity requires both',
+        'Mainnet RPC endpoints require RPC_EXPECTED_CHAIN_ID_MAINNET',
       ],
       [
         'a mainnet endpoint equal to a testnet endpoint',
@@ -699,17 +712,61 @@ describe('Dormant mainnet configuration', () => {
         'mainnet pins equal to the testnet pins',
         {
           ...mainnetPinEnv,
+          RPC_ENDPOINTS_MAINNET: 'http://mainnet.example:8545',
           RPC_EXPECTED_CHAIN_ID_TESTNET: '23',
           RPC_EXPECTED_GENESIS_HASH_TESTNET: MAINNET_GENESIS,
         },
         'Mainnet chain ID and genesis hash pins must both differ from the testnet pins',
       ],
     ]) {
-      it(`refuses to initialize the application with ${label}`, () => {
-        const child = startApp(env);
-        expect(child.status, child.stderr).to.equal(1);
-        expect(child.stderr).to.include(message);
+      it(`keeps mainnet dormant and the rest running with ${label}`, () => {
+        const child = loadEndpoints(env);
+        expect(child.status, child.stderr).to.equal(0);
+        expect(child.stderr).to.include(`Mainnet stays dormant: ${message}`);
+        const parsed = JSON.parse(child.stdout.trim());
+        expect(parsed.mainnet).to.deep.equal([]);
+        expect(parsed.testnet.length).to.be.greaterThan(0);
       });
     }
+
+    function loadHistory(env) {
+      return spawnSync(
+        process.execPath,
+        [
+          '--import',
+          'tsx',
+          '--input-type=module',
+          '--eval',
+          "import { CONFIG } from './src/config/index.ts'; console.log(JSON.stringify(CONFIG.TX_HISTORY_ORIGINS));",
+        ],
+        { encoding: 'utf8', timeout: 5000, env: rpcEnv(env) }
+      );
+    }
+
+    it('keeps mainnet history off without mainnet pins or with a shared origin', () => {
+      for (const env of [
+        { TX_HISTORY_ORIGIN_MAINNET: 'https://mainnet-explorer.example' },
+        {
+          ...mainnetPinEnv,
+          RPC_ENDPOINTS_MAINNET: 'http://mainnet.example:8545',
+          TX_HISTORY_ORIGIN_MAINNET: 'https://zondscan.com',
+        },
+      ]) {
+        const child = loadHistory(env);
+        expect(child.status, `${JSON.stringify(env)} ${child.stderr}`).to.equal(0);
+        expect(JSON.parse(child.stdout.trim()).mainnet, JSON.stringify(env)).to.equal(null);
+        expect(child.stderr).to.include('Mainnet transaction history stays off');
+      }
+    });
+
+    it('serves mainnet history from its own origin once mainnet is pinned', () => {
+      const child = loadHistory({
+        ...mainnetPinEnv,
+        RPC_ENDPOINTS_MAINNET: 'http://mainnet.example:8545',
+        TX_HISTORY_ORIGIN_MAINNET: 'https://mainnet-explorer.example',
+      });
+      expect(child.status, child.stderr).to.equal(0);
+      expect(JSON.parse(child.stdout.trim()).mainnet).to.equal('https://mainnet-explorer.example');
+    });
   });
 });
