@@ -284,19 +284,18 @@ loop.
 
 ## CI/CD
 
-The GitHub Actions workflow (`.github/workflows/ci.yml`) automatically:
+The GitHub Actions workflow (`.github/workflows/ci.yml`):
 
-1. **On PR/Push**: Runs tests
-2. **On Push to main/dev**: Builds and pushes Docker image to GitHub Container Registry
-3. **On Push to main**: Deploys to Kubernetes cluster
+1. **On a pull request into `dev` or `main`**: runs the tests. This is the only test run a change gets, and it is the required `test (22.x)` check.
+2. **On a push to `main`**: builds and pushes the release image to GitHub Container Registry. Dev pushes run nothing.
+3. **Weekly, on `dev`**: runs the tests to surface drift in the registry and the runtime. Manual dispatch runs them too, and then builds the image.
 
-CI runs `node scripts/audit-gate.mjs` immediately after `npm ci` in the required `test (22.x)` check (the Docker job depends on it), blocking high or critical production advisories and failed audits. Matching exceptions in root `audit-allowlist.json` require an advisory ID, package, a reason explaining why the advisory cannot reach users, and an expiry within 90 days; expired matching exceptions fail the gate.
+CI runs `node scripts/audit-gate.mjs` as the last step of `test (22.x)`, blocking high or critical production advisories and failed audits. Matching exceptions in root `audit-allowlist.json` require an advisory ID, package, a reason explaining why the advisory cannot reach users, and an expiry within 90 days; expired matching exceptions fail the gate.
 
 ### Image Tags
 
 - `ghcr.io/<owner>/myqrlwallet-backend:latest` - Latest main branch
 - `ghcr.io/<owner>/myqrlwallet-backend:main-<sha>` - Specific commit
-- `ghcr.io/<owner>/myqrlwallet-backend:dev` - Dev branch
 
 ### Required GitHub Configuration
 
