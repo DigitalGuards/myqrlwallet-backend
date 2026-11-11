@@ -22,6 +22,7 @@ const rawBodyBytes = new WeakMap<object, number>();
 
 function tooLarge(): Error {
   return Object.assign(new Error('request entity too large'), {
+    name: 'PayloadTooLargeError',
     status: 413,
     statusCode: 413,
     type: 'entity.too.large',

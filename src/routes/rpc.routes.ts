@@ -7,6 +7,10 @@ import { readStringParam } from '../utils/route-params.js';
 import { HttpError, isRecord } from '../utils/guards.js';
 import { normalizeClientIpForLimits } from '../utils/client-ip.js';
 import {
+  RPC_DEFAULT_BODY_LIMIT_BYTES,
+  RPC_SEND_RAW_TX_BODY_LIMIT_BYTES,
+} from '../middleware/rpc-body.js';
+import {
   rpcBatchReject,
   rpcMethodWhitelist,
   rpcRateLimitWrite,
@@ -46,7 +50,7 @@ router.get('/:network', (req, res) => {
       admission: `${CONFIG.RPC_RATE_LIMIT_PER_MINUTE} requests/min per IP for all RPC traffic`,
       write: `${CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE} requests/min per IP (sendRawTransaction)`,
     },
-    max_payload: '50KB',
+    max_payload: `${RPC_DEFAULT_BODY_LIMIT_BYTES / 1024}KB (${Math.round(RPC_SEND_RAW_TX_BODY_LIMIT_BYTES / 1000)}KB for qrl_sendRawTransaction)`,
   });
 });
 
