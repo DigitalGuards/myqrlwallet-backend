@@ -49,9 +49,9 @@ router.get('/:network', (req, res) => {
     rate_limits: {
       admission: `${CONFIG.RPC_RATE_LIMIT_PER_MINUTE} requests/min per IP for all RPC traffic`,
       write: `${CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE} requests/min per IP (sendRawTransaction)`,
-      large_body: `${CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE} requests/min per IP for bodies above ${RPC_DEFAULT_BODY_LIMIT_BYTES / 1024}KB`,
+      large_body: `${CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE} requests/min per IP for bodies above ${RPC_DEFAULT_BODY_LIMIT_BYTES} bytes`,
     },
-    max_payload: `${RPC_DEFAULT_BODY_LIMIT_BYTES / 1024}KB (${Math.round(RPC_LARGE_BODY_LIMIT_BYTES / 1000)}KB for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)`,
+    max_payload: `${RPC_DEFAULT_BODY_LIMIT_BYTES} bytes (${RPC_LARGE_BODY_LIMIT_BYTES} bytes for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)`,
   });
 });
 

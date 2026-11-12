@@ -268,6 +268,7 @@ export interface AppConfig {
   RPC_HEALTH: RpcHealthConfig;
   RPC_RATE_LIMIT_PER_MINUTE: number;
   RPC_WRITE_RATE_LIMIT_PER_MINUTE: number;
+  RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE: number;
   RPC_MAX_RESPONSE_BYTES: number;
   RPC_MAX_CONCURRENT: number;
   RPC_MAX_CONCURRENT_PER_CLIENT: number;
@@ -418,6 +419,10 @@ export const CONFIG: AppConfig = {
   RPC_WRITE_RATE_LIMIT_PER_MINUTE: parsePositiveInt(
     process.env.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
     10
+  ),
+  RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE: parsePositiveInt(
+    process.env.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE,
+    30
   ),
   RPC_MAX_RESPONSE_BYTES: rpcMaxResponseBytes,
   RPC_MAX_CONCURRENT: rpcMaxConcurrent,

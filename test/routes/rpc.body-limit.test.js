@@ -41,10 +41,12 @@ describe('RPC body limits', () => {
       proxies: [...CONFIG.TRUSTED_PROXY_CIDRS],
       general: CONFIG.RPC_RATE_LIMIT_PER_MINUTE,
       write: CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
+      large: CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE,
     };
     CONFIG.TRUSTED_PROXY_CIDRS = ['loopback'];
     CONFIG.RPC_RATE_LIMIT_PER_MINUTE = 1000;
     CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1000;
+    CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 1000;
     stub = sinon.stub(rpcService, 'executeRPC').resolves({ jsonrpc: '2.0', id: 7, result: '0x1' });
   });
 
@@ -52,6 +54,7 @@ describe('RPC body limits', () => {
     CONFIG.TRUSTED_PROXY_CIDRS = saved.proxies;
     CONFIG.RPC_RATE_LIMIT_PER_MINUTE = saved.general;
     CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = saved.write;
+    CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = saved.large;
     stub.restore();
   });
 
@@ -186,7 +189,7 @@ describe('RPC body limits', () => {
 
     it('refuses a large qrl_call with a nested or non-hex call field', async () => {
       const nested = callBody('qrl_call', 100_000);
-      nested.params[0].accessList = [];
+      nested.params[0].extra = { a: 1 };
       expect((await post(nested)).status).to.equal(413);
       const text = callBody('qrl_call', 100_000);
       text.params[0].data = 'ab'.repeat(100_000);
@@ -305,7 +308,7 @@ describe('RPC body limits', () => {
 
   describe('large-body limiter', () => {
     it('refuses the request after the write limit and counts refused large bodies', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 3;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 3;
       const ip = nextIp();
       expect(await post(sendRaw(30_000), ip)).to.have.status(200);
       expect(await post(callBodyOversized(), ip)).to.have.status(413);
@@ -317,14 +320,14 @@ describe('RPC body limits', () => {
     });
 
     it('does not count small requests', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1000;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 1000;
       const ip = nextIp();
       for (let i = 0; i < 5; i += 1) {
         expect(
           await post({ jsonrpc: '2.0', id: 1, method: 'qrl_blockNumber', params: [] }, ip)
         ).to.have.status(200);
       }
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 1;
       expect(await post(sendRaw(30_000), ip)).to.have.status(200);
     });
 
@@ -368,7 +371,7 @@ describe('RPC body limits', () => {
     };
 
     it('does not count small chunked requests against the large-body limiter', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 2;
       const ip = nextIp();
       for (let i = 0; i < 5; i += 1) {
         expect(
@@ -427,7 +430,7 @@ describe('RPC body limits', () => {
     });
 
     it('shares the large-body limit across networks for one address', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 2;
       const ip = nextIp();
       expect(await post(sendRaw(30_000), ip, '/api/qrl-rpc/dev')).to.have.status(200);
       expect(await post(callOf(), ip, '/api/qrl-rpc/testnet')).to.have.status(200);
@@ -435,7 +438,7 @@ describe('RPC body limits', () => {
     });
 
     it('shares the large-body limit inside one IPv6 /56 and separates other /56s', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 2;
       expect(await post(callOf(), '2001:db8:0:1::1')).to.have.status(200);
       expect(await post(callOf(), '2001:db8:0:2::1')).to.have.status(200);
       expect(await post(callOf(), '2001:db8:0:ff::1')).to.have.status(429);
@@ -449,7 +452,7 @@ describe('RPC body limits', () => {
     });
 
     it('does not count a request that declares exactly the default limit', async () => {
-      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1;
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 1;
       const ip = nextIp();
       const head = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'qrl_getLogs', params: [''] });
       const body = JSON.stringify({
@@ -470,6 +473,92 @@ describe('RPC body limits', () => {
       expect(nonHex).to.be.lessThan(1024);
       expect(await post(' '.repeat(1024 - nonHex) + text)).to.have.status(200);
       expect(await post(' '.repeat(1025 - nonHex) + text)).to.have.status(413);
+    });
+  });
+
+  describe('call object variants and limiter settings', () => {
+    const big = rawTx(60_000);
+    const callWith = (call, block = 'latest') => ({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'qrl_estimateGas',
+      params: block === undefined ? [call] : [call, block],
+    });
+    const base = () => ({ from: qip55Address, data: big });
+
+    it('accepts a large contract creation (to: null)', async () => {
+      const res = await post(callWith({ ...base(), to: null }));
+      expect(res).to.have.status(200);
+      expect(stub.firstCall.args[2][0].to).to.equal(null);
+    });
+
+    it('accepts a well-formed access list and refuses oversized or malformed ones', async () => {
+      const entry = { address: qip55Address, storageKeys: [`0x${'11'.repeat(64)}`] };
+      expect(await post(callWith({ ...base(), accessList: [entry] }))).to.have.status(200);
+      const tooMany = Array.from({ length: 65 }, () => entry);
+      expect(await post(callWith({ ...base(), accessList: tooMany }))).to.have.status(413);
+      const manyKeys = { address: qip55Address, storageKeys: Array(65).fill('0x01') };
+      expect(await post(callWith({ ...base(), accessList: [manyKeys] }))).to.have.status(413);
+      const badEntry = { address: 'not-an-address', storageKeys: [] };
+      expect(await post(callWith({ ...base(), accessList: [badEntry] }))).to.have.status(413);
+      const extraKey = { ...entry, extra: '0x01' };
+      expect(await post(callWith({ ...base(), accessList: [extraKey] }))).to.have.status(413);
+    });
+
+    it('accepts an EIP-1898 block object and refuses malformed ones', async () => {
+      const ok = [
+        { blockNumber: '0x10' },
+        { blockHash: `0x${'ab'.repeat(32)}`, requireCanonical: true },
+      ];
+      for (const block of ok) {
+        expect((await post(callWith(base(), block))).status).to.equal(200);
+      }
+      const bad = [
+        { blockNumber: '0x10', blockHash: '0x01' },
+        { requireCanonical: true },
+        { blockNumber: 'latest' },
+        { blockNumber: '0x10', requireCanonical: 'yes' },
+        { blockNumber: '0x10', other: 1 },
+      ];
+      for (const block of bad) {
+        expect((await post(callWith(base(), block))).status, JSON.stringify(block)).to.equal(413);
+      }
+    });
+
+    it('refuses a state override as a third param', async () => {
+      const body = callWith(base());
+      body.params.push({ [qip55Address]: { balance: '0x1' } });
+      expect(await post(body)).to.have.status(413);
+    });
+
+    it('refuses odd-length and empty hex as a large raw transaction', async () => {
+      const odd = { ...sendRaw(0), params: [`0x${'a'.repeat(120_001)}`] };
+      expect(await post(odd)).to.have.status(413);
+      const empty = { ...sendRaw(0), params: ['0x', 'ab'.repeat(60_000)] };
+      expect(await post(empty)).to.have.status(413);
+    });
+
+    it('does not spend the write limit on large estimates and calls', async () => {
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1;
+      const ip = nextIp();
+      for (let i = 0; i < 3; i += 1) {
+        expect(await post(callWith(base()), ip)).to.have.status(200);
+      }
+      expect(await post(sendRaw(60_000), ip)).to.have.status(200);
+      expect(await post(sendRaw(60_000), ip)).to.have.status(429);
+    });
+
+    it('reads the large-body limit from its own setting', async () => {
+      CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE = 2;
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1000;
+      const ip = nextIp();
+      expect(await post(callWith(base()), ip)).to.have.status(200);
+      expect(await post(callWith(base()), ip)).to.have.status(200);
+      expect(await post(callWith(base()), ip)).to.have.status(429);
+    });
+
+    it('defaults the large-body limit to 30 per minute', () => {
+      expect(saved.large).to.equal(30);
     });
   });
 });

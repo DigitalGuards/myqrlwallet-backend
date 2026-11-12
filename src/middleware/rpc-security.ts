@@ -9,6 +9,9 @@ import { isQrlAddress, QRL_ADDRESS_FORMAT } from '../utils/qrl-address.js';
 
 const log = logger.child({ module: 'rpc-security' });
 
+/** Canonical, byte-aligned hex for a signed transaction. */
+export const RAW_TX_HEX_PATTERN = /^0x(?:[a-fA-F0-9]{2})+$/;
+
 /**
  * Whitelist of allowed RPC methods.
  * Supports wallet operations and individual transaction lookups.
@@ -256,7 +259,7 @@ export const rpcParamsValidator = (req: Request, res: Response, next: NextFuncti
       }
       // Require canonical, byte-aligned hex rather than forwarding arbitrary
       // text that happens to carry a 0x prefix.
-      if (!/^0x(?:[a-fA-F0-9]{2})+$/.test(rawTx)) {
+      if (!RAW_TX_HEX_PATTERN.test(rawTx)) {
         sendRpcError(res, 400, id, -32602, 'Invalid params: transaction must be hex-encoded');
         return;
       }

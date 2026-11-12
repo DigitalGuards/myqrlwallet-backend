@@ -3,6 +3,8 @@ import type { NextFunction, Request, Response } from 'express';
 import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
 import { CONFIG } from '../config/index.js';
 import { isArray, isRecord } from '../utils/guards.js';
+import { QRL_ADDRESS_HEX_LENGTH } from '../utils/qrl-address.js';
+import { RAW_TX_HEX_PATTERN } from './rpc-security.js';
 
 /** Body limit for every RPC request that is not a large-body method. */
 export const RPC_DEFAULT_BODY_LIMIT_BYTES = 50 * 1024;
@@ -34,12 +36,12 @@ const MAX_NON_HEX_BYTES = 1024;
 
 const HEX_PATTERN = /^0x[0-9a-fA-F]*$/;
 // Shape only: the node checks the address checksum.
-const ADDRESS_PATTERN = /^Q[0-9a-fA-F]{128}$/;
+const ADDRESS_PATTERN = new RegExp(`^Q[0-9a-fA-F]{${QRL_ADDRESS_HEX_LENGTH}}$`);
 const BLOCK_TAG_PATTERN = /^(?:latest|pending|earliest|safe|finalized|0x[0-9a-fA-F]{1,64})$/;
 const ENVELOPE_KEYS: ReadonlySet<string> = new Set(['jsonrpc', 'id', 'method', 'params']);
 
-// Raw byte length of each parsed body, keyed by request.
-const rawBodyBytes = new WeakMap<object, number>();
+const MAX_ACCESS_LIST_ENTRIES = 64;
+const MAX_STORAGE_KEYS = 64;
 
 function tooLarge(): Error {
   return Object.assign(new Error('request entity too large'), {
@@ -66,7 +68,8 @@ function looksLikeLargeBody(buf: Buffer): boolean {
   }
   if (!named) return false;
   let other = 0;
-  for (const c of buf) {
+  for (let i = 0; i < buf.length; i += 1) {
+    const c = buf.readUInt8(i);
     const isHex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
     if (!isHex) {
       other += 1;
@@ -76,14 +79,50 @@ function looksLikeLargeBody(buf: Buffer): boolean {
   return true;
 }
 
+function isAccessList(value: unknown): boolean {
+  return (
+    isArray(value) &&
+    value.length <= MAX_ACCESS_LIST_ENTRIES &&
+    value.every(
+      (entry) =>
+        isRecord(entry) &&
+        Object.keys(entry).every((key) => key === 'address' || key === 'storageKeys') &&
+        typeof entry.address === 'string' &&
+        ADDRESS_PATTERN.test(entry.address) &&
+        isArray(entry.storageKeys) &&
+        entry.storageKeys.length <= MAX_STORAGE_KEYS &&
+        entry.storageKeys.every((key) => typeof key === 'string' && HEX_PATTERN.test(key))
+    )
+  );
+}
+
 function isCallObject(value: unknown): boolean {
   return (
     isRecord(value) &&
-    Object.values(value).every(
-      (field) =>
-        typeof field === 'string' && (HEX_PATTERN.test(field) || ADDRESS_PATTERN.test(field))
-    )
+    Object.entries(value).every(([key, field]) => {
+      if (field === null) return true;
+      if (key === 'accessList') return isAccessList(field);
+      return typeof field === 'string' && (HEX_PATTERN.test(field) || ADDRESS_PATTERN.test(field));
+    })
   );
+}
+
+/** Block tag, or an EIP-1898 object with one hex blockNumber or blockHash. */
+function isBlockParam(value: unknown): boolean {
+  if (typeof value === 'string') return BLOCK_TAG_PATTERN.test(value);
+  if (!isRecord(value)) return false;
+  const keys = Object.keys(value);
+  if (
+    !keys.every((key) => key === 'blockNumber' || key === 'blockHash' || key === 'requireCanonical')
+  ) {
+    return false;
+  }
+  const hasNumber = value.blockNumber !== undefined;
+  const hasHash = value.blockHash !== undefined;
+  if (hasNumber === hasHash) return false;
+  const tag = hasNumber ? value.blockNumber : value.blockHash;
+  if (typeof tag !== 'string' || !HEX_PATTERN.test(tag)) return false;
+  return value.requireCanonical === undefined || typeof value.requireCanonical === 'boolean';
 }
 
 /** Exact post-parse shape of an accepted body above the default limit. */
@@ -100,12 +139,12 @@ function isLargeBodyShape(body: unknown): boolean {
   if (!idOk) return false;
   if (!isArray(params)) return false;
   if (method === SEND_RAW_TX_METHOD) {
-    return params.length === 1 && typeof params[0] === 'string' && HEX_PATTERN.test(params[0]);
+    return (
+      params.length === 1 && typeof params[0] === 'string' && RAW_TX_HEX_PATTERN.test(params[0])
+    );
   }
   if (params.length < 1 || params.length > 2 || !isCallObject(params[0])) return false;
-  return (
-    params.length === 1 || (typeof params[1] === 'string' && BLOCK_TAG_PATTERN.test(params[1]))
-  );
+  return params.length === 1 || isBlockParam(params[1]);
 }
 
 /**
@@ -116,9 +155,8 @@ function isLargeBodyShape(body: unknown): boolean {
 const largeJsonParser = express.json({
   limit: RPC_LARGE_BODY_LIMIT_BYTES,
   inflate: false,
-  verify: (req, _res, buf) => {
-    rawBodyBytes.set(req, buf.length);
-    if (buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES && !looksLikeLargeBody(buf)) {
+  verify: (_req, _res, buf) => {
+    if (!looksLikeLargeBody(buf)) {
       throw tooLarge();
     }
   },
@@ -139,7 +177,7 @@ function mayBeLarge(req: Request): boolean {
 }
 
 /**
- * Strict per-address limiter for large bodies, using the write-limit setting.
+ * Strict per-address limiter for large bodies (RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE).
  * It sits before the parser and keys on the declared Content-Length
  * (body-parser rejects a body that differs from it), so a large body is
  * counted before it is buffered. A body above the default limit is accepted
@@ -148,7 +186,7 @@ function mayBeLarge(req: Request): boolean {
  */
 export const rpcRateLimitLargeBody = rateLimit({
   windowMs: 60 * 1000,
-  limit: () => CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
+  limit: () => CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? 'unknown')}-large-body`,
@@ -177,8 +215,7 @@ export const rpcJsonBody = (req: Request, res: Response, next: NextFunction): vo
       next(err);
       return;
     }
-    const bytes = rawBodyBytes.get(req) ?? 0;
-    if (bytes > RPC_DEFAULT_BODY_LIMIT_BYTES && !isLargeBodyShape(req.body)) {
+    if (!isLargeBodyShape(req.body)) {
       next(tooLarge());
       return;
     }

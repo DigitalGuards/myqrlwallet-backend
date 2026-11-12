@@ -732,7 +732,8 @@ describe('RPC Routes', () => {
       expect(body).to.include({
         name: 'QRL RPC Proxy',
         network,
-        max_payload: '50KB (270KB for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)',
+        max_payload:
+          '51200 bytes (270000 bytes for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)',
       });
       expect(body.description).to.be.a('string');
       expect(body.usage).to.deep.equal({
