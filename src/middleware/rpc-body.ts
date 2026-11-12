@@ -1,8 +1,10 @@
 import express from 'express';
 import type { NextFunction, Request, Response } from 'express';
-import { isRecord } from '../utils/guards.js';
+import rateLimit, { ipKeyGenerator } from 'express-rate-limit';
+import { CONFIG } from '../config/index.js';
+import { isArray, isRecord } from '../utils/guards.js';
 
-/** Body limit for every RPC method except qrl_sendRawTransaction. */
+/** Body limit for every RPC request that is not a large-body method. */
 export const RPC_DEFAULT_BODY_LIMIT_BYTES = 50 * 1024;
 
 /**
@@ -13,9 +15,28 @@ export const RPC_DEFAULT_BODY_LIMIT_BYTES = 50 * 1024;
  * needs more than the default limit. 270,000 bytes covers the arithmetic
  * (about 263 KB) with headroom.
  */
-export const RPC_SEND_RAW_TX_BODY_LIMIT_BYTES = 270_000;
+export const RPC_LARGE_BODY_LIMIT_BYTES = 270_000;
 
+/**
+ * A wallet estimates and simulates a transaction with the same call data it
+ * later sends, so these three methods share the larger limit. Single
+ * requests only.
+ */
 const SEND_RAW_TX_METHOD = 'qrl_sendRawTransaction';
+const LARGE_BODY_METHODS: ReadonlySet<string> = new Set([
+  SEND_RAW_TX_METHOD,
+  'qrl_call',
+  'qrl_estimateGas',
+]);
+
+/** Bytes outside [0-9a-fA-F] a large body may hold (envelope, keys, quotes). */
+const MAX_NON_HEX_BYTES = 1024;
+
+const HEX_PATTERN = /^0x[0-9a-fA-F]*$/;
+// Shape only: the node checks the address checksum.
+const ADDRESS_PATTERN = /^Q[0-9a-fA-F]{128}$/;
+const BLOCK_TAG_PATTERN = /^(?:latest|pending|earliest|safe|finalized|0x[0-9a-fA-F]{1,64})$/;
+const ENVELOPE_KEYS: ReadonlySet<string> = new Set(['jsonrpc', 'id', 'method', 'params']);
 
 // Raw byte length of each parsed body, keyed by request.
 const rawBodyBytes = new WeakMap<object, number>();
@@ -30,21 +51,103 @@ function tooLarge(): Error {
 }
 
 /**
- * Parses the RPC body under the larger raw-transaction limit, then enforces
- * the default limit for everything else. The method is only known after
- * parsing, so two checks apply: a cheap pre-parse check on the raw bytes (a
- * body above the default limit must at least mention the raw-transaction
- * method) and an exact post-parse check on the decoded method. Batches and
- * non-object bodies keep the default limit.
+ * Pre-parse shape check for a body above the default limit: it names a
+ * large-body method and is mostly hex (at most MAX_NON_HEX_BYTES of other
+ * bytes). A nested, padded or text body fails here in one byte scan, before
+ * JSON.parse allocates anything.
+ */
+function looksLikeLargeBody(buf: Buffer): boolean {
+  let named = false;
+  for (const method of LARGE_BODY_METHODS) {
+    if (buf.includes(method)) {
+      named = true;
+      break;
+    }
+  }
+  if (!named) return false;
+  let other = 0;
+  for (const c of buf) {
+    const isHex = (c >= 48 && c <= 57) || (c >= 97 && c <= 102) || (c >= 65 && c <= 70);
+    if (!isHex) {
+      other += 1;
+      if (other > MAX_NON_HEX_BYTES) return false;
+    }
+  }
+  return true;
+}
+
+function isCallObject(value: unknown): boolean {
+  return (
+    isRecord(value) &&
+    Object.values(value).every(
+      (field) =>
+        typeof field === 'string' && (HEX_PATTERN.test(field) || ADDRESS_PATTERN.test(field))
+    )
+  );
+}
+
+/** Exact post-parse shape of an accepted body above the default limit. */
+function isLargeBodyShape(body: unknown): boolean {
+  if (!isRecord(body) || !Object.keys(body).every((key) => ENVELOPE_KEYS.has(key))) return false;
+  const { method, params, id } = body;
+  if (typeof method !== 'string' || !LARGE_BODY_METHODS.has(method)) return false;
+  if (typeof id === 'string' && id.length > 256) return false;
+  if (!isArray(params)) return false;
+  if (method === SEND_RAW_TX_METHOD) {
+    return params.length === 1 && typeof params[0] === 'string' && HEX_PATTERN.test(params[0]);
+  }
+  if (params.length < 1 || params.length > 2 || !isCallObject(params[0])) return false;
+  return (
+    params.length === 1 || (typeof params[1] === 'string' && BLOCK_TAG_PATTERN.test(params[1]))
+  );
+}
+
+/**
+ * Raw-size parse limit. The method is only known after parsing, so the
+ * parser reads up to the large limit and the checks above enforce the
+ * default limit afterwards. Batches and non-object bodies keep the default.
  */
 const largeJsonParser = express.json({
-  limit: RPC_SEND_RAW_TX_BODY_LIMIT_BYTES,
+  limit: RPC_LARGE_BODY_LIMIT_BYTES,
   inflate: false,
   verify: (req, _res, buf) => {
     rawBodyBytes.set(req, buf.length);
-    if (buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES && !buf.includes(SEND_RAW_TX_METHOD)) {
+    if (buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES && !looksLikeLargeBody(buf)) {
       throw tooLarge();
     }
+  },
+});
+
+/** True when the request declares, or may carry, a body above the default limit. */
+function mayBeLarge(req: Request): boolean {
+  const declared = req.headers['content-length'];
+  if (declared === undefined) return true;
+  return !/^\d+$/.test(declared) || Number(declared) > RPC_DEFAULT_BODY_LIMIT_BYTES;
+}
+
+/**
+ * Strict per-address limiter for large bodies, using the write-limit setting.
+ * It sits before the parser and keys on Content-Length (body-parser rejects a
+ * body that differs from it), so a large body is counted before it is
+ * buffered. Requests without a Content-Length count too, since their size is
+ * unknown until read. Small requests skip it.
+ */
+export const rpcRateLimitLargeBody = rateLimit({
+  windowMs: 60 * 1000,
+  limit: () => CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => `${ipKeyGenerator(req.ip ?? 'unknown')}-large-body`,
+  skip: (req) => !mayBeLarge(req),
+  handler: (_req, res) => {
+    res.status(429).json({
+      jsonrpc: '2.0',
+      id: null,
+      error: {
+        code: -32005,
+        message: 'Large request rate limit exceeded. Please wait before sending more.',
+      },
+    });
   },
 });
 
@@ -55,12 +158,9 @@ export const rpcJsonBody = (req: Request, res: Response, next: NextFunction): vo
       return;
     }
     const bytes = rawBodyBytes.get(req) ?? 0;
-    if (bytes > RPC_DEFAULT_BODY_LIMIT_BYTES) {
-      const body: unknown = req.body;
-      if (!isRecord(body) || body.method !== SEND_RAW_TX_METHOD) {
-        next(tooLarge());
-        return;
-      }
+    if (bytes > RPC_DEFAULT_BODY_LIMIT_BYTES && !isLargeBodyShape(req.body)) {
+      next(tooLarge());
+      return;
     }
     next();
   });
