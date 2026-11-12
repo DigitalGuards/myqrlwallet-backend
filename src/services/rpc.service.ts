@@ -189,7 +189,9 @@ class RPCService {
     const isCacheable = CACHEABLE_METHODS.has(method);
     const identity = CONFIG.RPC_EXPECTED_IDENTITIES[network];
     const identityKey = identity === null ? '' : `${identity.chainId}-${identity.genesisHash}-`;
-    const cacheKey = `${network}-${identityKey}${method}-${JSON.stringify(params)}`;
+    const cacheKey = isCacheable
+      ? `${network}-${identityKey}${method}-${JSON.stringify(params)}`
+      : '';
 
     if (isCacheable) {
       // Only the upstream `result` value is cached, never the envelope:
