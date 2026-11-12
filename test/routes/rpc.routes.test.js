@@ -741,7 +741,7 @@ describe('RPC Routes', () => {
         body: { jsonrpc: '2.0', method: 'qrl_blockNumber', params: [], id: 1 },
       });
       expect(body.allowed_methods).to.include('qrl_blockNumber');
-      expect(body.rate_limits).to.have.keys('admission', 'write');
+      expect(body.rate_limits).to.have.keys('admission', 'write', 'large_body');
     }
 
     it('reports a dormant mainnet as unconfigured and not ready', async () => {

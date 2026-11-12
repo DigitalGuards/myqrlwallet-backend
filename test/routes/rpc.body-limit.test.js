@@ -1,4 +1,5 @@
 import * as chai from 'chai';
+import { createServer, request as httpRequest } from 'node:http';
 import { default as chaiHttp, request } from 'chai-http';
 import sinon from 'sinon';
 import { app } from '../../src/app.js';
@@ -330,5 +331,61 @@ describe('RPC body limits', () => {
     function callBodyOversized() {
       return { jsonrpc: '2.0', id: 1, method: 'qrl_getBalance', params: ['ab'.repeat(30_000)] };
     }
+  });
+
+  describe('chunked requests', () => {
+    const postChunked = async (payload, ip) => {
+      const server = createServer(app);
+      await new Promise((resolve) => server.listen(0, '127.0.0.1', resolve));
+      try {
+        const body = JSON.stringify(payload);
+        return await new Promise((resolve, reject) => {
+          const req = httpRequest(
+            {
+              host: '127.0.0.1',
+              port: server.address().port,
+              path: '/api/qrl-rpc/dev',
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Transfer-Encoding': 'chunked',
+                'X-Forwarded-For': ip,
+              },
+            },
+            (res) => {
+              res.resume();
+              res.on('end', () => resolve(res.statusCode));
+            }
+          );
+          req.on('error', reject);
+          const mid = Math.floor(body.length / 2);
+          req.write(body.slice(0, mid));
+          req.end(body.slice(mid));
+        });
+      } finally {
+        await new Promise((resolve) => server.close(resolve));
+      }
+    };
+
+    it('does not count small chunked requests against the large-body limiter', async () => {
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      const ip = nextIp();
+      for (let i = 0; i < 5; i += 1) {
+        expect(
+          await postChunked({ jsonrpc: '2.0', id: 1, method: 'qrl_blockNumber', params: [] }, ip)
+        ).to.equal(200);
+      }
+      expect(stub.callCount).to.equal(5);
+    });
+
+    it('refuses a large chunked body that has no declared length', async () => {
+      expect(await postChunked(sendRaw(60_000), nextIp())).to.equal(413);
+      expect(stub.called).to.equal(false);
+    });
+
+    it('still serves a large body with a Content-Length', async () => {
+      expect(await post(sendRaw(60_000))).to.have.status(200);
+      expect(stub.calledOnce).to.equal(true);
+    });
   });
 });

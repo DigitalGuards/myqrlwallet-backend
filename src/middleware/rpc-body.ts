@@ -112,25 +112,36 @@ const largeJsonParser = express.json({
   inflate: false,
   verify: (req, _res, buf) => {
     rawBodyBytes.set(req, buf.length);
-    if (buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES && !looksLikeLargeBody(buf)) {
+    if (
+      buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES &&
+      (declaredLength(req) === null || !looksLikeLargeBody(buf))
+    ) {
       throw tooLarge();
     }
   },
 });
 
-/** True when the request declares, or may carry, a body above the default limit. */
-function mayBeLarge(req: Request): boolean {
+/** Declared body length, or null when the header is absent or not a plain number. */
+function declaredLength(req: {
+  headers: { 'content-length'?: string | undefined };
+}): number | null {
   const declared = req.headers['content-length'];
-  if (declared === undefined) return true;
-  return !/^\d+$/.test(declared) || Number(declared) > RPC_DEFAULT_BODY_LIMIT_BYTES;
+  return declared !== undefined && /^\d+$/.test(declared) ? Number(declared) : null;
+}
+
+/** True only when the request declares a length above the default limit. */
+function mayBeLarge(req: Request): boolean {
+  const length = declaredLength(req);
+  return length !== null && length > RPC_DEFAULT_BODY_LIMIT_BYTES;
 }
 
 /**
  * Strict per-address limiter for large bodies, using the write-limit setting.
- * It sits before the parser and keys on Content-Length (body-parser rejects a
- * body that differs from it), so a large body is counted before it is
- * buffered. Requests without a Content-Length count too, since their size is
- * unknown until read. Small requests skip it.
+ * It sits before the parser and keys on the declared Content-Length
+ * (body-parser rejects a body that differs from it), so a large body is
+ * counted before it is buffered. A body above the default limit is accepted
+ * only with a declared length, so every other request, chunked ones
+ * included, skips this limiter and behaves as before.
  */
 export const rpcRateLimitLargeBody = rateLimit({
   windowMs: 60 * 1000,
