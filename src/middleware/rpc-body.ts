@@ -91,7 +91,13 @@ function isLargeBodyShape(body: unknown): boolean {
   if (!isRecord(body) || !Object.keys(body).every((key) => ENVELOPE_KEYS.has(key))) return false;
   const { method, params, id } = body;
   if (typeof method !== 'string' || !LARGE_BODY_METHODS.has(method)) return false;
-  if (typeof id === 'string' && id.length > 256) return false;
+  if (body.jsonrpc !== undefined && body.jsonrpc !== '2.0') return false;
+  const idOk =
+    id === undefined ||
+    id === null ||
+    (typeof id === 'string' && id.length <= 256) ||
+    (typeof id === 'number' && Number.isFinite(id));
+  if (!idOk) return false;
   if (!isArray(params)) return false;
   if (method === SEND_RAW_TX_METHOD) {
     return params.length === 1 && typeof params[0] === 'string' && HEX_PATTERN.test(params[0]);
@@ -112,10 +118,7 @@ const largeJsonParser = express.json({
   inflate: false,
   verify: (req, _res, buf) => {
     rawBodyBytes.set(req, buf.length);
-    if (
-      buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES &&
-      (declaredLength(req) === null || !looksLikeLargeBody(buf))
-    ) {
+    if (buf.length > RPC_DEFAULT_BODY_LIMIT_BYTES && !looksLikeLargeBody(buf)) {
       throw tooLarge();
     }
   },
@@ -163,6 +166,12 @@ export const rpcRateLimitLargeBody = rateLimit({
 });
 
 export const rpcJsonBody = (req: Request, res: Response, next: NextFunction): void => {
+  // Anything that does not declare a length above the default limit takes the
+  // old path: the global 50kb parser reads it, chunked bodies included.
+  if (!mayBeLarge(req)) {
+    next();
+    return;
+  }
   largeJsonParser(req, res, (err?: unknown) => {
     if (err !== undefined) {
       next(err);

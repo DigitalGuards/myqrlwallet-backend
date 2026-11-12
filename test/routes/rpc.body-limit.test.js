@@ -21,10 +21,10 @@ describe('RPC body limits', () => {
   let ipCounter = 0;
 
   const nextIp = () => `198.51.100.${(ipCounter += 1)}`;
-  const post = (body, ip = nextIp()) =>
+  const post = (body, ip = nextIp(), path = '/api/qrl-rpc/dev') =>
     request
       .execute(app)
-      .post('/api/qrl-rpc/dev')
+      .post(path)
       .set('X-Forwarded-For', ip)
       .set('Content-Type', 'application/json')
       .send(typeof body === 'string' ? body : JSON.stringify(body));
@@ -386,6 +386,90 @@ describe('RPC body limits', () => {
     it('still serves a large body with a Content-Length', async () => {
       expect(await post(sendRaw(60_000))).to.have.status(200);
       expect(stub.calledOnce).to.equal(true);
+    });
+  });
+
+  describe('shape, limiter keys and byte budget', () => {
+    const callOf = (overrides) => ({
+      jsonrpc: '2.0',
+      id: 7,
+      method: 'qrl_call',
+      params: [{ to: qip55Address, data: rawTx(60_000) }, 'latest'],
+      ...overrides,
+    });
+
+    it('refuses a large body whose method is outside the three but names one in the id', async () => {
+      const res = await post(callOf({ method: 'qrl_getBlockByNumber', id: 'qrl_call' }));
+      expect(res).to.have.status(413);
+      expect(stub.called).to.equal(false);
+    });
+
+    it('refuses a large qrl_call whose second param is not a block tag', async () => {
+      const res = await post(callOf({ params: [{ to: qip55Address }, rawTx(60_000)] }));
+      expect(res).to.have.status(413);
+      expect((await post(callOf({ params: [{ to: qip55Address }, 1] }))).status).to.equal(200);
+    });
+
+    it('accepts the named and hex block tags on a large call', async () => {
+      for (const tag of ['latest', 'pending', 'earliest', 'safe', 'finalized', '0x1f']) {
+        const body = callOf();
+        body.params[1] = tag;
+        expect((await post(body)).status, tag).to.equal(200);
+      }
+    });
+
+    it('refuses a bad jsonrpc or id on a large body', async () => {
+      expect((await post({ ...sendRaw(60_000), jsonrpc: 'ab'.repeat(1000) })).status).to.equal(413);
+      expect((await post({ ...sendRaw(60_000), jsonrpc: '1.0' })).status).to.equal(413);
+      expect((await post({ ...sendRaw(60_000), id: { a: 1 } })).status).to.equal(413);
+      expect((await post({ ...sendRaw(60_000), id: null })).status).to.equal(200);
+      expect((await post({ ...sendRaw(60_000), id: 12 })).status).to.equal(200);
+    });
+
+    it('shares the large-body limit across networks for one address', async () => {
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      const ip = nextIp();
+      expect(await post(sendRaw(30_000), ip, '/api/qrl-rpc/dev')).to.have.status(200);
+      expect(await post(callOf(), ip, '/api/qrl-rpc/testnet')).to.have.status(200);
+      expect(await post(callOf(), ip, '/api/qrl-rpc/other')).to.have.status(429);
+    });
+
+    it('shares the large-body limit inside one IPv6 /56 and separates other /56s', async () => {
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 2;
+      expect(await post(callOf(), '2001:db8:0:1::1')).to.have.status(200);
+      expect(await post(callOf(), '2001:db8:0:2::1')).to.have.status(200);
+      expect(await post(callOf(), '2001:db8:0:ff::1')).to.have.status(429);
+      expect(await post(callOf(), '2001:db8:0:100::1')).to.have.status(200);
+    });
+
+    it('accepts an upper-case hex transaction', async () => {
+      const body = { ...sendRaw(0), params: [`0x${'AB'.repeat(60_000)}`] };
+      expect(await post(body)).to.have.status(200);
+      expect(stub.firstCall.args[2]).to.deep.equal(body.params);
+    });
+
+    it('does not count a request that declares exactly the default limit', async () => {
+      CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE = 1;
+      const ip = nextIp();
+      const head = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'qrl_getLogs', params: [''] });
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id: 1,
+        method: 'qrl_getLogs',
+        params: ['x'.repeat(RPC_DEFAULT_BODY_LIMIT_BYTES - head.length)],
+      });
+      expect(body.length).to.equal(RPC_DEFAULT_BODY_LIMIT_BYTES);
+      for (let i = 0; i < 3; i += 1) {
+        expect((await post(body, ip)).status).to.not.equal(429);
+      }
+    });
+
+    it('allows 1024 bytes outside hex and refuses 1025', async () => {
+      const text = JSON.stringify(sendRaw(60_000));
+      const nonHex = text.match(/[^0-9a-fA-F]/g).length;
+      expect(nonHex).to.be.lessThan(1024);
+      expect(await post(' '.repeat(1024 - nonHex) + text)).to.have.status(200);
+      expect(await post(' '.repeat(1025 - nonHex) + text)).to.have.status(413);
     });
   });
 });

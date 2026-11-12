@@ -57,7 +57,9 @@ router.get('/:network', (req, res) => {
 
 // Apply security middleware in order:
 // The application-level admission limiter runs before JSON parsing. The
-// application JSON parser then enforces the actual 50KB decoded-body limit.
+// JSON parser then enforces the 50 KiB body limit; a request that declares a
+// larger length for qrl_sendRawTransaction, qrl_call or qrl_estimateGas is
+// handled by the large-body limiter and parser (see rpc-body.ts).
 // Valid write methods pass through an additional stricter limiter here.
 router.post(
   '/:network',
