@@ -7,6 +7,10 @@ import { readStringParam } from '../utils/route-params.js';
 import { HttpError, isRecord } from '../utils/guards.js';
 import { normalizeClientIpForLimits } from '../utils/client-ip.js';
 import {
+  RPC_DEFAULT_BODY_LIMIT_BYTES,
+  RPC_LARGE_BODY_LIMIT_BYTES,
+} from '../middleware/rpc-body.js';
+import {
   rpcBatchReject,
   rpcMethodWhitelist,
   rpcRateLimitWrite,
@@ -45,14 +49,17 @@ router.get('/:network', (req, res) => {
     rate_limits: {
       admission: `${CONFIG.RPC_RATE_LIMIT_PER_MINUTE} requests/min per IP for all RPC traffic`,
       write: `${CONFIG.RPC_WRITE_RATE_LIMIT_PER_MINUTE} requests/min per IP (sendRawTransaction)`,
+      large_body: `${CONFIG.RPC_LARGE_BODY_RATE_LIMIT_PER_MINUTE} requests/min per IP for bodies above ${RPC_DEFAULT_BODY_LIMIT_BYTES} bytes`,
     },
-    max_payload: '50KB',
+    max_payload: `${RPC_DEFAULT_BODY_LIMIT_BYTES} bytes (${RPC_LARGE_BODY_LIMIT_BYTES} bytes for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)`,
   });
 });
 
 // Apply security middleware in order:
 // The application-level admission limiter runs before JSON parsing. The
-// application JSON parser then enforces the actual 50KB decoded-body limit.
+// JSON parser then enforces the 50 KiB body limit; a request that declares a
+// larger length for qrl_sendRawTransaction, qrl_call or qrl_estimateGas is
+// handled by the large-body limiter and parser (see rpc-body.ts).
 // Valid write methods pass through an additional stricter limiter here.
 router.post(
   '/:network',

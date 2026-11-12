@@ -729,7 +729,12 @@ describe('RPC Routes', () => {
     }
 
     function expectDocumentation(body, network) {
-      expect(body).to.include({ name: 'QRL RPC Proxy', network, max_payload: '50KB' });
+      expect(body).to.include({
+        name: 'QRL RPC Proxy',
+        network,
+        max_payload:
+          '51200 bytes (270000 bytes for qrl_sendRawTransaction, qrl_call and qrl_estimateGas)',
+      });
       expect(body.description).to.be.a('string');
       expect(body.usage).to.deep.equal({
         method: 'POST',
@@ -737,7 +742,7 @@ describe('RPC Routes', () => {
         body: { jsonrpc: '2.0', method: 'qrl_blockNumber', params: [], id: 1 },
       });
       expect(body.allowed_methods).to.include('qrl_blockNumber');
-      expect(body.rate_limits).to.have.keys('admission', 'write');
+      expect(body.rate_limits).to.have.keys('admission', 'write', 'large_body');
     }
 
     it('reports a dormant mainnet as unconfigured and not ready', async () => {
